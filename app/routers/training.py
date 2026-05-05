@@ -82,4 +82,5 @@ async def create_record(
     )
     db.add(record)
     await db.flush()
+    await db.refresh(record)
     return TrainingRecordOut.model_validate(record)

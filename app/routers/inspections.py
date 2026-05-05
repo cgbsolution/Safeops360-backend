@@ -79,20 +79,24 @@ async def create_inspection(
     )
     db.add(insp)
     await db.flush()
+    await db.refresh(insp)
     try:
-        await workflow_engine.initiate(
-            db,
-            module="INSPECTION",
-            record_id=insp.id,
-            record_number=insp.number,
-            record_title=f"{eq.name} — scheduled {payload.scheduledDate.date()}",
-            record_data={"equipmentId": eq.id, "inspectorId": payload.inspectorId, "plantId": eq.plantId},
-            initiator_id=user.id,
-            plant_id=eq.plantId,
-        )
+        async with db.begin_nested():
+            await workflow_engine.initiate(
+                db,
+                module="INSPECTION",
+                record_id=insp.id,
+                record_number=insp.number,
+                record_title=f"{eq.name} — scheduled {payload.scheduledDate.date()}",
+                record_data={"equipmentId": eq.id, "inspectorId": payload.inspectorId, "plantId": eq.plantId},
+                initiator_id=user.id,
+                plant_id=eq.plantId,
+            )
     except Exception as e:  # noqa: BLE001
         import sys
+        import traceback
         print(f"Inspection workflow init failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
     return InspectionOut.model_validate(insp)
 
 

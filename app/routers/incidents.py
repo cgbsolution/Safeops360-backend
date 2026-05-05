@@ -127,30 +127,37 @@ async def create_incident(
     )
     db.add(incident)
     await db.flush()
+    # Refresh so DB-side defaults (createdAt, updatedAt) are loaded —
+    # without this, model_validate trips MissingGreenlet on attribute
+    # access in async context.
+    await db.refresh(incident)
 
     if payload.investigationTeamIds:
         for i, uid in enumerate(payload.investigationTeamIds):
             db.add(IncidentInvestigationMember(incidentId=incident.id, userId=uid, role="LEAD" if i == 0 else "MEMBER"))
 
     try:
-        await workflow_engine.initiate(
-            db,
-            module="INCIDENT",
-            record_id=incident.id,
-            record_number=incident.number,
-            record_title=incident.description[:120],
-            record_data={
-                "type": incident.type.value,
-                "plantId": incident.plantId,
-                "reporterId": incident.reporterId,
-                "lostDays": incident.lostDays,
-            },
-            initiator_id=user.id,
-            plant_id=incident.plantId,
-        )
+        async with db.begin_nested():
+            await workflow_engine.initiate(
+                db,
+                module="INCIDENT",
+                record_id=incident.id,
+                record_number=incident.number,
+                record_title=incident.description[:120],
+                record_data={
+                    "type": incident.type.value,
+                    "plantId": incident.plantId,
+                    "reporterId": incident.reporterId,
+                    "lostDays": incident.lostDays,
+                },
+                initiator_id=user.id,
+                plant_id=incident.plantId,
+            )
     except Exception as e:  # noqa: BLE001
         import sys
+        import traceback
         print(f"Incident workflow init failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
     return IncidentOut.model_validate(incident)
 

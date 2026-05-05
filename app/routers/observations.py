@@ -147,66 +147,78 @@ async def create_observation(
     )
     db.add(obs)
     await db.flush()
+    # Refresh so DB-side defaults (createdAt, updatedAt — both populated
+    # via `default=func.now()`) are loaded into the in-memory object.
+    # Without this, Pydantic's `model_validate(obs)` later tries to lazy-
+    # load the unloaded attributes and trips MissingGreenlet because the
+    # async session context isn't available during sync attribute access.
+    await db.refresh(obs)
 
-    # Kick off workflow. Failures are logged but don't block creation —
-    # mirrors the Node behaviour of the original POST. Log the full
-    # traceback because silently swallowing exceptions has previously
-    # masked real bugs (e.g. orphaned WorkflowInstance with no tasks →
-    # "Awaiting Action" panel never renders).
+    # Kick off workflow. Best-effort — workflow init failures must NOT
+    # poison the main transaction (otherwise the Observation INSERT, even
+    # though already flushed, gets rolled back at commit time → 500).
+    # Wrap in a SAVEPOINT so a flush failure in the engine rolls back
+    # only the engine's partial work, leaving the outer transaction
+    # consistent.
+    import sys
+    import traceback
+
     try:
-        await workflow_engine.initiate(
-            db,
-            module="OBSERVATION",
-            record_id=obs.id,
-            record_number=obs.number,
-            record_title=obs.description[:120],
-            record_data={
-                "type": obs.type.value,
-                "severity": obs.severity.value,
-                "plantId": obs.plantId,
-                "observerId": obs.observerId,
-                "responsiblePersonId": obs.responsiblePersonId,
-            },
-            initiator_id=user.id,
-            plant_id=obs.plantId,
-        )
+        async with db.begin_nested():
+            await workflow_engine.initiate(
+                db,
+                module="OBSERVATION",
+                record_id=obs.id,
+                record_number=obs.number,
+                record_title=obs.description[:120],
+                record_data={
+                    "type": obs.type.value,
+                    "severity": obs.severity.value,
+                    "plantId": obs.plantId,
+                    "observerId": obs.observerId,
+                    "responsiblePersonId": obs.responsiblePersonId,
+                },
+                initiator_id=user.id,
+                plant_id=obs.plantId,
+            )
     except Exception as e:  # noqa: BLE001
-        import sys
-        import traceback
         print(f"Observation workflow init failed: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
     # TriageAgent — run on submission. Best-effort, never blocks creation.
     # Output is appended to closureTriggers with ruleId="rule_triage_on_submit".
+    # Same SAVEPOINT pattern: a write failure here (e.g. column missing,
+    # transient DB error) rolls back only this block.
     try:
-        from app.services.ai.agents.triage import run_triage
+        async with db.begin_nested():
+            from app.services.ai.agents.triage import run_triage
 
-        triage = await run_triage(
-            observation={
-                "type": obs.type.value,
-                "category": obs.category.value,
-                "severity": obs.severity.value,
-                "description": obs.description,
-                "immediateAction": obs.immediateAction,
-            }
-        )
-        if triage is not None:
-            entry = {
-                "ruleId": "rule_triage_on_submit",
-                "ruleName": "Triage (AI)",
-                "fired": not triage.get("skipped", False),
-                "reason": triage.get("rationale") or triage.get("reason") or "",
-                "spawnedRecordType": "AI_TRIAGE",
-                "data": triage,
-            }
-            existing = obs.closureTriggers or []
-            if not isinstance(existing, list):
-                existing = []
-            obs.closureTriggers = [entry, *existing]
-            await db.flush()
+            triage = await run_triage(
+                observation={
+                    "type": obs.type.value,
+                    "category": obs.category.value,
+                    "severity": obs.severity.value,
+                    "description": obs.description,
+                    "immediateAction": obs.immediateAction,
+                }
+            )
+            if triage is not None:
+                entry = {
+                    "ruleId": "rule_triage_on_submit",
+                    "ruleName": "Triage (AI)",
+                    "fired": not triage.get("skipped", False),
+                    "reason": triage.get("rationale") or triage.get("reason") or "",
+                    "spawnedRecordType": "AI_TRIAGE",
+                    "data": triage,
+                }
+                existing = obs.closureTriggers or []
+                if not isinstance(existing, list):
+                    existing = []
+                obs.closureTriggers = [entry, *existing]
+                await db.flush()
     except Exception as e:  # noqa: BLE001
-        import sys
         print(f"TriageAgent failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
     return ObservationOut.model_validate(obs)
 

@@ -119,6 +119,7 @@ async def create_flra(
     for uid in crew_ids:
         db.add(FLRACrewSignature(flraId=flra.id, userId=uid))
     await db.flush()
+    await db.refresh(flra)
     return FLRAOut.model_validate(flra)
 
 

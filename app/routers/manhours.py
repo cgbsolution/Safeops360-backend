@@ -107,4 +107,5 @@ async def create_manhours(
     if existing is None:
         db.add(target)
     await db.flush()
+    await db.refresh(target)
     return ManhoursOut.model_validate(target)

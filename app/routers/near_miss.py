@@ -79,25 +79,29 @@ async def create_near_miss(
     )
     db.add(nm)
     await db.flush()
+    await db.refresh(nm)
 
     try:
-        await workflow_engine.initiate(
-            db,
-            module="NEAR_MISS",
-            record_id=nm.id,
-            record_number=nm.number,
-            record_title=nm.description[:120],
-            record_data={
-                "potentialSeverity": nm.potentialSeverity.value,
-                "plantId": nm.plantId,
-                "reporterId": nm.reporterId,
-            },
-            initiator_id=user.id,
-            plant_id=nm.plantId,
-        )
+        async with db.begin_nested():
+            await workflow_engine.initiate(
+                db,
+                module="NEAR_MISS",
+                record_id=nm.id,
+                record_number=nm.number,
+                record_title=nm.description[:120],
+                record_data={
+                    "potentialSeverity": nm.potentialSeverity.value,
+                    "plantId": nm.plantId,
+                    "reporterId": nm.reporterId,
+                },
+                initiator_id=user.id,
+                plant_id=nm.plantId,
+            )
     except Exception as e:  # noqa: BLE001
         import sys
+        import traceback
         print(f"Near-miss workflow init failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
     return NearMissOut.model_validate(nm)
 

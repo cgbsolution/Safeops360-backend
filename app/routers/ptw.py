@@ -175,27 +175,31 @@ async def create_permit(
     )
     db.add(permit)
     await db.flush()
+    await db.refresh(permit)
 
     try:
-        await workflow_engine.initiate(
-            db,
-            module="PTW",
-            record_id=permit.id,
-            record_number=permit.number,
-            record_title=permit.scopeOfWork[:120],
-            record_data={
-                "type": permit.type.value,
-                "plantId": permit.plantId,
-                "originatorId": permit.originatorId,
-                "issuerId": permit.issuerId,
-                "receiverId": permit.receiverId,
-            },
-            initiator_id=user.id,
-            plant_id=permit.plantId,
-        )
+        async with db.begin_nested():
+            await workflow_engine.initiate(
+                db,
+                module="PTW",
+                record_id=permit.id,
+                record_number=permit.number,
+                record_title=permit.scopeOfWork[:120],
+                record_data={
+                    "type": permit.type.value,
+                    "plantId": permit.plantId,
+                    "originatorId": permit.originatorId,
+                    "issuerId": permit.issuerId,
+                    "receiverId": permit.receiverId,
+                },
+                initiator_id=user.id,
+                plant_id=permit.plantId,
+            )
     except Exception as e:  # noqa: BLE001
         import sys
+        import traceback
         print(f"PTW workflow init failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
     return PermitOut.model_validate(permit)
 
