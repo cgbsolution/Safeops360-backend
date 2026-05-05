@@ -573,15 +573,24 @@ async def initiate(
 
 
 async def _load_task_with_definition(db: AsyncSession, task_id: str) -> tuple[WorkflowTask, WorkflowInstance, list[WorkflowStep]]:
-    task = await db.get(
-        WorkflowTask,
-        task_id,
-        options=[
+    # Use an explicit `select()` with `.execution_options(populate_existing=True)`
+    # so the eager-load options ALWAYS apply — even if the WorkflowTask is
+    # already in the identity map without its `instance`/`definition`/`steps`
+    # relations loaded (which happens when an earlier db.get(WorkflowTask, ...)
+    # without options ran in the same session). `db.get()` would silently
+    # return the cached instance and ignore the options → lazy load on
+    # `task.instance` → MissingGreenlet under async.
+    stmt = (
+        select(WorkflowTask)
+        .where(WorkflowTask.id == task_id)
+        .options(
             selectinload(WorkflowTask.instance)
             .selectinload(WorkflowInstance.definition)
             .selectinload(WorkflowDefinition.steps)
-        ],
+        )
+        .execution_options(populate_existing=True)
     )
+    task = (await db.execute(stmt)).scalar_one_or_none()
     if task is None:
         raise WorkflowError("Task not found")
     instance = task.instance

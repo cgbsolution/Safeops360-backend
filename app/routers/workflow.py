@@ -61,13 +61,26 @@ async def approve(
         # responsiblePersonId, persist it on the Observation BEFORE the
         # engine advances — so the next ASSIGNEE_TASK step's
         # _resolve_assignee finds it via _enrich_record_data.
+        #
+        # IMPORTANT: query only the scalar columns (module, recordId) so
+        # SQLAlchemy doesn't load the WorkflowTask entity into the
+        # identity map. If we used `db.get(WorkflowTask, ...)` here, the
+        # engine's later `_load_task_with_definition` would receive that
+        # cached instance and silently ignore its `selectinload(instance)`
+        # option → `task.instance` would trigger a lazy load and fail
+        # with MissingGreenlet under async.
         rp_id = (payload.recordData or {}).get("responsiblePersonId")
         if rp_id:
-            task = await db.get(WorkflowTask, payload.taskId)
-            if task is not None and task.module == "OBSERVATION":
+            row = (
+                await db.execute(
+                    select(WorkflowTask.module, WorkflowTask.recordId)
+                    .where(WorkflowTask.id == payload.taskId)
+                )
+            ).first()
+            if row is not None and row.module == "OBSERVATION":
                 from app.models.observation import Observation
 
-                obs = await db.get(Observation, task.recordId)
+                obs = await db.get(Observation, row.recordId)
                 if obs is not None and not obs.responsiblePersonId:
                     obs.responsiblePersonId = rp_id
                     await db.flush()
