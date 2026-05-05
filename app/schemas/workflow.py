@@ -1,0 +1,122 @@
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class ApproveRequest(BaseModel):
+    taskId: str
+    comments: str | None = None
+    attachments: list[str] | None = None
+    recordData: dict[str, Any] | None = None
+    plantId: str | None = None
+
+
+class RejectRequest(BaseModel):
+    taskId: str
+    reason: str = Field(min_length=1)
+    comments: str | None = None
+
+
+class SubmitExecutionRequest(BaseModel):
+    taskId: str
+    executionData: dict[str, Any] | None = None
+    comments: str | None = None
+    attachments: list[str] | None = None
+    recordData: dict[str, Any] | None = None
+    plantId: str | None = None
+
+
+class VerifyRequest(BaseModel):
+    taskId: str
+    accepted: bool
+    comments: str | None = None
+    recordData: dict[str, Any] | None = None
+    plantId: str | None = None
+
+
+class ResubmitRequest(BaseModel):
+    instanceId: str
+    comments: str | None = None
+    recordData: dict[str, Any] | None = None
+    plantId: str | None = None
+
+
+class ReassignRequest(BaseModel):
+    taskId: str
+    toUserId: str
+    reason: str | None = None
+
+
+class MyCountResponse(BaseModel):
+    count: int
+
+
+# ─── Definition admin ────────────────────────────────────────────────────
+
+
+class StepInput(BaseModel):
+    id: str | None = None
+    sequence: int
+    stepType: str
+    name: str
+    approverRole: str | None = None
+    approverField: str | None = None
+    approverUserId: str | None = None
+    approverGroupRoles: str | None = None
+    slaHours: int | None = None
+    slaUnit: str | None = None
+    escalationRole: str | None = None
+    isOptional: bool = False
+    conditionExpr: str | None = None
+    notes: str | None = None
+
+
+class DefinitionCreate(BaseModel):
+    module: str
+    recordType: str | None = None
+    name: str
+    description: str | None = None
+    isActive: bool = True
+
+
+class DefinitionUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    recordType: str | None = None
+    isActive: bool | None = None
+    steps: list[StepInput] | None = None
+    changeNote: str | None = None
+
+
+class StepOut(BaseModel):
+    id: str
+    sequence: int
+    stepType: str
+    name: str
+    approverRole: str | None
+    approverField: str | None
+    approverUserId: str | None
+    approverGroupRoles: str | None
+    slaHours: int | None
+    slaUnit: str | None
+    escalationRole: str | None
+    isOptional: bool
+    conditionExpr: str | None
+    notes: str | None
+
+    model_config = {"from_attributes": True}
+
+
+class DefinitionOut(BaseModel):
+    id: str
+    module: str
+    recordType: str | None
+    name: str
+    description: str | None
+    isActive: bool
+    createdAt: datetime
+    updatedAt: datetime
+    steps: list[StepOut]
+
+    model_config = {"from_attributes": True}

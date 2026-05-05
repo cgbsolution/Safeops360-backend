@@ -1,0 +1,303 @@
+"""RBAC seed — direct port of prisma/seed-rbac.ts.
+
+Idempotent. Run as:
+  python -m app.seed.seed_rbac
+
+Adds expanded roles, all permission codes, the default Role × Permission
+matrix, and assigns demo users to RBAC roles via UserRole rows. Does NOT
+touch the User.role denormalised column.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import AsyncSessionLocal
+from app.models.user import Permission, Role, RolePermission, User, UserRole
+
+ADDITIONAL_ROLES: list[dict[str, Any]] = [
+    {"code": "SYSTEM_ADMIN", "name": "System Administrator", "description": "Full configuration access. Alias of ADMIN.", "isSystem": True, "sortOrder": 1, "defaultLanding": "/configuration/workflows"},
+    {"code": "CORPORATE_HSE", "name": "Corporate HSE", "description": "All-plants HSE leadership; manages master data and roll-up reports.", "isSystem": True, "sortOrder": 5, "defaultLanding": "/dashboard"},
+    {"code": "PERMIT_ISSUER", "name": "Permit Issuer", "description": "Originates and approves permits as Issuer.", "isSystem": True, "sortOrder": 25, "defaultLanding": "/inbox"},
+    {"code": "SAFETY_OFFICER", "name": "Safety Officer", "description": "Verifies observations, near-miss closure, permit safety conditions.", "isSystem": True, "sortOrder": 27, "defaultLanding": "/inbox"},
+    {"code": "SUPERVISOR", "name": "Supervisor", "description": "Frontline supervisor; raises FLRA, approves observations within own department.", "isSystem": True, "sortOrder": 80, "defaultLanding": "/inbox"},
+    {"code": "DEPARTMENT_HEAD", "name": "Department Head", "description": "Department-scoped approval authority for non-permit records.", "isSystem": False, "sortOrder": 75, "defaultLanding": "/inbox"},
+    {"code": "MAINTENANCE_HEAD", "name": "Maintenance Head", "description": "Owns equipment master + inspection assignments.", "isSystem": False, "sortOrder": 65, "defaultLanding": "/inspections"},
+    {"code": "LD_MANAGER", "name": "L&D Manager", "description": "Owns training programs across all plants.", "isSystem": False, "sortOrder": 55, "defaultLanding": "/training"},
+    {"code": "TRAINER", "name": "Trainer", "description": "Conducts training sessions and records outcomes.", "isSystem": False, "sortOrder": 90, "defaultLanding": "/training"},
+    {"code": "CONTRACTOR_WORKMAN", "name": "Contractor Workman", "description": "External crew member; restricted to records they're crew on.", "isSystem": False, "sortOrder": 110, "defaultLanding": "/inbox"},
+]
+
+OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS"]
+OPERATIONAL_ACTIONS = ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"]
+
+EXTRA_PERMISSIONS = [
+    {"code": "CONFIGURATION.MASTERS", "module": "CONFIGURATION", "action": "MASTERS", "description": "Manage master data"},
+    {"code": "CONFIGURATION.WORKFLOWS", "module": "CONFIGURATION", "action": "WORKFLOWS", "description": "Edit workflow definitions and steps"},
+    {"code": "CONFIGURATION.USERS", "module": "CONFIGURATION", "action": "USERS", "description": "Create / edit / disable user accounts"},
+    {"code": "CONFIGURATION.PERMISSIONS", "module": "CONFIGURATION", "action": "PERMISSIONS", "description": "Edit role × permission matrix"},
+    {"code": "CONFIGURATION.ROLES", "module": "CONFIGURATION", "action": "ROLES", "description": "Create / edit roles and assign role membership"},
+    {"code": "AUDIT.VIEW", "module": "AUDIT", "action": "VIEW", "description": "Read audit log"},
+]
+
+
+# scope: ALL_PLANTS / OWN_PLANT / OWN_DEPARTMENT / OWN_RECORDS
+ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
+    "WORKER": [
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
+        {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
+        {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_RECORDS"},
+    ],
+    "CONTRACTOR_WORKMAN": [
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
+        {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
+        {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
+    ],
+    "SUPERVISOR": [
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
+        {"module": "PTW", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        {"module": "FLRA", "actions": ["CREATE", "READ", "EXECUTE"], "scope": "OWN_DEPARTMENT"},
+        {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+    ],
+    "PERMIT_ISSUER": [
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
+        {"module": "PTW", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "FLRA", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
+        {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "SAFETY_OFFICER": [
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ", "VERIFY"], "scope": "OWN_PLANT"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_PLANT"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
+        {"module": "PTW", "actions": ["READ", "APPROVE"], "scope": "OWN_PLANT"},
+        {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "INSPECTION", "actions": ["READ", "VERIFY"], "scope": "OWN_PLANT"},
+    ],
+    "HSE_MANAGER": [
+        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
+    ] + [
+        {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "INSPECTION", "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"},
+        {"module": "MANHOURS", "actions": ["CREATE", "READ", "UPDATE", "EXPORT"], "scope": "OWN_PLANT"},
+    ],
+    "PLANT_HEAD": [
+        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
+    ] + [
+        {"module": "PTW", "actions": ["READ", "APPROVE", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "TRAINING", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "INSPECTION", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "MANHOURS", "actions": ["READ", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
+    ],
+    "CORPORATE_HSE": [
+        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
+    ] + [
+        {"module": "PTW", "actions": ["READ", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "FLRA", "actions": ["READ", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "TRAINING", "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"},
+        {"module": "INSPECTION", "actions": ["READ", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "MANHOURS", "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"},
+        {"module": "CONFIGURATION", "actions": ["MASTERS"], "scope": "ALL_PLANTS"},
+        {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
+    ],
+    "TRAINER": [
+        {"module": "TRAINING", "actions": ["READ", "EXECUTE"], "scope": "OWN_PLANT"},
+    ],
+    "LD_MANAGER": [
+        {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "EXPORT"], "scope": "ALL_PLANTS"},
+    ],
+    "DEPARTMENT_HEAD": [
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
+        {"module": "PTW", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+    ],
+    "MAINTENANCE_HEAD": [
+        {"module": "INSPECTION", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "ENVIRONMENT_MANAGER": [
+        {"module": "OBSERVATION", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "INCIDENT", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "CONTRACTOR_COORDINATOR": [
+        {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "OCCUPATIONAL_HEALTH_OFFICER": [
+        {"module": "INCIDENT", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "EMERGENCY_RESPONSE_COORDINATOR": [
+        {"module": "INCIDENT", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "INDUSTRIAL_HYGIENIST": [
+        {"module": "INSPECTION", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "INCIDENT", "actions": ["READ"], "scope": "OWN_PLANT"},
+    ],
+    "ADMIN": [
+        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in OPERATIONAL_MODULES
+    ] + [
+        {"module": "CONFIGURATION", "actions": ["MASTERS", "WORKFLOWS", "USERS", "PERMISSIONS", "ROLES"], "scope": "ALL_PLANTS"},
+        {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
+    ],
+    "SYSTEM_ADMIN": [
+        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in OPERATIONAL_MODULES
+    ] + [
+        {"module": "CONFIGURATION", "actions": ["MASTERS", "WORKFLOWS", "USERS", "PERMISSIONS", "ROLES"], "scope": "ALL_PLANTS"},
+        {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
+    ],
+}
+
+DEMO_OVERLAYS = [
+    {"emailContains": "rajesh", "roleCode": "PERMIT_ISSUER"},
+    {"emailContains": "rajesh", "roleCode": "SUPERVISOR"},
+    {"emailContains": "priya", "roleCode": "SAFETY_OFFICER"},
+    {"emailContains": "ravi", "roleCode": "CORPORATE_HSE"},
+    {"emailContains": "anjali", "roleCode": "HSE_MANAGER"},
+    {"emailContains": "suresh", "roleCode": "PLANT_HEAD"},
+]
+
+
+async def upsert_role(db: AsyncSession, r: dict[str, Any]) -> Role:
+    existing = (await db.execute(select(Role).where(Role.code == r["code"]))).scalar_one_or_none()
+    if existing:
+        existing.name = r["name"]
+        existing.description = r["description"]
+        existing.sortOrder = r["sortOrder"]
+        existing.defaultLanding = r["defaultLanding"]
+        existing.isActive = True
+        return existing
+    new = Role(
+        code=r["code"], name=r["name"], description=r["description"],
+        isSystem=r["isSystem"], sortOrder=r["sortOrder"], defaultLanding=r["defaultLanding"], isActive=True,
+    )
+    db.add(new)
+    await db.flush()
+    return new
+
+
+async def upsert_permission(db: AsyncSession, p: dict[str, Any]) -> Permission:
+    existing = (await db.execute(select(Permission).where(Permission.code == p["code"]))).scalar_one_or_none()
+    if existing:
+        existing.module = p["module"]
+        existing.action = p["action"]
+        existing.description = p["description"]
+        return existing
+    new = Permission(code=p["code"], module=p["module"], action=p["action"], description=p["description"])
+    db.add(new)
+    await db.flush()
+    return new
+
+
+async def main() -> None:
+    print("🔐  RBAC seed: roles + permissions + grants + user-role assignments")
+    async with AsyncSessionLocal() as db:
+        # 1) Roles
+        for r in ADDITIONAL_ROLES:
+            await upsert_role(db, r)
+
+        # 2) Permission catalogue
+        catalogue: list[dict[str, Any]] = []
+        for m in OPERATIONAL_MODULES:
+            for a in OPERATIONAL_ACTIONS:
+                catalogue.append({"code": f"{m}.{a}", "module": m, "action": a, "description": f"{a} on {m}"})
+        catalogue.extend(EXTRA_PERMISSIONS)
+        for p in catalogue:
+            await upsert_permission(db, p)
+        print(f"   permissions catalogued: {len(catalogue)}")
+
+        # 3) Wipe + re-create role-permission grants
+        await db.execute(delete(RolePermission))
+        await db.flush()
+
+        roles_by_code = {r.code: r for r in (await db.execute(select(Role))).scalars().all()}
+        perms_by_code = {p.code: p for p in (await db.execute(select(Permission))).scalars().all()}
+        grants_created = 0
+        for role_code, grants in ROLE_GRANTS.items():
+            role = roles_by_code.get(role_code)
+            if role is None:
+                continue
+            for g in grants:
+                for action in g["actions"]:
+                    perm = perms_by_code.get(f"{g['module']}.{action}")
+                    if perm is None:
+                        continue
+                    db.add(RolePermission(roleId=role.id, permissionId=perm.id, scope=g["scope"]))
+                    grants_created += 1
+        await db.flush()
+        print(f"   role-permission grants created: {grants_created}")
+
+        # 4) Backfill UserRole from User.role + apply demo overlays
+        await db.execute(delete(UserRole))
+        await db.flush()
+
+        all_users = (await db.execute(select(User))).scalars().all()
+        for u in all_users:
+            rid = roles_by_code.get(u.role)
+            if rid is None:
+                continue
+            db.add(
+                UserRole(
+                    userId=u.id,
+                    roleId=rid.id,
+                    scopeType="PLANT" if u.plantId else None,
+                    scopeValue=u.plantId,
+                )
+            )
+        await db.flush()
+
+        for o in DEMO_OVERLAYS:
+            user = next((u for u in all_users if o["emailContains"].lower() in u.email.lower()), None)
+            role = roles_by_code.get(o["roleCode"])
+            if user is None or role is None:
+                continue
+            existing = (
+                await db.execute(
+                    select(UserRole).where(UserRole.userId == user.id, UserRole.roleId == role.id)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                continue
+            db.add(
+                UserRole(
+                    userId=user.id, roleId=role.id,
+                    scopeType="PLANT" if user.plantId else None,
+                    scopeValue=user.plantId,
+                )
+            )
+
+        # SYSTEM_ADMIN overlay on the bootstrap admin
+        admin_user = next((u for u in all_users if "admin" in u.email.lower()), None)
+        sysadmin_role = roles_by_code.get("SYSTEM_ADMIN")
+        if admin_user and sysadmin_role:
+            existing = (
+                await db.execute(
+                    select(UserRole).where(UserRole.userId == admin_user.id, UserRole.roleId == sysadmin_role.id)
+                )
+            ).scalar_one_or_none()
+            if not existing:
+                db.add(UserRole(userId=admin_user.id, roleId=sysadmin_role.id))
+
+        await db.commit()
+
+        ur_count = (await db.execute(select(__import__("sqlalchemy", fromlist=["func"]).func.count()).select_from(UserRole))).scalar_one()
+        print(f"   user-role assignments: {ur_count}")
+    print("✅  RBAC seed complete.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
