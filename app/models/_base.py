@@ -27,9 +27,13 @@ class TimestampMixin:
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # `server_default` (DB-side) on INSERT — SQLAlchemy uses RETURNING to
+    # load the value into memory, so a subsequent `model_validate(obj)`
+    # never lazy-loads (which would trip MissingGreenlet under async).
+    # `onupdate=func.now()` keeps the value fresh on every UPDATE.
     updatedAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=func.now(),
+        server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
     )

@@ -78,8 +78,15 @@ class Observation(Base, IdMixin):
     )
 
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # `server_default` (DB-side) on INSERT so SQLAlchemy uses RETURNING to
+    # populate the value into the in-memory object — without this, a
+    # subsequent `model_validate(obs)` would lazy-load and trip
+    # MissingGreenlet under async. `onupdate=func.now()` keeps the value
+    # fresh on every UPDATE.
     updatedAt: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=func.now(), onupdate=func.now()
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     # Audit log of post-closure cross-module triggers (Dimension 4) +

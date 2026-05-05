@@ -147,12 +147,6 @@ async def create_observation(
     )
     db.add(obs)
     await db.flush()
-    # Refresh so DB-side defaults (createdAt, updatedAt — both populated
-    # via `default=func.now()`) are loaded into the in-memory object.
-    # Without this, Pydantic's `model_validate(obs)` later tries to lazy-
-    # load the unloaded attributes and trips MissingGreenlet because the
-    # async session context isn't available during sync attribute access.
-    await db.refresh(obs)
 
     # Kick off workflow. Best-effort — workflow init failures must NOT
     # poison the main transaction (otherwise the Observation INSERT, even
@@ -220,6 +214,14 @@ async def create_observation(
         print(f"TriageAgent failed: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
+    # Final refresh before serialising. The savepoint flushes above
+    # (workflow init, TriageAgent's UPDATE on closureTriggers) leave
+    # `obs` with expired attributes — even with expire_on_commit=False
+    # SQLAlchemy can mark fields stale after a write. Reading any of
+    # those (e.g. updatedAt) inside Pydantic's sync validator triggers
+    # MissingGreenlet because the lazy load needs an async context.
+    # Refreshing here loads everything in one round-trip.
+    await db.refresh(obs)
     return ObservationOut.model_validate(obs)
 
 
@@ -280,6 +282,7 @@ async def update_observation(
     if payload.closingRemark is not None:
         obs.closingRemark = payload.closingRemark
     await db.flush()
+    await db.refresh(obs)
     return ObservationOut.model_validate(obs)
 
 
