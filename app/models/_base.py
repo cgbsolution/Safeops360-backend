@@ -27,13 +27,15 @@ class TimestampMixin:
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    # `server_default` (DB-side) on INSERT — SQLAlchemy uses RETURNING to
-    # load the value into memory, so a subsequent `model_validate(obj)`
-    # never lazy-loads (which would trip MissingGreenlet under async).
-    # `onupdate=func.now()` keeps the value fresh on every UPDATE.
+    # MUST be `default=func.now()` (NOT `server_default`). Prisma's
+    # `@updatedAt` is client-managed — the DB column has NO DEFAULT.
+    # A `server_default` would make SQLAlchemy omit updatedAt from the
+    # INSERT and Postgres rejects it (NOT NULL, no default). Routes that
+    # serialise the row via `model_validate` MUST `await db.refresh(x)`
+    # first so the inline-NOW() value is loaded into memory.
     updatedAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        server_default=func.now(),
+        default=func.now(),
         onupdate=func.now(),
         nullable=False,
     )

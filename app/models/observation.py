@@ -78,14 +78,17 @@ class Observation(Base, IdMixin):
     )
 
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    # `server_default` (DB-side) on INSERT so SQLAlchemy uses RETURNING to
-    # populate the value into the in-memory object — without this, a
-    # subsequent `model_validate(obs)` would lazy-load and trip
-    # MissingGreenlet under async. `onupdate=func.now()` keeps the value
-    # fresh on every UPDATE.
+    # MUST be `default=func.now()` (NOT `server_default`). Prisma's
+    # `@updatedAt` is client-managed — there is no DB-level DEFAULT on
+    # this column, so a `server_default` would have SQLAlchemy omit
+    # updatedAt from the INSERT and Postgres rejects it (NOT NULL, no
+    # default). With `default=func.now()` SQLAlchemy emits NOW() inline.
+    # The post-flush `db.refresh(obs)` call in the route loads the
+    # computed value into the in-memory object so model_validate doesn't
+    # trip MissingGreenlet.
     updatedAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        server_default=func.now(),
+        default=func.now(),
         onupdate=func.now(),
     )
 
