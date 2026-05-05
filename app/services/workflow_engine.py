@@ -377,6 +377,19 @@ async def _sync_record_status(
             obs.closedAt = datetime.now(timezone.utc)
             await db.flush()
 
+        # Post-closure cross-module triggers (Dimension 4). Today this is
+        # just the LessonsDistributionAgent (Anthropic) — additional rules
+        # (focused inspection on repeats, contractor score, PPE trend etc.)
+        # can be ported from src/lib/observation/post-closure-rules.ts.
+        # Each trigger is best-effort; failures must NEVER block closure.
+        try:
+            from app.services.post_closure_rules import run_post_closure_rules
+
+            await run_post_closure_rules(db, observation_id=record_id)
+        except Exception as e:  # noqa: BLE001
+            import sys
+            print(f"[post-closure] OBSERVATION {record_id}: {e}", file=sys.stderr)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Task creation

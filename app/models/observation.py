@@ -82,6 +82,14 @@ class Observation(Base, IdMixin):
         DateTime(timezone=True), default=func.now(), onupdate=func.now()
     )
 
+    # Audit log of post-closure cross-module triggers (Dimension 4) +
+    # AI agent outputs (LessonsDistributionAgent, TriageAgent, etc.).
+    # Shape: list of `{ ruleId, ruleName, fired, reason?, error?, data? }`.
+    # Triage entries (run on submission, not closure) are stored here too
+    # under ruleId="rule_triage_on_submit" — Prisma's JSON column doesn't
+    # need a separate aiTriage field.
+    closureTriggers: Mapped[list | None] = mapped_column(JSON)
+
 
 # Same shape as IncidentAttachment — see that model for upload lifecycle.
 class ObservationAttachment(Base, IdMixin):

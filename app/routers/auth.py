@@ -73,3 +73,18 @@ async def me(user: User = Depends(get_current_user)) -> UserOut:
         designation=user.designation,
         department=user.department,
     )
+
+
+@router.get("/demo-user")
+async def demo_user_lookup(email: str, db: AsyncSession = Depends(get_db)) -> dict[str, str | None]:
+    """Public lookup used by the login page's demo role picker — given the
+    composed demo email, returns just the user's display name + designation.
+    Restricted to @safeops360.in addresses so it can't be used as a generic
+    user-enumeration oracle."""
+    e = (email or "").strip().lower()
+    if not e or not e.endswith("@safeops360.in"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "demo email required")
+    row = (await db.execute(select(User).where(User.email == e))).scalar_one_or_none()
+    if row is None:
+        return {"name": None, "designation": None}
+    return {"name": row.name, "designation": row.designation}

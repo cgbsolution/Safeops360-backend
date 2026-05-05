@@ -176,6 +176,38 @@ async def create_observation(
         print(f"Observation workflow init failed: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
+    # TriageAgent — run on submission. Best-effort, never blocks creation.
+    # Output is appended to closureTriggers with ruleId="rule_triage_on_submit".
+    try:
+        from app.services.ai.agents.triage import run_triage
+
+        triage = await run_triage(
+            observation={
+                "type": obs.type.value,
+                "category": obs.category.value,
+                "severity": obs.severity.value,
+                "description": obs.description,
+                "immediateAction": obs.immediateAction,
+            }
+        )
+        if triage is not None:
+            entry = {
+                "ruleId": "rule_triage_on_submit",
+                "ruleName": "Triage (AI)",
+                "fired": not triage.get("skipped", False),
+                "reason": triage.get("rationale") or triage.get("reason") or "",
+                "spawnedRecordType": "AI_TRIAGE",
+                "data": triage,
+            }
+            existing = obs.closureTriggers or []
+            if not isinstance(existing, list):
+                existing = []
+            obs.closureTriggers = [entry, *existing]
+            await db.flush()
+    except Exception as e:  # noqa: BLE001
+        import sys
+        print(f"TriageAgent failed: {e}", file=sys.stderr)
+
     return ObservationOut.model_validate(obs)
 
 
