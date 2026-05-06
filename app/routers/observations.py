@@ -286,6 +286,69 @@ async def update_observation(
     return ObservationOut.model_validate(obs)
 
 
+@router.delete("/{observation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_observation(
+    observation_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete an observation. Per the RBAC matrix, only HSE_MANAGER
+    (own plant), CORPORATE_HSE (all plants), and SYSTEM_ADMIN (all plants)
+    have OBSERVATION.DELETE — the permission service enforces the scope.
+    Cascades remove the workflow instance, tasks, history, and any
+    attachments via DB foreign keys (ondelete=CASCADE)."""
+    obs = await db.get(Observation, observation_id)
+    if obs is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Observation not found")
+    record_dict = {
+        "observerId": obs.observerId,
+        "responsiblePersonId": obs.responsiblePersonId,
+    }
+    result = await can(
+        db,
+        user.id,
+        "OBSERVATION.DELETE",
+        PermissionContext(record_id=obs.id, plant_id=obs.plantId, record=record_dict),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    # Drop the workflow instance + downstream rows first. Prisma's
+    # WorkflowInstance has ondelete CASCADE on its FKs to history/tasks,
+    # but Observation doesn't FK into WorkflowInstance — we have to
+    # delete it ourselves.
+    from app.models.workflow import WorkflowInstance
+
+    inst_rows = (
+        await db.execute(
+            select(WorkflowInstance).where(
+                WorkflowInstance.module == "OBSERVATION",
+                WorkflowInstance.recordId == observation_id,
+            )
+        )
+    ).scalars().all()
+    for inst in inst_rows:
+        await db.delete(inst)
+
+    # Soft-delete attachments instead of hard-delete so the storage
+    # objects (Supabase) can be reaped later by a cleanup job.
+    att_rows = (
+        await db.execute(
+            select(ObservationAttachment).where(
+                ObservationAttachment.observationId == observation_id,
+                ObservationAttachment.deletedAt.is_(None),
+            )
+        )
+    ).scalars().all()
+    now = datetime.now(timezone.utc)
+    for att in att_rows:
+        att.deletedAt = now
+
+    await db.delete(obs)
+    await db.flush()
+    return None
+
+
 # ─── Attachments ─────────────────────────────────────────────────────────
 # Same two-phase upload pattern as IncidentAttachment — see that router for
 # the design notes (init → direct PUT to Supabase signed URL → complete).

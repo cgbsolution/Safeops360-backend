@@ -22,7 +22,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -392,6 +392,46 @@ async def _sync_record_status(
         except Exception as e:  # noqa: BLE001
             import sys
             print(f"[post-closure] OBSERVATION {record_id}: {e}", file=sys.stderr)
+    elif module == "NEAR_MISS" and instance_completed:
+        # Mirror of the OBSERVATION closure path, plus the 10-rule near
+        # miss engine (Dimension 4 of the Near Miss refactor brief).
+        from app.models.near_miss import NearMiss, NearMissStatus
+
+        nm = await db.get(NearMiss, record_id)
+        if nm is not None and nm.status != NearMissStatus.CLOSED:
+            nm.status = NearMissStatus.CLOSED
+            nm.closedAt = datetime.now(timezone.utc)
+            nm.slaActualClosedAt = nm.closedAt
+            # SLA performance string — populated for analytics + sidebar display.
+            # Defensively coerce both sides to UTC-aware before subtracting:
+            # `nm.closedAt` is aware (we just set it via datetime.now(tz=utc)),
+            # but `nm.slaTargetAt` may come back from older rows as naive
+            # depending on how the value was originally written. A naive ↔
+            # aware subtraction raises TypeError, so normalise first.
+            if nm.slaTargetAt:
+                target = nm.slaTargetAt
+                closed = nm.closedAt
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                if closed.tzinfo is None:
+                    closed = closed.replace(tzinfo=timezone.utc)
+                delta_h = (target - closed).total_seconds() / 3600.0
+                nm.slaPerformance = (
+                    f"On time ({int(delta_h)}h spare)" if delta_h >= 0
+                    else f"Late by {int(abs(delta_h))}h"
+                )
+            await db.flush()
+
+        # Run the 10 post-closure rules. Best-effort + savepoint, same
+        # pattern as observation.
+        try:
+            async with db.begin_nested():
+                from app.services.post_closure_rules_nm import run_near_miss_post_closure_rules
+
+                await run_near_miss_post_closure_rules(db, near_miss_id=record_id)
+        except Exception as e:  # noqa: BLE001
+            import sys
+            print(f"[post-closure] NEAR_MISS {record_id}: {e}", file=sys.stderr)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -412,74 +452,174 @@ async def _create_task_for_step(
     initiator_id: str,
     plant_id: str | None,
 ) -> WorkflowTask | None:
-    # SQLAlchemy returns step.stepType as a StepType enum (str-subclass).
-    # Coerce to plain str so dict lookups + comparisons are predictable
-    # whether SQLAlchemy hands back an enum or a raw string.
+    """Single-task convenience wrapper that returns the first task created
+    by `_create_tasks_for_step`. Use that helper directly when you need
+    the full list (e.g. parallel-strategy steps)."""
+    tasks = await _create_tasks_for_step(
+        db,
+        instance=instance,
+        step=step,
+        record_data=record_data,
+        record_number=record_number,
+        record_title=record_title,
+        module=module,
+        record_id=record_id,
+        initiator_id=initiator_id,
+        plant_id=plant_id,
+    )
+    return tasks[0] if tasks else None
+
+
+async def _create_tasks_for_step(
+    db: AsyncSession,
+    *,
+    instance: WorkflowInstance,
+    step: WorkflowStep,
+    record_data: dict[str, Any],
+    record_number: str | None,
+    record_title: str | None,
+    module: str,
+    record_id: str,
+    initiator_id: str,
+    plant_id: str | None,
+) -> list[WorkflowTask]:
+    """Create one or more PENDING WorkflowTask rows for this step.
+
+    Returns a list because steps with `parallelStrategy` set fan out into
+    multiple tasks (joint approval × N reviewers, or one execution task
+    per NearMissCapa). Single-task steps return a 1-element list. MAKER
+    and unsupported step types return [].
+    """
     step_type = step.stepType.value if hasattr(step.stepType, "value") else str(step.stepType)
 
     if step_type == StepType.MAKER.value:
-        # MAKER is implicit — the act of submitting the record IS the maker step.
-        return None
+        return []
 
     task_type_map = {
         StepType.CHECKER.value: TaskType.APPROVAL.value,
         StepType.ASSIGNEE_TASK.value: TaskType.EXECUTION.value,
         StepType.VERIFIER.value: TaskType.VERIFICATION.value,
-        # CLOSURE — HSE Manager (or designated closer) confirms the record
-        # can be closed. Modelled as an APPROVAL task so the existing
-        # approval panel handles the UI; approving it advances past the
-        # last step → instance COMPLETED → record marked closed.
         StepType.CLOSURE.value: TaskType.APPROVAL.value,
     }
     task_type = task_type_map.get(step_type)
     if task_type is None:
-        return None
+        return []
 
-    # Safety net: callers (the approval/execution panels) sometimes pass a
-    # partial record_data that doesn't include the fields needed by the
-    # next step's approverField (e.g. ACTION_OWNER → responsiblePersonId).
-    # Load the actual record from DB and merge its key fields so assignee
-    # resolution can succeed without depending on what the UI sent.
     enriched = await _enrich_record_data(db, module=module, record_id=record_id, base=record_data)
 
-    assignee_id = await _resolve_assignee(
-        db,
-        approver_role=step.approverRole,
-        approver_field=step.approverField,
-        approver_user_id=step.approverUserId,
-        approver_group_roles=step.approverGroupRoles,
-        record_data=enriched,
-        initiator_id=initiator_id,
-        plant_id=plant_id,
-    )
+    # ── Severity-driven SLA override (slaBySeverity wins over slaHours) ──
+    sla_hours = _resolve_sla_hours(step, enriched)
 
-    # Prisma's WorkflowTask requires a non-null assignedToId. If the
-    # resolver returned None (no eligible user found), fall back to the
-    # workflow initiator so the row is at least valid; the task can be
-    # reassigned manually later.
-    if not assignee_id:
-        assignee_id = initiator_id
+    # ── Parallel strategies ────────────────────────────────────────────
+    strategy = step.parallelStrategy or None
 
-    # task_type is already the .value string from task_type_map; do NOT call
-    # .value on it again — that throws AttributeError, which the route's
-    # outer try/except swallows, leaving the workflow instance with zero
-    # pending tasks and an empty "Awaiting Action" panel on the detail page.
-    task = WorkflowTask(
-        instanceId=instance.id,
-        stepId=step.id,
-        stepName=step.name,
-        taskType=task_type,
-        module=module,
-        recordId=record_id,
-        recordNumber=record_number,
-        recordTitle=record_title,
-        assignedToId=assignee_id,
-        status=TaskStatus.PENDING.value,
-        dueAt=_calc_due_at(step),
+    assignees: list[str] = []
+
+    if strategy == "JOINT_APPROVAL" and step.approverGroupRoles:
+        # One task per role in the group, all must complete to advance.
+        roles = _parse_group_roles(step.approverGroupRoles)
+        seen: set[str] = set()
+        for role in roles:
+            uid = await _find_user_by_roles(db, [role], plant_id)
+            if uid and uid not in seen:
+                assignees.append(uid)
+                seen.add(uid)
+        if not assignees:
+            assignees = [initiator_id]
+
+    elif strategy == "CAPA_FAN_OUT" and module == "NEAR_MISS":
+        # One task per NearMissCapa row attached to this near miss. Each
+        # CAPA owner gets their own EXECUTION task; the parent step
+        # advances only when ALL CAPAs are completed.
+        from app.models.near_miss_children import NearMissCapa
+
+        capa_rows = (
+            await db.execute(
+                select(NearMissCapa).where(NearMissCapa.nearMissId == record_id)
+            )
+        ).scalars().all()
+        for capa in capa_rows:
+            if capa.ownerId:
+                assignees.append(capa.ownerId)
+        if not assignees:
+            # No CAPAs defined — fall back to single task assigned to
+            # the suggested action owner / initiator. The reviewer will
+            # add CAPAs at the previous step normally.
+            assignees = [initiator_id]
+
+    else:
+        # Default single-task path
+        assignee = await _resolve_assignee(
+            db,
+            approver_role=step.approverRole,
+            approver_field=step.approverField,
+            approver_user_id=step.approverUserId,
+            approver_group_roles=step.approverGroupRoles,
+            record_data=enriched,
+            initiator_id=initiator_id,
+            plant_id=plant_id,
+        )
+        assignees = [assignee or initiator_id]
+
+    # Build tasks
+    due_at = (
+        datetime.now(timezone.utc) + timedelta(hours=sla_hours) if sla_hours else None
     )
-    db.add(task)
+    tasks: list[WorkflowTask] = []
+    for uid in assignees:
+        t = WorkflowTask(
+            instanceId=instance.id,
+            stepId=step.id,
+            stepName=step.name,
+            taskType=task_type,
+            module=module,
+            recordId=record_id,
+            recordNumber=record_number,
+            recordTitle=record_title,
+            assignedToId=uid,
+            status=TaskStatus.PENDING.value,
+            dueAt=due_at,
+        )
+        db.add(t)
+        tasks.append(t)
     await db.flush()
-    return task
+    return tasks
+
+
+def _parse_group_roles(raw: str) -> list[str]:
+    """approverGroupRoles is stored as either a JSON array string or a
+    comma-separated list. Accept both."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return [r.strip() for r in raw.split(",") if r.strip()]
+
+
+def _resolve_sla_hours(step: WorkflowStep, record_data: dict[str, Any]) -> int | None:
+    """Pick the SLA in hours for this step. `slaBySeverity` (JSON map)
+    wins over `slaHours`, keyed by record_data['potentialSeverity'] |
+    record_data['severity']."""
+    by_sev = step.slaBySeverity or None
+    if isinstance(by_sev, dict):
+        sev = (
+            record_data.get("potentialSeverity")
+            or record_data.get("severity")
+        )
+        if isinstance(sev, str):
+            sev = sev.upper()
+        if sev and sev in by_sev:
+            try:
+                return int(by_sev[sev])
+            except (TypeError, ValueError):
+                pass
+    return step.slaHours
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -614,8 +754,8 @@ async def _advance(
     current_step = next((s for s in steps if s.id == task.stepId), None)
     if current_step is None:
         raise WorkflowError("Step missing")
-    next_step = _find_next_applicable_step(steps, current_step.sequence, record_data)
 
+    # Mark this specific task complete and record history first.
     task.status = TaskStatus.COMPLETED.value
     task.completedAt = datetime.now(timezone.utc)
     db.add(
@@ -629,6 +769,31 @@ async def _advance(
             attachments=json.dumps(attachments) if attachments else None,
         )
     )
+    await db.flush()
+
+    # Parallel-step gate: if other PENDING tasks remain on the SAME step
+    # (joint-approval reviewers still working, other CAPA owners not yet
+    # done), don't advance the instance. Just record this completion and
+    # return — the workflow waits for the rest.
+    remaining_stmt = (
+        select(func.count())
+        .select_from(WorkflowTask)
+        .where(WorkflowTask.instanceId == instance.id)
+        .where(WorkflowTask.stepId == current_step.id)
+        .where(WorkflowTask.status == TaskStatus.PENDING.value)
+    )
+    remaining = (await db.execute(remaining_stmt)).scalar_one()
+    if remaining > 0:
+        return {
+            "ok": True,
+            "waitingFor": remaining,
+            "stepName": current_step.name,
+            "advancedTo": None,
+        }
+
+    # All tasks on this step are done — advance the instance to the next
+    # applicable step.
+    next_step = _find_next_applicable_step(steps, current_step.sequence, record_data)
 
     if next_step:
         instance.currentStepId = next_step.id
@@ -638,10 +803,6 @@ async def _advance(
         instance.currentStepName = "Completed"
         instance.status = InstanceStatus.COMPLETED.value
         instance.completedAt = datetime.now(timezone.utc)
-        # Clean up any other PENDING tasks for this instance — duplicates
-        # from past engine bugs (or stale tasks from a recovered orphan)
-        # would otherwise show as live "Awaiting Action" entries even
-        # though the workflow is closed.
         await _close_pending_tasks(db, instance_id=instance.id, except_task_id=task.id)
     await db.flush()
 
@@ -666,6 +827,49 @@ async def _advance(
         next_step_type=next_step.stepType if next_step else None,
         instance_completed=next_step is None,
     )
+
+    # Post-step hooks. Anything that needs to run AFTER a specific step
+    # finishes (across all approvers, parallel-step gate cleared) goes
+    # here. Today we have one: auto-promote a CRITICAL near miss to an
+    # Incident the moment Joint Review approves. The NM workflow keeps
+    # running in parallel with the spawned investigation.
+    if (
+        task.module == "NEAR_MISS"
+        and current_step.name == "Joint Review"
+        and action == Action.APPROVED.value
+    ):
+        try:
+            from app.models.near_miss import NearMiss
+            from app.models.observation import Severity
+
+            nm = await db.get(NearMiss, task.recordId)
+            if (
+                nm is not None
+                and nm.potentialSeverity == Severity.CRITICAL
+                and not nm.promotedIncidentId
+            ):
+                from app.services.auto_promote_near_miss import (
+                    promote_near_miss_to_incident,
+                )
+
+                await promote_near_miss_to_incident(
+                    db,
+                    near_miss_id=nm.id,
+                    actor_id=user_id,
+                    suspend_workflow=False,  # NM continues; Incident parallel
+                )
+        except Exception as e:  # noqa: BLE001
+            # Never block the approval over a promotion failure. Log + carry
+            # on; an admin can backfill via the manual-promote endpoint.
+            import sys as _sys
+            import traceback as _tb
+
+            print(
+                f"[workflow] post-Joint-Review auto-promote failed: {e}",
+                file=_sys.stderr,
+            )
+            _tb.print_exc(file=_sys.stderr)
+
     return {"ok": True, "advancedTo": next_step.name if next_step else "Completed"}
 
 

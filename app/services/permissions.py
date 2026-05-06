@@ -253,6 +253,15 @@ async def get_permissions(db: AsyncSession, user_id: str) -> dict[str, bool]:
     return {r.permission_code: True for r in rows}
 
 
+async def get_module_scopes(db: AsyncSession, user_id: str, module_prefix: str) -> set[str]:
+    """Return the unique scopes the user holds for permissions starting with
+    `module_prefix` (e.g. "NEAR_MISS." or "OBSERVATION."). Used by masters
+    endpoints to decide whether a dropdown should show plant-wide options
+    or restrict to the caller's own department."""
+    rows = await _load_user_permissions(db, user_id)
+    return {r.scope for r in rows if r.permission_code.startswith(module_prefix)}
+
+
 async def get_accessible_plants(db: AsyncSession, user_id: str) -> list[str] | None:
     """Returns the plant IDs the user can act in. None == unrestricted."""
     rows = await _load_user_permissions(db, user_id)

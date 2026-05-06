@@ -59,7 +59,11 @@ class Incident(Base, IdMixin):
     lostDays: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     propertyDamageCost: Mapped[float | None] = mapped_column(Numeric(12, 2))
 
-    fromNearMissId: Mapped[str | None] = mapped_column(ForeignKey("NearMiss.id"))
+    # NOTE: the FK linking an Incident back to its originating NearMiss
+    # lives on the NearMiss side as `NearMiss.promotedIncidentId` (1-to-1).
+    # There is intentionally no `fromNearMissId` column on Incident — the
+    # Prisma schema is the source of truth and only declares the reverse
+    # relation here. Query via NearMiss.promotedIncidentId == incident.id.
 
     status: Mapped[IncidentStatus] = mapped_column(
         Enum(IncidentStatus, name="IncidentStatus", native_enum=False), nullable=False, default=IncidentStatus.REPORTED

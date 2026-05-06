@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models._base import Base, IdMixin
@@ -89,6 +89,11 @@ class WorkflowStep(Base, IdMixin):
     isOptional: Mapped[bool] = mapped_column(Boolean, default=False)
     conditionExpr: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
+    # Parallel-task strategy: JOINT_APPROVAL or CAPA_FAN_OUT (or null
+    # for the default single-task behaviour). See workflow_engine.py.
+    parallelStrategy: Mapped[str | None] = mapped_column(String)
+    # Optional severity-driven SLA override: {"LOW":336,"HIGH":48,...}
+    slaBySeverity: Mapped[dict | None] = mapped_column(JSON)
 
     definition: Mapped[WorkflowDefinition] = relationship(back_populates="steps")
 

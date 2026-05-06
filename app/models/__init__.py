@@ -15,7 +15,16 @@ from app.models.incident import (
     IncidentType,
 )
 from app.models.manhours import Manhours
+from app.models.masters import ContractorCompany, Department, MasterItem
 from app.models.near_miss import NearMiss, NearMissStatus
+from app.models.near_miss_children import (
+    NearMissAttachment,
+    NearMissCapa,
+    NearMissComment,
+    NearMissPersonAffected,
+    NearMissPersonInvolved,
+    NearMissWitness,
+)
 from app.models.observation import (
     Observation,
     ObservationAttachment,

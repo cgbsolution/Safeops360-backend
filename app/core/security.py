@@ -1,46 +1,43 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.core.config import get_settings
 
 settings = get_settings()
 
-# bcrypt has a 72-byte limit on the input password. bcryptjs (used by the
-# Node side) silently truncates; bcrypt 4.1+ raises ValueError. To stay
-# bug-compatible with whatever bcryptjs wrote into the User table, we pre-
-# truncate the input ourselves before passlib touches it. truncate_error=
-# False on the bcrypt scheme is also belt-and-suspenders.
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto",
-    bcrypt__truncate_error=False,
-)
+# Direct bcrypt usage — passlib 1.7.4 is incompatible with bcrypt 5.x
+# (silently returns False from verify), so we skip the wrapper and call
+# the bcrypt library directly. Hash format is the standard $2a$/$2b$
+# bcrypt format, which is byte-identical to what Node's bcryptjs writes,
+# so all existing passwords in the User table continue to verify.
 
 
-def _truncate_72(plain: str) -> str:
-    """Match bcryptjs's silent-truncate behaviour. Encode in UTF-8, slice
-    to 72 bytes, decode back ignoring incomplete tail bytes. Equivalent of
-    bcryptjs's `await bcrypt.compare(password, hash)` for long passwords."""
+def _truncate_72(plain: str) -> bytes:
+    """bcrypt has a 72-byte input limit. bcryptjs (Node) silently truncates;
+    Python's bcrypt 4.1+ raises. We pre-truncate to stay byte-compatible
+    with hashes written by bcryptjs. Returns UTF-8 bytes ready for bcrypt."""
     raw = plain.encode("utf-8")
-    if len(raw) <= 72:
-        return plain
-    return raw[:72].decode("utf-8", errors="ignore")
+    return raw[:72] if len(raw) > 72 else raw
 
 
 def hash_password(plain: str) -> str:
-    return pwd_context.hash(_truncate_72(plain))
+    """Hash a password with bcrypt cost factor 10 — same default bcryptjs
+    uses, so hashes are interchangeable across Node and Python writers."""
+    return bcrypt.hashpw(_truncate_72(plain), bcrypt.gensalt(rounds=10)).decode("ascii")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
+    """Verify a plaintext password against a stored bcrypt hash. Returns
+    False on any error (malformed hash, wrong format, etc.) so a bad row
+    can never crash login — the caller treats it as a wrong password."""
+    if not hashed:
+        return False
     try:
-        return pwd_context.verify(_truncate_72(plain), hashed)
-    except (ValueError, Exception):
-        # Defensive: a malformed hash in the DB or a bcrypt-version mismatch
-        # should never crash the login endpoint — return False so callers
-        # treat it as a wrong password.
+        return bcrypt.checkpw(_truncate_72(plain), hashed.encode("ascii"))
+    except (ValueError, TypeError):
         return False
 
 

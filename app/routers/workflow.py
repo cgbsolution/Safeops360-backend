@@ -183,7 +183,8 @@ async def reassign(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Reassign a pending task to another user. Allowed by the current task
-    holder OR HSE_MANAGER / ADMIN."""
+    holder OR HSE_MANAGER / ADMIN. Records an audit-trail entry so the
+    workflow tracker shows who reassigned to whom and why."""
     task = await db.get(WorkflowTask, payload.taskId)
     if task is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
@@ -193,13 +194,49 @@ async def reassign(
     is_privileged = any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes)
     if task.assignedToId != user.id and not is_privileged:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the current task holder or HSE Manager can reassign")
+
+    # Resolve old / new user names so the audit entry is human-readable
+    # without the UI having to dereference IDs after the fact.
+    old_user = await db.get(User, task.assignedToId)
     new_user = await db.get(User, payload.toUserId)
     if new_user is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target user not found")
+
+    reason = (payload.reason or "").strip() or "(no reason provided)"
+    audit_msg = (
+        f"Reassigned from {old_user.name if old_user else task.assignedToId} → "
+        f"{new_user.name}. Reason: {reason}"
+    )
+
+    # Write the audit row BEFORE mutating the task — this way both rows
+    # land in one flush and the history reflects the actor + the change.
+    db.add(
+        WorkflowHistory(
+            instanceId=task.instanceId,
+            stepId=task.stepId,
+            stepName=task.stepName,
+            action=Action.REASSIGNED.value,
+            performedById=user.id,
+            comments=audit_msg,
+        )
+    )
+
     task.assignedToId = payload.toUserId
     task.assignedAt = datetime.now(timezone.utc)
     await db.flush()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "task": {
+            "id": task.id,
+            "assignedToId": task.assignedToId,
+            "assignedTo": {"id": new_user.id, "name": new_user.name, "designation": new_user.designation},
+        },
+        "audit": {
+            "action": "REASSIGNED",
+            "comments": audit_msg,
+            "performedBy": user.name,
+        },
+    }
 
 
 @router.post("/repair-orphan")
