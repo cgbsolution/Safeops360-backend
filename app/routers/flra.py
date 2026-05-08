@@ -10,13 +10,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
-from app.models.flra import FLRA, FLRACrewSignature, FLRAStatus, FLRATeamMember
+from app.models.flra import (
+    FLRA,
+    FLRAAttachment,
+    FLRACrewSignature,
+    FLRAFitnessDeclaration,
+    FLRAJobStep,
+    FLRAStatus,
+    FLRAStepHazard,
+    FLRATeamMember,
+)
 from app.models.permit import Permit, PermitStatus
 from app.models.plant import Plant
 from app.models.training import TrainingProgram, TrainingRecord
 from app.models.user import User
 from app.models.workflow import Action, WorkflowHistory, WorkflowInstance
-from app.schemas.flra import FLRACreate, FLRAOut, FLRARedoRequest
+from app.schemas.flra import (
+    FLRACreate,
+    FLRAOut,
+    FLRARedoRequest,
+    FLRASignRequest,
+    JobStepInput,
+)
 from app.services.flra_gate import maybe_complete_flra, resolve_crew_for_flra
 from app.services.permissions import (
     PermissionContext,
@@ -27,6 +42,40 @@ from app.services.permissions import (
 from app.routers.ptw import REQUIRED_TRAINING_CODES
 
 router = APIRouter(prefix="/api/flra", tags=["flra"])
+
+
+# ─── 5×5 risk matrix helper ────────────────────────────────────────────
+
+
+def risk_level_from_score(score: int) -> str:
+    """Maps 5×5 risk-matrix score to band. Same thresholds as Node side."""
+    if score >= 15:
+        return "CRITICAL"
+    if score >= 8:
+        return "HIGH"
+    if score >= 4:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _validate_step_hazards(steps: list[JobStepInput]) -> None:
+    """Reject FLRAs whose residual risk would block work."""
+    for step in steps:
+        for hz in step.hazards:
+            residual = hz.residualLikelihood * hz.residualSeverity
+            level = risk_level_from_score(residual)
+            if level in {"HIGH", "CRITICAL"}:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    (
+                        f'Hazard "{hz.hazardDescription[:60]}" still has {level} '
+                        f"residual risk after controls. Add stronger controls "
+                        "or escalate to HSE before signing."
+                    ),
+                )
+
+
+# ─── Endpoints ─────────────────────────────────────────────────────────
 
 
 @router.get("")
@@ -65,8 +114,16 @@ async def create_flra(
         permit = await db.get(Permit, payload.permitId)
         if permit is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Linked permit not found.")
-        if permit.status in {PermitStatus.DRAFT, PermitStatus.REJECTED, PermitStatus.EXPIRED, PermitStatus.CLOSED}:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot start FLRA on a {permit.status.value} permit.")
+        if permit.status in {
+            PermitStatus.DRAFT,
+            PermitStatus.REJECTED,
+            PermitStatus.EXPIRED,
+            PermitStatus.CLOSED,
+        }:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Cannot start FLRA on a {permit.status.value} permit.",
+            )
         active_q = select(func.count()).select_from(FLRA).where(
             FLRA.permitId == payload.permitId,
             FLRA.status.in_([FLRAStatus.IN_PROGRESS, FLRAStatus.COMPLETED]),
@@ -77,19 +134,33 @@ async def create_flra(
                 f"Permit {permit.number} already has an active FLRA. Use Re-do FLRA instead.",
             )
 
-    # Hazards must be a non-empty JSON array
-    try:
-        hz = json.loads(payload.hazards or "[]")
-    except json.JSONDecodeError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Hazards data is malformed.") from e
-    filled = [
-        h for h in hz if isinstance(h, dict) and (str(h.get("step", "")).strip() or str(h.get("hazard", "")).strip())
-    ]
-    if not filled:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Capture at least one hazard before saving.")
+    # Hazards: prefer structured `jobSteps`. Legacy `hazards` JSON kept for
+    # back-compat with the older single-page form clients.
+    use_structured = bool(payload.jobSteps)
+    legacy_filled: list[dict[str, Any]] = []
+    if not use_structured:
+        try:
+            hz = json.loads(payload.hazards or "[]")
+        except json.JSONDecodeError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Hazards data is malformed.") from e
+        legacy_filled = [
+            h
+            for h in hz
+            if isinstance(h, dict)
+            and (str(h.get("step", "")).strip() or str(h.get("hazard", "")).strip())
+        ]
+        if not legacy_filled:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Capture at least one hazard before saving.",
+            )
+    else:
+        _validate_step_hazards(payload.jobSteps)
 
     last = (
-        await db.execute(select(func.count()).select_from(FLRA).where(FLRA.plantId == payload.plantId))
+        await db.execute(
+            select(func.count()).select_from(FLRA).where(FLRA.plantId == payload.plantId)
+        )
     ).scalar_one()
     number = f"FLRA-{plant.code}-{last + 1:04d}"
 
@@ -99,6 +170,8 @@ async def create_flra(
         fallback_team_member_ids=payload.teamMemberIds,
     )
 
+    is_standalone = payload.isStandalone or (payload.permitId is None)
+
     flra = FLRA(
         number=number,
         permitId=payload.permitId,
@@ -107,17 +180,100 @@ async def create_flra(
         location=payload.location,
         jobDescription=payload.jobDescription,
         leaderId=user.id,
-        hazards=json.dumps(filled),
+        # Always retain a JSON-string copy for back-compat readers
+        hazards=json.dumps(
+            [
+                {
+                    "step": s.stepDescription,
+                    "hazard": h.hazardDescription,
+                    "category": h.hazardCategory,
+                    "initialLikelihood": h.initialLikelihood,
+                    "initialSeverity": h.initialSeverity,
+                    "control": h.controlMeasures,
+                    "residualLikelihood": h.residualLikelihood,
+                    "residualSeverity": h.residualSeverity,
+                }
+                for s in payload.jobSteps
+                for h in s.hazards
+            ]
+            if use_structured
+            else legacy_filled
+        ),
         toolboxTalkById=payload.toolboxTalkById,
         toolboxTalkConfirmed=payload.toolboxTalkConfirmed,
         status=FLRAStatus.IN_PROGRESS,
+        # Commit 3 wizard fields
+        isStandalone=is_standalone,
+        departmentId=payload.departmentId,
+        areaCode=payload.areaCode,
+        specificLocation=payload.specificLocation,
+        gpsLatitude=payload.gpsLatitude,
+        gpsLongitude=payload.gpsLongitude,
+        startTime=payload.startTime,
+        jobIsRoutine=payload.jobIsRoutine,
+        toolboxTalkConducted=payload.toolboxTalkConducted,
+        toolboxTalkConductedAt=payload.toolboxTalkConductedAt,
+        toolboxTalkTopics=payload.toolboxTalkTopics,
+        toolboxTalkLanguage=payload.toolboxTalkLanguage,
+        ppeChecklistResponses=payload.ppeChecklistResponses,
+        toolsCheckedResponses=payload.toolsCheckedResponses,
+        exitRoutesIdentified=payload.exitRoutesIdentified,
+        emergencyContactsConfirmed=payload.emergencyContactsConfirmed,
     )
     db.add(flra)
     await db.flush()
+
+    # Team members + crew signature rows
     for uid in payload.teamMemberIds:
         db.add(FLRATeamMember(flraId=flra.id, userId=uid))
     for uid in crew_ids:
         db.add(FLRACrewSignature(flraId=flra.id, userId=uid))
+
+    # Structured job steps + hazards (Commit 3)
+    for step in payload.jobSteps:
+        js = FLRAJobStep(
+            flraId=flra.id,
+            sequence=step.sequence,
+            stepDescription=step.stepDescription,
+        )
+        db.add(js)
+        await db.flush()
+        for hz in step.hazards:
+            initial_score = hz.initialLikelihood * hz.initialSeverity
+            residual_score = hz.residualLikelihood * hz.residualSeverity
+            db.add(
+                FLRAStepHazard(
+                    jobStepId=js.id,
+                    hazardDescription=hz.hazardDescription,
+                    hazardCategory=hz.hazardCategory,
+                    energySource=hz.energySource,
+                    initialLikelihood=hz.initialLikelihood,
+                    initialSeverity=hz.initialSeverity,
+                    initialRiskScore=initial_score,
+                    initialRiskLevel=risk_level_from_score(initial_score),
+                    controlMeasures=hz.controlMeasures,
+                    residualLikelihood=hz.residualLikelihood,
+                    residualSeverity=hz.residualSeverity,
+                    residualRiskScore=residual_score,
+                    residualRiskLevel=risk_level_from_score(residual_score),
+                )
+            )
+
+    # Fitness declarations (Commit 3)
+    for fd in payload.fitnessDeclarations:
+        db.add(
+            FLRAFitnessDeclaration(
+                flraId=flra.id,
+                userId=fd.userId,
+                isFit=fd.isFit,
+                hasMedicalCondition=fd.hasMedicalCondition,
+                conditionsDeclared=fd.conditionsDeclared,
+                hadAdequateRest=fd.hadAdequateRest,
+                underInfluenceCheck=fd.underInfluenceCheck,
+                notes=fd.notes,
+            )
+        )
+
     await db.flush()
     await db.refresh(flra)
     return FLRAOut.model_validate(flra)
@@ -134,7 +290,9 @@ async def get_flra(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
     record = {"leaderId": flra.leaderId}
     result = await can(
-        db, user.id, "FLRA.READ",
+        db,
+        user.id,
+        "FLRA.READ",
         PermissionContext(record_id=flra.id, plant_id=flra.plantId, record=record),
     )
     if not result.allowed:
@@ -142,28 +300,70 @@ async def get_flra(
     return FLRAOut.model_validate(flra)
 
 
+@router.delete("/{flra_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_flra(
+    flra_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete an FLRA. Per the RBAC matrix only HSE_MANAGER (own plant)
+    and SYSTEM_ADMIN have FLRA.DELETE. Cascades remove team members,
+    crew signatures, job steps + hazards, fitness declarations, and
+    attachments via FK ondelete=CASCADE."""
+    flra = await db.get(FLRA, flra_id)
+    if flra is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "FLRA not found")
+    record = {"leaderId": flra.leaderId}
+    result = await can(
+        db,
+        user.id,
+        "FLRA.DELETE",
+        PermissionContext(record_id=flra.id, plant_id=flra.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    await db.delete(flra)
+    await db.flush()
+
+
 @router.post("/{flra_id}/sign")
 async def sign_flra(
     flra_id: str,
     request: Request,
+    payload: FLRASignRequest | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Per-crew sign-off with training re-validation. Mirror of Node /sign route."""
+    """Per-crew sign-off with training re-validation. Also handles the
+    refusal-to-sign flow when payload.refusedToSign=true."""
     flra = await db.get(FLRA, flra_id)
     if flra is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "FLRA not found")
     if flra.status == FLRAStatus.SUPERSEDED:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This FLRA has been superseded by a re-do — sign the new one instead.")
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This FLRA has been superseded by a re-do — sign the new one instead.",
+        )
     if flra.status == FLRAStatus.CANCELLED:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This FLRA has been cancelled.")
     if flra.status == FLRAStatus.COMPLETED:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This FLRA is already complete — no further signatures needed.")
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This FLRA is already complete — no further signatures needed.",
+        )
 
     # Permit-state lock
     permit = await db.get(Permit, flra.permitId) if flra.permitId else None
-    if permit and permit.status in {PermitStatus.SUSPENDED, PermitStatus.EXPIRED, PermitStatus.CLOSED, PermitStatus.REJECTED}:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Linked permit is {permit.status.value}. FLRA actions are locked.")
+    if permit and permit.status in {
+        PermitStatus.SUSPENDED,
+        PermitStatus.EXPIRED,
+        PermitStatus.CLOSED,
+        PermitStatus.REJECTED,
+    }:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Linked permit is {permit.status.value}. FLRA actions are locked.",
+        )
 
     sig_q = select(FLRACrewSignature).where(
         FLRACrewSignature.flraId == flra.id, FLRACrewSignature.userId == user.id
@@ -176,6 +376,24 @@ async def sign_flra(
         )
     if sig.signed:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "You have already signed this FLRA.")
+    if sig.refusedToSign:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You have already refused — supervisor must replace you or re-do the FLRA.",
+        )
+
+    # Refusal path — supervisor must escalate; permit stays gated
+    if payload and payload.refusedToSign:
+        sig.refusedToSign = True
+        sig.refusalReason = (payload.refusalReason or "").strip()
+        sig.refusalEscalatedToId = payload.escalatedToId or flra.leaderId
+        sig.refusalEscalatedAt = datetime.now(timezone.utc)
+        await db.flush()
+        return {
+            "ok": True,
+            "refused": True,
+            "escalatedToId": sig.refusalEscalatedToId,
+        }
 
     # Training re-check
     training_valid = True
@@ -184,7 +402,9 @@ async def sign_flra(
         required_code = REQUIRED_TRAINING_CODES.get(permit.type.value)
         if required_code:
             prog = (
-                await db.execute(select(TrainingProgram).where(TrainingProgram.code == required_code))
+                await db.execute(
+                    select(TrainingProgram).where(TrainingProgram.code == required_code)
+                )
             ).scalar_one_or_none()
             if prog is not None:
                 now = datetime.now(timezone.utc)
@@ -192,7 +412,7 @@ async def sign_flra(
                     select(TrainingRecord)
                     .where(TrainingRecord.employeeId == user.id)
                     .where(TrainingRecord.programId == prog.id)
-                    .where(TrainingRecord.passed == True)
+                    .where(TrainingRecord.passed == True)  # noqa: E712
                     .where(TrainingRecord.validUntil > now)
                     .order_by(TrainingRecord.validUntil.desc())
                     .limit(1)
@@ -203,22 +423,41 @@ async def sign_flra(
                         select(TrainingRecord)
                         .where(TrainingRecord.employeeId == user.id)
                         .where(TrainingRecord.programId == prog.id)
-                        .where(TrainingRecord.passed == True)
+                        .where(TrainingRecord.passed == True)  # noqa: E712
                         .order_by(TrainingRecord.validUntil.desc())
                         .limit(1)
                     )
                     last_record = (await db.execute(last_q)).scalar_one_or_none()
-                    expiry = last_record.validUntil.strftime("%d %b %Y") if last_record else "never"
+                    expiry = (
+                        last_record.validUntil.strftime("%d %b %Y") if last_record else "never"
+                    )
                     raise HTTPException(
                         status.HTTP_400_BAD_REQUEST,
-                        f'Your "{prog.name}" training expired on {expiry}. You cannot proceed with this work — contact your supervisor for replacement.',
+                        (
+                            f'Your "{prog.name}" training expired on {expiry}. '
+                            "You cannot proceed with this work — contact your supervisor for replacement."
+                        ),
                     )
                 training_valid = True
                 training_expires_at = valid.validUntil
 
+    # Block sign if user declared not fit
+    fitness_q = select(FLRAFitnessDeclaration).where(
+        FLRAFitnessDeclaration.flraId == flra.id,
+        FLRAFitnessDeclaration.userId == user.id,
+    )
+    fd = (await db.execute(fitness_q)).scalar_one_or_none()
+    if fd is not None and not fd.isFit:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You declared yourself not fit for duty — supervisor must replace you before sign-off.",
+        )
+
     sig.signed = True
     sig.signedAt = datetime.now(timezone.utc)
-    sig.ipAddress = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() or request.headers.get("x-real-ip")
+    sig.ipAddress = (
+        request.headers.get("x-forwarded-for") or ""
+    ).split(",")[0].strip() or request.headers.get("x-real-ip")
     sig.deviceInfo = request.headers.get("user-agent")
     sig.trainingValidAtSignature = training_valid
     sig.trainingExpiresAt = training_expires_at
@@ -239,20 +478,33 @@ async def redo_flra(
     if flra is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "FLRA not found")
     if flra.status not in {FLRAStatus.IN_PROGRESS, FLRAStatus.COMPLETED}:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot re-do a {flra.status.value} FLRA.")
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"Cannot re-do a {flra.status.value} FLRA."
+        )
 
     # Authorisation: crew member, leader, or HSE_MANAGER / ADMIN
-    sig_q = select(FLRACrewSignature).where(FLRACrewSignature.flraId == flra.id, FLRACrewSignature.userId == user.id)
-    is_crew = (await db.execute(sig_q)).scalar_one_or_none() is not None or flra.leaderId == user.id
+    sig_q = select(FLRACrewSignature).where(
+        FLRACrewSignature.flraId == flra.id, FLRACrewSignature.userId == user.id
+    )
+    is_crew = (
+        await db.execute(sig_q)
+    ).scalar_one_or_none() is not None or flra.leaderId == user.id
     role_codes = await get_user_role_codes(db, user.id)
     is_priv = any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes)
     if not is_crew and not is_priv:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only crew members or HSE Manager can trigger an FLRA re-do.")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only crew members or HSE Manager can trigger an FLRA re-do.",
+        )
 
     plant = await db.get(Plant, flra.plantId)
     if plant is None:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Plant lookup failed")
-    last = (await db.execute(select(func.count()).select_from(FLRA).where(FLRA.plantId == flra.plantId))).scalar_one()
+    last = (
+        await db.execute(
+            select(func.count()).select_from(FLRA).where(FLRA.plantId == flra.plantId)
+        )
+    ).scalar_one()
     new_number = f"FLRA-{plant.code}-{last + 1:04d}"
 
     sigs = (
@@ -273,7 +525,8 @@ async def redo_flra(
             instance = (
                 await db.execute(
                     select(WorkflowInstance).where(
-                        WorkflowInstance.module == "PTW", WorkflowInstance.recordId == permit.id
+                        WorkflowInstance.module == "PTW",
+                        WorkflowInstance.recordId == permit.id,
                     )
                 )
             ).scalar_one_or_none()
@@ -285,7 +538,9 @@ async def redo_flra(
                         stepName=instance.currentStepName or "FLRA Re-do",
                         action=Action.SUSPENDED,
                         performedById=user.id,
-                        comments=f"FLRA re-do: {payload.reason}. Work suspended pending new FLRA sign-off.",
+                        comments=(
+                            f"FLRA re-do: {payload.reason}. Work suspended pending new FLRA sign-off."
+                        ),
                         fromStatus="ACTIVE",
                         toStatus="SUSPENDED",
                     )
@@ -303,6 +558,12 @@ async def redo_flra(
         toolboxTalkById=flra.toolboxTalkById,
         toolboxTalkConfirmed=False,
         status=FLRAStatus.IN_PROGRESS,
+        isStandalone=flra.isStandalone,
+        departmentId=flra.departmentId,
+        areaCode=flra.areaCode,
+        specificLocation=flra.specificLocation,
+        gpsLatitude=flra.gpsLatitude,
+        gpsLongitude=flra.gpsLongitude,
     )
     db.add(new_flra)
     await db.flush()

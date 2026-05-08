@@ -12,6 +12,7 @@ from app.core.deps import get_current_user, require_permission_with_context
 from app.models.training import TrainingProgram, TrainingRecord
 from app.models.user import User
 from app.schemas.training import TrainingCreate, TrainingProgramOut, TrainingRecordOut
+from app.services.permissions import PermissionContext, can
 
 router = APIRouter(prefix="/api/training", tags=["training"])
 
@@ -84,3 +85,31 @@ async def create_record(
     await db.flush()
     await db.refresh(record)
     return TrainingRecordOut.model_validate(record)
+
+
+@router.delete("/{record_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_training_record(
+    record_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete a training record. Per the RBAC matrix:
+    - LD_MANAGER can delete OWN_RECORDS (own draft records)
+    - HSE_MANAGER can delete OWN_PLANT
+    - SYSTEM_ADMIN can delete ALL_PLANTS
+    The permission service enforces the scope. TrainingRecord has no
+    children to cascade — clean delete."""
+    record = await db.get(TrainingRecord, record_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Training record not found")
+    record_dict = {"employeeId": record.employeeId, "trainerId": record.trainerId}
+    result = await can(
+        db,
+        user.id,
+        "TRAINING.DELETE",
+        PermissionContext(record_id=record.id, plant_id=None, record=record_dict),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    await db.delete(record)
+    await db.flush()

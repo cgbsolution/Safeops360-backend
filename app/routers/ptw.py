@@ -9,7 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
-from app.models.permit import Permit, PermitStatus, PermitType
+from app.models.permit import (
+    Permit,
+    PermitCrewMember,
+    PermitGasTestPlan,
+    PermitIsolation,
+    PermitStatus,
+    PermitSubjectEquipment,
+    PermitToolEquipment,
+    PermitType,
+)
 from app.models.plant import Plant
 from app.models.training import TrainingProgram, TrainingRecord
 from app.models.user import User
@@ -149,6 +158,12 @@ async def create_permit(
     ).scalar_one()
     number = f"PTW-{plant.code}-{last + 1:05d}"
 
+    # Auto-detect requirements from permit type — wizard reads the same
+    # rules client-side, but we re-compute server-side for defence in depth.
+    needs_gas_test = payload.type.value in {"HOT_WORK", "CONFINED_SPACE"}
+    needs_fire_watch = payload.type.value == "HOT_WORK"
+    validity_hours = int((payload.validTo - payload.validFrom).total_seconds() / 3600.0)
+
     permit = Permit(
         number=number,
         type=payload.type,
@@ -162,18 +177,93 @@ async def create_permit(
         issuerId=payload.issuerId,
         receiverId=payload.receiverId,
         contractorName=payload.contractorName,
+
+        # ─── Wizard Step 1/2 additions ───
+        validityHours=validity_hours,
+        departmentId=payload.departmentId,
+        specificLocation=payload.specificLocation,
+        gpsLatitude=payload.gpsLatitude,
+        gpsLongitude=payload.gpsLongitude,
+        workOrderNumber=payload.workOrderNumber,
+        attachedDrawingIds=payload.attachedDrawingIds or None,
+
+        # ─── Wizard Step 3 additions ───
+        fireWatchPersonId=payload.fireWatchPersonId,
+        standbyPersonId=payload.standbyPersonId,
+
+        # ─── Wizard Step 7 additions ───
+        weatherConditionsAtIssue=payload.weatherConditionsAtIssue,
+        windSpeedKmh=payload.windSpeedKmh,
+        adjacentAreaNotifications=payload.adjacentAreaNotifications,
+
+        # ─── Legacy + auto-derived ───
         isolationsRequired=payload.isolationsRequired,
         ppeChecklist=payload.ppeChecklist,
-        gasTestRequired=payload.gasTestRequired,
+        gasTestRequired=payload.gasTestRequired or needs_gas_test,
         gasTestResult=payload.gasTestResult,
         o2Level=payload.o2Level,
         lelLevel=payload.lelLevel,
         h2sLevel=payload.h2sLevel,
-        fireWatchRequired=payload.fireWatchRequired,
+        fireWatchRequired=payload.fireWatchRequired or needs_fire_watch,
         rescuePlan=payload.rescuePlan,
         status=PermitStatus.DRAFT,
     )
     db.add(permit)
+    await db.flush()
+
+    # ─── Wizard child rows ───
+    if payload.workCrew:
+        for c in payload.workCrew:
+            db.add(PermitCrewMember(
+                permitId=permit.id,
+                userId=c.userId,
+                role=c.role,
+            ))
+    if payload.isolations:
+        for iso in payload.isolations:
+            db.add(PermitIsolation(
+                permitId=permit.id,
+                isolationType=iso.isolationType,
+                description=iso.description,
+                isolationPointTag=iso.isolationPointTag,
+                lotoTagNumber=iso.lotoTagNumber,
+            ))
+    if payload.toolsEquipment:
+        from app.models.equipment import Equipment
+
+        for tool in payload.toolsEquipment:
+            # Defensive FK check — drop tools whose equipmentId doesn't resolve
+            if tool.equipmentId:
+                eq = await db.get(Equipment, tool.equipmentId)
+                if eq is None:
+                    continue
+            db.add(PermitToolEquipment(
+                permitId=permit.id,
+                equipmentId=tool.equipmentId,
+                freeTextDescription=tool.freeTextDescription,
+            ))
+    if payload.subjectEquipment:
+        from app.models.equipment import Equipment
+
+        for s in payload.subjectEquipment:
+            eq = await db.get(Equipment, s.equipmentId)
+            if eq is None:
+                continue
+            db.add(PermitSubjectEquipment(
+                permitId=permit.id,
+                equipmentId=s.equipmentId,
+                workNature=s.workNature,
+            ))
+    if payload.gasTestPlan:
+        plan = payload.gasTestPlan
+        db.add(PermitGasTestPlan(
+            permitId=permit.id,
+            refreshFrequencyMinutes=plan.refreshFrequencyMinutes,
+            parametersToTest=[p.model_dump() for p in plan.parametersToTest],
+            instrumentSerial=plan.instrumentSerial,
+            instrumentLastCalibrated=plan.instrumentLastCalibrated,
+        ))
+
     await db.flush()
     await db.refresh(permit)
 
@@ -225,6 +315,107 @@ async def get_permit(
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     return PermitOut.model_validate(permit)
+
+
+@router.get("/{permit_id}/activation-gate")
+async def get_activation_gate(
+    permit_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Returns the full PTW activation gate status — every blocker reason
+    aggregated so the receiver-step UI can render them all at once."""
+    permit = await db.get(Permit, permit_id)
+    if permit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Permit not found")
+    result = await can(
+        db,
+        user.id,
+        "PTW.READ",
+        PermissionContext(
+            record_id=permit.id,
+            plant_id=permit.plantId,
+            record={
+                "originatorId": permit.originatorId,
+                "issuerId": permit.issuerId,
+                "receiverId": permit.receiverId,
+            },
+        ),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    from app.services.ptw_activation_gate import can_ptw_transition_to_active
+
+    gate = await can_ptw_transition_to_active(db, permit_id)
+    return {
+        "ok": gate.ok,
+        "blockers": [
+            {"code": b.code, "message": b.message, "severity": b.severity}
+            for b in gate.blockers
+        ],
+        "flra": {
+            "id": gate.flra_id,
+            "number": gate.flra_number,
+            "status": gate.flra_status,
+            "signedCount": gate.signed_count,
+            "totalCrew": gate.total_crew,
+        }
+        if gate.flra_id
+        else None,
+        "crewValidityIssues": gate.crew_validity_issues,
+        "isolations": {
+            "pending": gate.isolations_pending,
+            "total": gate.isolations_total,
+        },
+    }
+
+
+@router.delete("/{permit_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_permit(
+    permit_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete a permit. Per the RBAC matrix:
+    - PERMIT_ISSUER can delete OWN_RECORDS (their own draft permits)
+    - HSE_MANAGER can delete OWN_PLANT
+    - SYSTEM_ADMIN can delete ALL_PLANTS
+    The permission service enforces the scope. Cascades remove workflow
+    instance, tasks, history, child rows (isolations, gas readings,
+    suspensions, extensions, approvals, attachments) via FK ondelete=CASCADE.
+    The linked FLRAs and WorkflowInstance need explicit cleanup since
+    they don't FK-cascade from Permit."""
+    permit = await db.get(Permit, permit_id)
+    if permit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Permit not found")
+    record = {
+        "originatorId": permit.originatorId,
+        "issuerId": permit.issuerId,
+        "receiverId": permit.receiverId,
+    }
+    result = await can(
+        db,
+        user.id,
+        "PTW.DELETE",
+        PermissionContext(record_id=permit.id, plant_id=permit.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    inst_rows = (
+        await db.execute(
+            select(WorkflowInstance).where(
+                WorkflowInstance.module == "PTW",
+                WorkflowInstance.recordId == permit_id,
+            )
+        )
+    ).scalars().all()
+    for inst in inst_rows:
+        await db.delete(inst)
+
+    await db.delete(permit)
+    await db.flush()
 
 
 @router.patch("/{permit_id}", response_model=PermitOut)

@@ -100,6 +100,31 @@ async def create_inspection(
     return InspectionOut.model_validate(insp)
 
 
+@router.delete("/{inspection_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_inspection(
+    inspection_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Hard-delete an inspection. Per the RBAC matrix only HSE_MANAGER
+    (own plant) and SYSTEM_ADMIN have INSPECTION.DELETE."""
+    insp = await db.get(Inspection, inspection_id)
+    if insp is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Inspection not found")
+    eq = await db.get(Equipment, insp.equipmentId)
+    record = {"inspectorId": insp.inspectorId}
+    result = await can(
+        db,
+        user.id,
+        "INSPECTION.DELETE",
+        PermissionContext(record_id=insp.id, plant_id=eq.plantId if eq else None, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    await db.delete(insp)
+    await db.flush()
+
+
 @router.patch("/{inspection_id}", response_model=InspectionOut)
 async def update_inspection(
     inspection_id: str,

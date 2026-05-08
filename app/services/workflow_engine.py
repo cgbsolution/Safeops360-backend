@@ -187,6 +187,15 @@ async def _resolve_assignee(
             return record_data.get("actionOwnerId") or record_data.get("responsiblePersonId")
         if approver_field == "RESPONSIBLE_PERSON":
             return record_data.get("responsiblePersonId") or record_data.get("actionOwnerId")
+        if approver_field == "INVESTIGATION_LEAD":
+            # Maps to the Incident.investigationTeamLead column. Falls back
+            # to actionOwnerId so the task still has a valid assignee even
+            # when the lead hasn't been picked yet during classification.
+            return (
+                record_data.get("investigationTeamLead")
+                or record_data.get("investigationLeadId")
+                or record_data.get("actionOwnerId")
+            )
         if approver_field == "ASSIGNED_INSPECTOR":
             return record_data.get("inspectorId")
         if approver_field == "RECEIVER":
@@ -368,6 +377,21 @@ async def _sync_record_status(
         else:
             permit.status = PermitStatus.SUBMITTED
         await db.flush()
+
+        # Post-closure cross-module triggers (Dimension 4). Each rule is
+        # wrapped in a SAVEPOINT inside the engine — failures must NEVER
+        # block the closure flow. Outer SAVEPOINT here in case any
+        # downstream import or SQL raises before the engine catches it.
+        if instance_completed:
+            try:
+                async with db.begin_nested():
+                    from app.services.ptw_post_closure import run_ptw_post_closure_rules
+
+                    await run_ptw_post_closure_rules(db, permit_id=record_id)
+            except Exception as e:  # noqa: BLE001
+                import sys
+
+                print(f"[post-closure] PTW {record_id}: {e}", file=sys.stderr)
     elif module == "OBSERVATION" and instance_completed:
         from app.models.observation import Observation, ObservationStatus
 
@@ -432,6 +456,28 @@ async def _sync_record_status(
         except Exception as e:  # noqa: BLE001
             import sys
             print(f"[post-closure] NEAR_MISS {record_id}: {e}", file=sys.stderr)
+    elif module == "INCIDENT" and instance_completed:
+        # Mark the incident CLOSED + run the post-closure rules engine
+        # (contractor score, observation cross-link, lessons distribution,
+        # equipment re-inspection, 90-day effectiveness review scheduling).
+        from app.models.incident import Incident as _Inc, IncidentStatus as _IncStatus
+
+        inc = await db.get(_Inc, record_id)
+        if inc is not None and inc.status != _IncStatus.CLOSED:
+            inc.status = _IncStatus.CLOSED
+            inc.closedAt = datetime.now(timezone.utc)
+            await db.flush()
+
+        try:
+            async with db.begin_nested():
+                from app.services.incident_post_closure import (
+                    run_incident_post_closure_rules,
+                )
+
+                await run_incident_post_closure_rules(db, incident_id=record_id)
+        except Exception as e:  # noqa: BLE001
+            import sys
+            print(f"[post-closure] INCIDENT {record_id}: {e}", file=sys.stderr)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -890,6 +936,34 @@ async def approve(
     if current_step is None:
         raise WorkflowError("Step missing")
     await _rbac_gate(db, task=task, step=current_step, user_id=user_id, action="APPROVE")
+
+    # PTW closure gate: a permit cannot reach CLOSED until the receiver has
+    # returned the permit AND a site-verification has been recorded. Closing
+    # remark goes onto Permit.closingRemark via _sync_record_status.
+    if task.module == "PTW" and current_step.stepType == StepType.CLOSURE.value:
+        from app.models.permit import Permit as PermitModel
+
+        permit_row = await db.get(PermitModel, task.recordId)
+        if permit_row is None:
+            raise WorkflowError("Permit not found for closure")
+        if permit_row.returnedAt is None:
+            raise WorkflowError(
+                "Receiver must return the permit before closure. "
+                "Open the permit detail page → Return panel."
+            )
+        if permit_row.siteVerifiedAt is None:
+            raise WorkflowError(
+                "Site verification is required before closure. "
+                "Open the permit detail page → Site Verification panel."
+            )
+        if not (comments and comments.strip()):
+            raise WorkflowError("A closing remark is required.")
+        # Persist the closing remark + closer onto the permit row so the
+        # detail view + post-closure rules engine can read them.
+        permit_row.closedById = user_id
+        permit_row.closingRemark = comments.strip()
+        await db.flush()
+
     return await _advance(
         db,
         task=task,
@@ -960,14 +1034,21 @@ async def submit_execution(
         raise WorkflowError("Step missing")
     await _rbac_gate(db, task=task, step=current_step, user_id=user_id, action="EXECUTE")
 
-    # PTW–FLRA gate: a permit cannot transition out of its receiver step
-    # without a COMPLETED FLRA whose crew has all signed.
+    # PTW activation gate: full pre-flight before transitioning out of the
+    # receiver step. Blocks on FLRA, crew validity, isolations, expiry, and
+    # any explicit suspension. The full blocker list is surfaced so the user
+    # can fix all of them in one round-trip.
     if task.module == "PTW" and current_step.stepType == StepType.ASSIGNEE_TASK.value:
-        from app.services.flra_gate import get_flra_gate_status
+        from app.services.ptw_activation_gate import can_ptw_transition_to_active
 
-        gate = await get_flra_gate_status(db, task.recordId)
+        gate = await can_ptw_transition_to_active(db, task.recordId)
         if not gate.ok:
-            raise WorkflowError(gate.reason or "FLRA gate is closed for this permit.")
+            messages = [b.message for b in gate.blockers]
+            raise WorkflowError(
+                "Cannot activate permit:\n• " + "\n• ".join(messages)
+                if messages
+                else "Activation gate is closed for this permit."
+            )
 
     merged = {**(record_data or {}), **(execution_data or {})}
     return await _advance(

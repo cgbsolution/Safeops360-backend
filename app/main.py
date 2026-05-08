@@ -23,6 +23,7 @@ from app.routers import (
     near_miss,
     observations,
     ptw,
+    ptw_active,
     training,
     users,
     workflow,
@@ -70,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(observations.router)
     app.include_router(near_miss.router)
     app.include_router(ptw.router)
+    app.include_router(ptw_active.router)
     app.include_router(flra.router)
     app.include_router(incidents.router)
     app.include_router(training.router)
