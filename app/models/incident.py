@@ -197,6 +197,10 @@ class Incident(Base, IdMixin):
     triggeredCapaIds: Mapped[list[str] | None] = mapped_column(ARRAY(String))
     contractorScoreImpact: Mapped[dict | None] = mapped_column(JSON)
 
+    # Training trigger (incident_post_closure._rule_training_trigger)
+    triggeredTrainingFor: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+    triggeredTrainingKeywords: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+
     # ─── SLA tracking (per phase) ───
     initialReportSlaTargetAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     classificationSlaTargetAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

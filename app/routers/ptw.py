@@ -115,29 +115,20 @@ async def create_permit(
     if receiver is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid receiver")
 
-    # Training validity check on receiver — Hot Work / Confined Space / WAH / LOTO
-    required_code = REQUIRED_TRAINING_CODES.get(payload.type.value)
-    if required_code:
-        prog = (
-            await db.execute(select(TrainingProgram).where(TrainingProgram.code == required_code))
-        ).scalar_one_or_none()
-        if prog is not None:
-            now = datetime.now(timezone.utc)
-            tr_stmt = (
-                select(TrainingRecord)
-                .where(TrainingRecord.employeeId == payload.receiverId)
-                .where(TrainingRecord.programId == prog.id)
-                .where(TrainingRecord.passed == True)
-                .where(TrainingRecord.validUntil > now)
-                .order_by(TrainingRecord.validUntil.desc())
-                .limit(1)
-            )
-            valid = (await db.execute(tr_stmt)).scalar_one_or_none()
-            if valid is None:
-                raise HTTPException(
-                    status.HTTP_400_BAD_REQUEST,
-                    f'Receiver {receiver.name} does not have a valid "{prog.name}" certification. Required for {payload.type.value} permits.',
-                )
+    # Training competency check on receiver — uses the canonical
+    # competency service which reads TrainingProgram.isMandatoryForPermitTypes
+    # (DB-driven) rather than the legacy hardcoded REQUIRED_TRAINING_CODES
+    # dict. Supports MULTIPLE required programs per permit type
+    # (e.g. Hot Work needs Hot Work Holder + Fire Watch + Basic Safety).
+    from app.services.competency import check_competency_for_permit_type
+
+    comp = await check_competency_for_permit_type(db, payload.receiverId, payload.type.value)
+    if not comp.ok:
+        msgs = [b.message for b in comp.blockers]
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Receiver {receiver.name} cannot hold this permit:\n• " + "\n• ".join(msgs),
+        )
 
     # Validity window
     if payload.validTo <= payload.validFrom:
@@ -213,11 +204,30 @@ async def create_permit(
 
     # ─── Wizard child rows ───
     if payload.workCrew:
+        # Competency check on every crew member, not just the receiver.
+        # Capture validity-at-issuance flags so the activation gate
+        # (Commit 4 — PTW) has the snapshot it needs.
+        from app.services.competency import check_competency_for_permit_type
+
         for c in payload.workCrew:
+            crew_comp = await check_competency_for_permit_type(
+                db, c.userId, payload.type.value
+            )
+            if not crew_comp.ok:
+                target = await db.get(User, c.userId)
+                msgs = [b.message for b in crew_comp.blockers]
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    (
+                        f"Crew member {target.name if target else c.userId} cannot be added "
+                        f"to this {payload.type.value} permit:\n• " + "\n• ".join(msgs)
+                    ),
+                )
             db.add(PermitCrewMember(
                 permitId=permit.id,
                 userId=c.userId,
                 role=c.role,
+                trainingValidAtIssuance=True,  # passed competency check
             ))
     if payload.isolations:
         for iso in payload.isolations:

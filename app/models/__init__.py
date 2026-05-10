@@ -40,7 +40,19 @@ from app.models.permit import (
     PermitType,
 )
 from app.models.plant import Area, Plant
-from app.models.training import TrainingProgram, TrainingRecord
+from app.models.training import (
+    TrainingAssessment,
+    TrainingAssessmentResponse,
+    TrainingAttendance,
+    TrainingCertificate,
+    TrainingProgram,
+    TrainingProgramMaterial,
+    TrainingProgramQuestion,
+    TrainingRecord,
+    TrainingRegistration,
+    TrainingSchedule,
+    TrainingSession,
+)
 from app.models.user import (
     Permission,
     Role,
@@ -96,8 +108,17 @@ __all__ = [
     "StepType",
     "TaskStatus",
     "TaskType",
+    "TrainingAssessment",
+    "TrainingAssessmentResponse",
+    "TrainingAttendance",
+    "TrainingCertificate",
     "TrainingProgram",
+    "TrainingProgramMaterial",
+    "TrainingProgramQuestion",
     "TrainingRecord",
+    "TrainingRegistration",
+    "TrainingSchedule",
+    "TrainingSession",
     "User",
     "UserRole",
     "WorkflowDefinition",

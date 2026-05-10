@@ -195,12 +195,77 @@ async def _rule_effectiveness_review(db: AsyncSession, incident: Incident) -> di
     }
 
 
+async def _rule_training_trigger(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """When the root-cause analysis text mentions training-related
+    keywords (training gap, knowledge deficit, untrained, lack of
+    awareness, inadequate training, competency gap), capture the
+    affected persons + similar-role-holders for L&D follow-up.
+
+    The Training module's L&D dashboard reads `incident.triggeredTrainingFor`
+    to surface "incidents needing training response" — the actual schedule
+    creation happens manually by the LD Manager (this rule is the trigger
+    flag, not the auto-scheduler)."""
+    text_blob = " ".join(
+        filter(
+            None,
+            [
+                (incident.rootCauseSummary or ""),
+                (incident.rootCauseDetail or ""),
+                (incident.correctiveActions or ""),
+                (incident.preventiveActions or ""),
+            ],
+        )
+    ).lower()
+    keywords = [
+        "training gap",
+        "knowledge deficit",
+        "untrained",
+        "lack of awareness",
+        "lack of training",
+        "inadequate training",
+        "competency gap",
+        "not trained",
+        "improper training",
+        "training inadequate",
+    ]
+    matched = [k for k in keywords if k in text_blob]
+    if not matched:
+        return {
+            "ruleName": "Training-gap detection",
+            "fired": False,
+            "reason": "No training-related root cause keywords detected.",
+        }
+
+    # Capture affected persons + their roles. The L&D dashboard joins
+    # these against TrainingProgram.isMandatoryForRoles to show "X
+    # people in role Y need refresher Z".
+    persons = (
+        await db.execute(
+            select(IncidentPerson).where(IncidentPerson.incidentId == incident.id)
+        )
+    ).scalars().all()
+
+    affected_user_ids = [p.userId for p in persons if p.userId]
+    incident.triggeredTrainingFor = affected_user_ids
+    incident.triggeredTrainingKeywords = matched
+
+    return {
+        "ruleName": "Training-gap detection",
+        "fired": True,
+        "reason": (
+            f"Root cause mentions {', '.join(matched)}. "
+            f"Captured {len(affected_user_ids)} affected person(s) for L&D review."
+        ),
+    }
+
+
 _ALL_RULES = [
     _rule_contractor_score,
     _rule_observation_crosslink,
     _rule_lessons_distribution,
     _rule_equipment_reinspection,
     _rule_effectiveness_review,
+    _rule_training_trigger,
 ]
 
 

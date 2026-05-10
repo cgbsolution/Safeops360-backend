@@ -395,51 +395,44 @@ async def sign_flra(
             "escalatedToId": sig.refusalEscalatedToId,
         }
 
-    # Training re-check
+    # Training re-check via canonical competency service. Replaces the
+    # legacy single-program REQUIRED_TRAINING_CODES lookup with the
+    # full multi-program permit-type gate driven by
+    # TrainingProgram.isMandatoryForPermitTypes.
     training_valid = True
     training_expires_at: datetime | None = None
     if permit:
-        required_code = REQUIRED_TRAINING_CODES.get(permit.type.value)
-        if required_code:
-            prog = (
-                await db.execute(
-                    select(TrainingProgram).where(TrainingProgram.code == required_code)
+        from app.services.competency import check_competency_for_permit_type
+
+        comp = await check_competency_for_permit_type(db, user.id, permit.type.value)
+        if not comp.ok:
+            msgs = [b.message for b in comp.blockers]
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                (
+                    "You cannot sign this FLRA — competency requirements not met:\n• "
+                    + "\n• ".join(msgs)
+                    + "\nContact your supervisor."
+                ),
+            )
+        # Capture earliest expiry across all required certs as the
+        # signature's training-expires-at marker.
+        from app.models.training import TrainingCertificate
+        from sqlalchemy import select as _sa_select
+
+        live = (
+            await db.execute(
+                _sa_select(TrainingCertificate)
+                .where(TrainingCertificate.userId == user.id)
+                .where(
+                    TrainingCertificate.status.in_(["ACTIVE", "EXPIRING_SOON"])
                 )
-            ).scalar_one_or_none()
-            if prog is not None:
-                now = datetime.now(timezone.utc)
-                tr_stmt = (
-                    select(TrainingRecord)
-                    .where(TrainingRecord.employeeId == user.id)
-                    .where(TrainingRecord.programId == prog.id)
-                    .where(TrainingRecord.passed == True)  # noqa: E712
-                    .where(TrainingRecord.validUntil > now)
-                    .order_by(TrainingRecord.validUntil.desc())
-                    .limit(1)
-                )
-                valid = (await db.execute(tr_stmt)).scalar_one_or_none()
-                if valid is None:
-                    last_q = (
-                        select(TrainingRecord)
-                        .where(TrainingRecord.employeeId == user.id)
-                        .where(TrainingRecord.programId == prog.id)
-                        .where(TrainingRecord.passed == True)  # noqa: E712
-                        .order_by(TrainingRecord.validUntil.desc())
-                        .limit(1)
-                    )
-                    last_record = (await db.execute(last_q)).scalar_one_or_none()
-                    expiry = (
-                        last_record.validUntil.strftime("%d %b %Y") if last_record else "never"
-                    )
-                    raise HTTPException(
-                        status.HTTP_400_BAD_REQUEST,
-                        (
-                            f'Your "{prog.name}" training expired on {expiry}. '
-                            "You cannot proceed with this work — contact your supervisor for replacement."
-                        ),
-                    )
-                training_valid = True
-                training_expires_at = valid.validUntil
+                .order_by(TrainingCertificate.validTo.asc().nulls_last())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if live is not None:
+            training_expires_at = live.validTo
 
     # Block sign if user declared not fit
     fitness_q = select(FLRAFitnessDeclaration).where(
