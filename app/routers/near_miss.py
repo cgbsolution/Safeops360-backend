@@ -240,7 +240,7 @@ async def list_equipment(
     near-miss form. Filtered to a plant when provided."""
     from app.models.equipment import Equipment
 
-    stmt = select(Equipment).where(Equipment.isActive == True)
+    stmt = select(Equipment).where(Equipment.active == True)
     if plant_id:
         stmt = stmt.where(Equipment.plantId == plant_id)
     stmt = stmt.order_by(Equipment.name)
@@ -674,9 +674,14 @@ async def update_near_miss(
     if payload.rootCauseDetail is not None:
         nm.rootCauseDetail = payload.rootCauseDetail or None
     if payload.targetDate is not None:
-        if payload.targetDate < datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0):
+        # The frontend posts a date-only string → naive datetime. Coerce to
+        # UTC so the comparison with an aware datetime.now() doesn't raise.
+        target = payload.targetDate
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        if target < datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target closure date cannot be in the past.")
-        nm.targetDate = payload.targetDate
+        nm.targetDate = target
     await db.flush()
     await db.refresh(nm)
     return NearMissOut.model_validate(nm)

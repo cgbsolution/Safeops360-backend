@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
-from app.models.user import User
+from app.models.user import Permission, RolePermission, User, UserRole
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -28,6 +28,7 @@ async def search_users(
     department: str | None = None,
     departmentId: str | None = None,
     role: list[str] = Query(default_factory=list),
+    permission: str | None = Query(default=None, description="Filter to users holding this permission code (any active role × grant)."),
     excludeSelf: bool = False,
     take: int = Query(default=20, le=100),
     skip: int = 0,
@@ -51,6 +52,17 @@ async def search_users(
                     codes.append(p)
         if codes:
             stmt = stmt.where(User.role.in_(codes))
+    if permission:
+        # Narrow to users who hold the named permission via any of their
+        # active roles. Used by pickers like "pick an inspector" so the
+        # form can't offer someone the workflow will later reject.
+        eligible_user_ids = (
+            select(UserRole.userId)
+            .join(RolePermission, RolePermission.roleId == UserRole.roleId)
+            .join(Permission, Permission.id == RolePermission.permissionId)
+            .where(Permission.code == permission)
+        )
+        stmt = stmt.where(User.id.in_(eligible_user_ids))
     if excludeSelf:
         stmt = stmt.where(User.id != user.id)
     if q:

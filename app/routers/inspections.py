@@ -57,9 +57,15 @@ async def create_inspection(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid equipment")
     await require_permission_with_context("INSPECTION.CREATE", user, db, plant_id=eq.plantId)
 
+    # The frontend sends a date-only string ("YYYY-MM-DD") which Pydantic
+    # parses to a naive datetime. Comparing naive vs aware raises TypeError —
+    # assume UTC for naive input so the bounds check works uniformly.
+    scheduled = payload.scheduledDate
+    if scheduled.tzinfo is None:
+        scheduled = scheduled.replace(tzinfo=timezone.utc)
     one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
     five_years_ahead = datetime.now(timezone.utc) + timedelta(days=365 * 5)
-    if payload.scheduledDate < one_year_ago or payload.scheduledDate > five_years_ahead:
+    if scheduled < one_year_ago or scheduled > five_years_ahead:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Scheduled date must be within the last year and five years ahead.")
 
     if payload.inspectorId:
@@ -73,8 +79,9 @@ async def create_inspection(
     insp = Inspection(
         number=number,
         equipmentId=payload.equipmentId,
+        plantId=eq.plantId,
         inspectorId=payload.inspectorId,
-        scheduledDate=payload.scheduledDate,
+        scheduledDate=scheduled,
         status=InspectionStatus.SCHEDULED,
     )
     db.add(insp)
@@ -135,14 +142,48 @@ async def update_inspection(
     insp = await db.get(Inspection, inspection_id)
     if insp is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    # "Completed" at the inspection-record level means the inspector submitted
+    # a result, but the workflow may still be in verification. We only want to
+    # forbid edits AFTER the workflow has fully concluded (COMPLETED workflow
+    # status). Without this check the user gets stuck if step 1 of the two-
+    # step submit (PATCH + workflow advance) succeeded at the DB but the
+    # response failed — the inspection is marked COMPLETED, the workflow is
+    # still IN_PROGRESS, and re-submission is locked out.
     if insp.status == InspectionStatus.COMPLETED:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot edit a completed inspection.")
+        from app.models.workflow import WorkflowInstance
+        from sqlalchemy import and_
+        wf = (
+            await db.execute(
+                select(WorkflowInstance).where(
+                    and_(
+                        WorkflowInstance.module == "INSPECTION",
+                        WorkflowInstance.recordId == insp.id,
+                    )
+                )
+            )
+        ).scalar_one_or_none()
+        if wf is not None and wf.status == "COMPLETED":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Cannot edit a completed inspection.",
+            )
     eq = await db.get(Equipment, insp.equipmentId)
     record = {"inspectorId": insp.inspectorId}
-    result = await can(
-        db, user.id, "INSPECTION.UPDATE",
-        PermissionContext(record_id=insp.id, plant_id=eq.plantId if eq else None, record=record),
-    )
+    ctx = PermissionContext(record_id=insp.id, plant_id=eq.plantId if eq else None, record=record)
+
+    # Recording inspection results (checklistResult / result / observations /
+    # followUpRequired) is the inspector's job and only requires
+    # INSPECTION.EXECUTE — the same permission the workflow's "Inspector
+    # Executes Checklist" step gates on. Mutating administrative fields
+    # (inspectorId / scheduledDate) still requires the broader UPDATE grant
+    # since that's a supervisor-level reassign / reschedule action.
+    is_admin_edit = payload.inspectorId is not None or payload.scheduledDate is not None
+    perm_code = "INSPECTION.UPDATE" if is_admin_edit else "INSPECTION.EXECUTE"
+    result = await can(db, user.id, perm_code, ctx)
+    if not result.allowed and not is_admin_edit:
+        # Fall back to UPDATE — some roles (HSE Manager, etc.) hold UPDATE
+        # but not EXECUTE; we shouldn't lock them out of recording results.
+        result = await can(db, user.id, "INSPECTION.UPDATE", ctx)
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
 
@@ -169,4 +210,10 @@ async def update_inspection(
     if payload.followUpRequired is not None:
         insp.followUpRequired = payload.followUpRequired
     await db.flush()
+    # Without refresh, attributes that SQLAlchemy marks as expired after a
+    # flush (notably onupdate columns like updatedAt) trigger an implicit
+    # lazy load when Pydantic reads them — but the greenlet context is gone
+    # by then, raising MissingGreenlet. Refresh forces the load inside the
+    # async context so model_validate gets concrete values.
+    await db.refresh(insp)
     return InspectionOut.model_validate(insp)
