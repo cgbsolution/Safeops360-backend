@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -144,10 +144,29 @@ async def create_permit(
         )
 
     type_code = PERMIT_TYPE_CODE.get(payload.type.value, "PTW")
-    last = (
-        await db.execute(select(func.count()).select_from(Permit).where(Permit.plantId == payload.plantId))
-    ).scalar_one()
-    number = f"PTW-{plant.code}-{last + 1:05d}"
+    # Generate the next permit number for this plant. We pull the MAX
+    # numeric suffix of existing permit numbers (not COUNT(*)) so that
+    # deletions don't shrink the counter and cause the next insert to
+    # collide with a number that was already issued. The `Permit_number_key`
+    # unique constraint will still trip on the unlikely concurrent-insert
+    # race, but for a single-tenant per-plant counter that's acceptable.
+    prefix = f"PTW-{plant.code}-"
+    existing_numbers = (
+        await db.execute(
+            select(Permit.number)
+            .where(Permit.plantId == payload.plantId)
+            .where(Permit.number.like(f"{prefix}%"))
+        )
+    ).scalars().all()
+    max_suffix = 0
+    for n in existing_numbers:
+        try:
+            suffix_int = int(n.rsplit("-", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if suffix_int > max_suffix:
+            max_suffix = suffix_int
+    number = f"{prefix}{max_suffix + 1:05d}"
 
     # Auto-detect requirements from permit type — wizard reads the same
     # rules client-side, but we re-compute server-side for defence in depth.
@@ -301,6 +320,12 @@ async def create_permit(
         print(f"PTW workflow init failed: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
+    # Refresh once more: workflow_engine.initiate flips Permit.status to
+    # SUBMITTED via _sync_record_status, and the resulting UPDATE expires
+    # server-default columns like updatedAt. Without this refresh, Pydantic
+    # serialization triggers a lazy load on the expired attribute and dies
+    # with MissingGreenlet (sync code attempting async IO).
+    await db.refresh(permit)
     return PermitOut.model_validate(permit)
 
 

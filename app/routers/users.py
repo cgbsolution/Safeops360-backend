@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
-from app.models.user import Permission, RolePermission, User, UserRole
+from app.models.user import Permission, Role, RolePermission, User, UserRole
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -51,7 +51,19 @@ async def search_users(
                 if p:
                     codes.append(p)
         if codes:
-            stmt = stmt.where(User.role.in_(codes))
+            # Match against the canonical UserRole assignments (the legacy
+            # denormalised `User.role` only carries the user's *primary*
+            # role and misses overlays like PERMIT_ISSUER assigned via the
+            # UserRole table — those overlays are how operational roles are
+            # actually granted in seed_rbac.py). Falling back to User.role
+            # in addition keeps back-compat with any callers that pass a
+            # role code that's only present in the legacy column.
+            role_user_ids = (
+                select(UserRole.userId)
+                .join(Role, Role.id == UserRole.roleId)
+                .where(Role.code.in_(codes))
+            )
+            stmt = stmt.where(or_(User.id.in_(role_user_ids), User.role.in_(codes)))
     if permission:
         # Narrow to users who hold the named permission via any of their
         # active roles. Used by pickers like "pick an inspector" so the
