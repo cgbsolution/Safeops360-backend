@@ -14,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.db import engine, warmup
 from app.routers import (
+    agents,
+    agents_config,
     anomalies,
     auth,
     flra,
@@ -80,6 +82,8 @@ def create_app() -> FastAPI:
     app.include_router(workflow.router)
     app.include_router(workflow_definitions.router)
     app.include_router(anomalies.router)
+    app.include_router(agents.router)
+    app.include_router(agents_config.router)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:

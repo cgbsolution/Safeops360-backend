@@ -4,6 +4,12 @@ Each module groups related tables; importing this package guarantees Alembic's
 autogenerate sees every model.
 """
 
+from app.models.agent import (
+    Agent,
+    AgentInvocation,
+    AgentPrompt,
+    AgentToolCall,
+)
 from app.models.anomaly import Anomaly
 from app.models.equipment import Equipment, Inspection
 from app.models.flra import FLRA, FLRACrewSignature, FLRAStatus, FLRATeamMember
@@ -74,6 +80,10 @@ from app.models.workflow import (
 )
 
 __all__ = [
+    "Agent",
+    "AgentInvocation",
+    "AgentPrompt",
+    "AgentToolCall",
     "Anomaly",
     "Area",
     "Equipment",

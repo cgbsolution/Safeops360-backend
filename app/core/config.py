@@ -23,10 +23,24 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000"
 
-    # AI agents (Anthropic Claude). Optional — when unset, the agents log
-    # a warning and fall through gracefully so the workflow keeps working.
+    # AI agents (Anthropic Claude). Optional — when unset, the
+    # workflow-rule agents (Pattern A: triage / lessons) log a warning
+    # and fall through gracefully so the workflow keeps working. The
+    # user-initiated agent platform (Pattern B) cannot proceed without
+    # the key and surfaces an ERRORED invocation if it's missing.
     anthropic_api_key: str | None = None
+    # Default model for Pattern A agents.
     anthropic_model: str = "claude-haiku-4-5-20251001"
+    # Escalation model used by Pattern B agents when low confidence or
+    # explicit user request triggers a deeper analysis. Configured at
+    # the agent level (Agent.escalationModelId), but this acts as the
+    # platform-wide hint for newly-seeded agents.
+    anthropic_escalation_model: str = "claude-opus-4-7"
+    # Tool-loop iteration cap and per-turn output cap for Pattern B
+    # agents. Surface here so the operations dashboard can tune them
+    # without code edits.
+    agent_max_tool_iterations: int = 8
+    agent_max_tokens_per_turn: int = 4096
 
     @property
     def cors_origins_list(self) -> list[str]:
