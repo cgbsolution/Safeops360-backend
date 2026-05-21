@@ -92,11 +92,10 @@ async def list_agents(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[AgentOut]:
-    """List every configured agent. Visible to anyone with any agent
-    invoke permission — same shape as the configuration landing tile.
-    Today this only checks AGENT.RCA_INVOKE since RCA is the only
-    user-initiated agent; when more land, generalise."""
-    await _require(db, user.id, "AGENT.RCA_INVOKE")
+    """List every configured agent. Open to any authenticated user so the
+    AI Agents landing page is universally discoverable — invocation on a
+    specific record is still gated by AGENT.RCA_INVOKE at the runtime
+    router (app/routers/agents.py)."""
     rows = (
         (await db.execute(select(Agent).order_by(Agent.code)))
         .scalars()
@@ -111,7 +110,8 @@ async def get_agent(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AgentOut:
-    await _require(db, user.id, "AGENT.RCA_INVOKE")
+    # Open to any authenticated user — the AI Agents detail page is a
+    # read-only operations dashboard; mutations are gated separately.
     agent = await _load_agent(db, code)
     return AgentOut.model_validate(agent)
 
@@ -173,8 +173,7 @@ async def get_agent_metrics(
     db: AsyncSession = Depends(get_db),
 ) -> AgentMetricsResponse:
     """Returns aggregated metrics over the last `days` days, plus a
-    daily series for the trend chart."""
-    await _require(db, user.id, "AGENT.RCA_INVOKE")
+    daily series for the trend chart. Open to any authenticated user."""
     agent = await _load_agent(db, code)
     window_start = datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -324,7 +323,8 @@ async def list_agent_prompts(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[AgentPromptOut]:
-    await _require(db, user.id, "AGENT.RCA_INVOKE")
+    # Prompt metadata (version list, acceptance rates) is open. The full
+    # prompt body still requires AGENT.PROMPT_EDIT (see get_agent_prompt).
     agent = await _load_agent(db, code)
     rows = (
         (
