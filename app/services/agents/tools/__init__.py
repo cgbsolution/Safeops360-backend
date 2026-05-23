@@ -23,11 +23,15 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.services.agents.tools import (
+    check_crew_training_currency,
     check_recent_changes,
     echo_incident_summary,
+    find_concurrent_permits,
+    find_recent_findings_in_area,
     find_related_near_misses,
     find_related_observations,
     find_similar_incidents,
+    find_similar_past_incidents_for_permit,
     get_active_permits_at_time,
     get_equipment_history,
     get_industry_benchmark,
@@ -83,6 +87,23 @@ TOOL_REGISTRY: dict[str, tuple[dict[str, Any], ToolHandler]] = {
         get_industry_benchmark.DEFINITION,
         get_industry_benchmark.handle,
     ),
+    # ─── PermitRiskReviewerAgent tools ─────────────────────────────────
+    find_concurrent_permits.DEFINITION["name"]: (
+        find_concurrent_permits.DEFINITION,
+        find_concurrent_permits.handle,
+    ),
+    find_similar_past_incidents_for_permit.DEFINITION["name"]: (
+        find_similar_past_incidents_for_permit.DEFINITION,
+        find_similar_past_incidents_for_permit.handle,
+    ),
+    check_crew_training_currency.DEFINITION["name"]: (
+        check_crew_training_currency.DEFINITION,
+        check_crew_training_currency.handle,
+    ),
+    find_recent_findings_in_area.DEFINITION["name"]: (
+        find_recent_findings_in_area.DEFINITION,
+        find_recent_findings_in_area.handle,
+    ),
     # Smoke-test tool from Commit 1. Kept registered so the test harness
     # can exercise the agent runtime against a minimal known-good tool.
     echo_incident_summary.DEFINITION["name"]: (
@@ -121,10 +142,24 @@ RCA_AGENT_TOOL_NAMES: list[str] = [
 ]
 
 
+# Canonical PermitRiskReviewer tool list. Used by the agent seeding
+# script to populate Agent.availableTools for PERMIT_RISK_REVIEWER.
+# A Python test guards against drift between this list and the registry.
+PERMIT_RISK_REVIEWER_TOOL_NAMES: list[str] = [
+    "find_concurrent_permits",
+    "find_similar_past_incidents_for_permit",
+    "check_crew_training_currency",
+    "find_recent_findings_in_area",
+    "get_training_records",
+    "get_equipment_history",
+]
+
+
 __all__ = [
     "TOOL_REGISTRY",
     "ToolHandler",
     "get_tool_definitions",
     "get_tool_handler",
     "RCA_AGENT_TOOL_NAMES",
+    "PERMIT_RISK_REVIEWER_TOOL_NAMES",
 ]
