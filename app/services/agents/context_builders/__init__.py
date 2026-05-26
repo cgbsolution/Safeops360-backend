@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.agents.context_builders import incident as incident_builder
 from app.services.agents.context_builders import permit as permit_builder
+from app.services.agents.context_builders import triage as triage_builder
 
 
 ContextBuilder = Callable[[AsyncSession, str], Awaitable[dict[str, Any]]]
@@ -33,6 +34,8 @@ ContextBuilder = Callable[[AsyncSession, str], Awaitable[dict[str, Any]]]
 CONTEXT_BUILDERS: dict[str, ContextBuilder] = {
     "INCIDENT": incident_builder.build_context,
     "PTW": permit_builder.build_context,
+    "OBSERVATION": triage_builder.build_observation_context,
+    "NEAR_MISS": triage_builder.build_near_miss_context,
 }
 
 

@@ -234,15 +234,25 @@ async def complete_with_tools(
     hit_cap = False
 
     for iteration in range(max_iterations):
+        # Anthropic's API rejects tools=[] with a validation error
+        # ("tools must contain at least one item"). When the caller has
+        # no tools (e.g. the TriageAgent which reasons purely over its
+        # context), omit the parameter entirely so the call still works.
+        # The model can never emit tool_use blocks in this mode, so the
+        # loop naturally finishes in one iteration.
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system,
+            "messages": messages,
+        }
+        if tools:
+            create_kwargs["tools"] = tools
+
         try:
             response = await asyncio.to_thread(
-                client.messages.create,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-                messages=messages,
-                tools=tools,
+                client.messages.create, **create_kwargs
             )
         except Exception as e:  # noqa: BLE001
             raise AnthropicApiError(f"messages.create failed at iteration {iteration + 1}: {e}") from e

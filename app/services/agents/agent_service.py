@@ -73,6 +73,7 @@ _DEFAULT_PRICE = (3.0, 15.0)  # fallback when model not in table
 _INVOKE_PERMISSIONS: dict[str, str] = {
     "RCA_ASSISTANT": "AGENT.RCA_INVOKE",
     "PERMIT_RISK_REVIEWER": "AGENT.PERMIT_REVIEW_INVOKE",
+    "TRIAGE_AGENT": "AGENT.TRIAGE_INVOKE",
     # Future agents register here.
 }
 
