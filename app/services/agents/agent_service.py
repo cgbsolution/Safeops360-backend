@@ -40,6 +40,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentInvocation, AgentPrompt, AgentToolCall
+from app.models.capa import Capa
 from app.models.incident import Incident
 from app.models.near_miss import NearMiss
 from app.models.observation import Observation
@@ -74,6 +75,8 @@ _INVOKE_PERMISSIONS: dict[str, str] = {
     "RCA_ASSISTANT": "AGENT.RCA_INVOKE",
     "PERMIT_RISK_REVIEWER": "AGENT.PERMIT_REVIEW_INVOKE",
     "TRIAGE_AGENT": "AGENT.TRIAGE_INVOKE",
+    "HIRA_ASSISTANT": "AGENT.HIRA_INVOKE",
+    "CAPA_ASSISTANT": "AGENT.CAPA_INVOKE",
     # Future agents register here.
 }
 
@@ -444,6 +447,7 @@ async def _resolve_source_plant_id(
         "OBSERVATION": Observation,
         "NEAR_MISS": NearMiss,
         "PTW": Permit,
+        "CAPA": Capa,
     }
     model = table_map.get(source_module)
     if model is None:

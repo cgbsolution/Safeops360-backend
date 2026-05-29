@@ -18,7 +18,10 @@ from app.routers import (
     agents_config,
     anomalies,
     auth,
+    capa,
+    eai,
     flra,
+    hira,
     incidents,
     inspections,
     manhours,
@@ -26,6 +29,8 @@ from app.routers import (
     observations,
     ptw,
     ptw_active,
+    risk_dashboard,
+    risk_register,
     training,
     users,
     workflow,
@@ -84,6 +89,11 @@ def create_app() -> FastAPI:
     app.include_router(anomalies.router)
     app.include_router(agents.router)
     app.include_router(agents_config.router)
+    app.include_router(hira.router)
+    app.include_router(capa.router)
+    app.include_router(eai.router)
+    app.include_router(risk_register.router)
+    app.include_router(risk_dashboard.router)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:

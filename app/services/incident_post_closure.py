@@ -259,6 +259,91 @@ async def _rule_training_trigger(db: AsyncSession, incident: Incident) -> dict[s
     }
 
 
+async def _rule_hira_review_trigger(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """Phase 6 — trigger HIRA review for entries covering the incident's
+    area or activity. Per spec §3.3 / §6.3.
+
+    Match logic (best-effort, conservative — never over-trigger):
+      1. HiraEntry rows whose study.plantId == incident.plantId AND
+         entry.areaId == incident.areaId (same location).
+      2. Active studies only — skip DRAFT, SUPERSEDED, ARCHIVED.
+      3. Skip entries that already have an open ReviewCycle (debounce).
+
+    For each match, create a HiraReviewCycle with triggeredBy='INCIDENT',
+    triggerReferenceId=incident.id, assignee = entry.study.teamLeaderId.
+    Wrapped by the caller in a SAVEPOINT so failure is non-fatal.
+    """
+    from app.models.hira import HiraEntry, HiraReviewCycle, HiraStudy
+
+    if not incident.plantId or not incident.areaId:
+        return {
+            "ruleName": "HIRA Review Trigger",
+            "fired": False,
+            "reason": "Incident has no plant/area context; cannot match HIRA entries.",
+        }
+
+    # Find candidate entries
+    stmt = (
+        select(HiraEntry, HiraStudy)
+        .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
+        .where(HiraStudy.plantId == incident.plantId)
+        .where(HiraEntry.areaId == incident.areaId)
+        .where(HiraStudy.status == "ACTIVE")
+        .where(HiraEntry.isCurrentVersion.is_(True))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+    )
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        return {
+            "ruleName": "HIRA Review Trigger",
+            "fired": False,
+            "reason": "No matching active HIRA entries for this incident's area.",
+        }
+
+    # Debounce: skip entries with an open review cycle
+    entry_ids = [r[0].id for r in rows]
+    existing_open = (
+        await db.execute(
+            select(HiraReviewCycle.entryId)
+            .where(HiraReviewCycle.entryId.in_(entry_ids))
+            .where(HiraReviewCycle.status.in_(["SCHEDULED", "IN_PROGRESS"]))
+        )
+    ).scalars().all()
+    debounce = set(existing_open)
+
+    created = 0
+    now = datetime.now(timezone.utc)
+    due = now + timedelta(days=30)
+    for entry, study in rows:
+        if entry.id in debounce:
+            continue
+        cycle = HiraReviewCycle(
+            entryId=entry.id,
+            scheduledFor=due,
+            triggeredBy="INCIDENT",
+            triggerReferenceId=incident.id,
+            status="SCHEDULED",
+            assignedToId=study.teamLeaderId,
+            assignedRole="TEAM_LEADER",
+        )
+        db.add(cycle)
+        # Also flag the entry for review so the list view surfaces it
+        entry.status = "FLAGGED_FOR_REVIEW"
+        created += 1
+
+    if created == 0:
+        return {
+            "ruleName": "HIRA Review Trigger",
+            "fired": False,
+            "reason": f"All {len(rows)} matching entries already have open review cycles.",
+        }
+    return {
+        "ruleName": "HIRA Review Trigger",
+        "fired": True,
+        "reason": f"Created {created} HIRA review cycle(s) due {due.date().isoformat()} for entries in incident area.",
+    }
+
+
 _ALL_RULES = [
     _rule_contractor_score,
     _rule_observation_crosslink,
@@ -266,6 +351,7 @@ _ALL_RULES = [
     _rule_equipment_reinspection,
     _rule_effectiveness_review,
     _rule_training_trigger,
+    _rule_hira_review_trigger,
 ]
 
 

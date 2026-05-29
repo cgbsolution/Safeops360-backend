@@ -593,6 +593,54 @@ async def _create_tasks_for_step(
             # add CAPAs at the previous step normally.
             assignees = [initiator_id]
 
+    elif strategy == "CAPA_ACTION_FAN_OUT" and module == "CAPA":
+        # One EXECUTION task per CapaAction row attached to this CAPA. Each
+        # action owner gets their own task; the workflow step advances only
+        # when ALL actions are completed. Mirrors NEAR_MISS CAPA_FAN_OUT but
+        # against the unified Capa table.
+        from app.models.capa import CapaAction
+
+        action_rows = (
+            await db.execute(
+                select(CapaAction).where(CapaAction.capaId == record_id)
+            )
+        ).scalars().all()
+        for action in action_rows:
+            if action.ownerUserId:
+                assignees.append(action.ownerUserId)
+        if not assignees:
+            # No actions defined yet — route to initiator so they go back to
+            # the previous step and add actions. Common when CAPA was
+            # submitted without planning fully.
+            assignees = [initiator_id]
+
+    elif strategy == "HIRA_TEAM_FAN_OUT" and module == "HIRA_STUDY":
+        # One APPROVAL task per HiraStudyTeamMember. The study cannot
+        # advance to Plant Head approval until every team member has
+        # signed off (matches spec §3.1 step 4: "every team member has
+        # signed"). The team leader gets the first task; other members
+        # get parallel sign-off tasks.
+        from app.models.hira import HiraStudy, HiraStudyTeamMember
+
+        study = await db.get(HiraStudy, record_id)
+        if study is not None:
+            assignees.append(study.teamLeaderId)
+        member_rows = (
+            await db.execute(
+                select(HiraStudyTeamMember).where(HiraStudyTeamMember.studyId == record_id)
+            )
+        ).scalars().all()
+        seen = {study.teamLeaderId} if study is not None else set()
+        for m in member_rows:
+            if m.userId and m.userId not in seen:
+                assignees.append(m.userId)
+                seen.add(m.userId)
+        if not assignees:
+            # Edge case: no team rows yet. Route to initiator so the
+            # workflow doesn't dead-end; the initiator will populate the
+            # team before re-submitting.
+            assignees = [initiator_id]
+
     else:
         # Default single-task path
         assignee = await _resolve_assignee(

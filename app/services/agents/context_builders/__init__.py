@@ -22,6 +22,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.agents.context_builders import capa as capa_builder
 from app.services.agents.context_builders import incident as incident_builder
 from app.services.agents.context_builders import permit as permit_builder
 from app.services.agents.context_builders import triage as triage_builder
@@ -36,6 +37,7 @@ CONTEXT_BUILDERS: dict[str, ContextBuilder] = {
     "PTW": permit_builder.build_context,
     "OBSERVATION": triage_builder.build_observation_context,
     "NEAR_MISS": triage_builder.build_near_miss_context,
+    "CAPA": capa_builder.build_context,
 }
 
 
