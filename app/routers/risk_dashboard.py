@@ -29,7 +29,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi import HTTPException, status
+
 from app.core.db import get_db
+from app.core.deps import get_current_user
+from app.models.user import User
 from app.models.eai import (
     EaiAspect,
     EaiAspectCategory,
@@ -50,6 +54,25 @@ from app.models.incident import Incident
 from app.models.masters import Department
 
 router = APIRouter(prefix="/api/risk-dashboard", tags=["risk-dashboard"])
+
+
+async def resolve_plant_id(
+    plantId: str | None = Query(None),
+    user: User = Depends(get_current_user),
+) -> str:
+    """Pick the plant the caller is asking about.
+
+    Web callers explicitly pass `?plantId=…`. Mobile / lightweight clients
+    omit it and we fall back to the caller's home plant — saves the mobile
+    UI from having to round-trip the user object before each widget.
+    """
+    plant_id = (plantId or user.plantId or "").strip()
+    if not plant_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "plantId required (caller has no home plant)",
+        )
+    return plant_id
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -155,7 +178,7 @@ async def _eai_enabled_for(db: AsyncSession, plant_id: str) -> bool:
 
 @router.get("/top-risks", response_model=list[TopRiskRow])
 async def top_risks(
-    plantId: str = Query(...),
+    plantId: str = Depends(resolve_plant_id),
     limit: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
@@ -229,7 +252,7 @@ async def top_risks(
 
 @router.get("/risk-trend", response_model=list[RiskTrendPoint])
 async def risk_trend(
-    plantId: str = Query(...),
+    plantId: str = Depends(resolve_plant_id),
     months: int = Query(12, ge=1, le=36),
     db: AsyncSession = Depends(get_db),
 ):
@@ -302,7 +325,7 @@ async def risk_trend(
 
 @router.get("/heatmap", response_model=list[HeatmapCell])
 async def heatmap(
-    plantId: str = Query(...), db: AsyncSession = Depends(get_db),
+    plantId: str = Depends(resolve_plant_id), db: AsyncSession = Depends(get_db),
 ):
     from app.models.plant import Area
 
@@ -365,7 +388,7 @@ async def heatmap(
 
 @router.get("/control-effectiveness", response_model=list[ControlEffectivenessRow])
 async def control_effectiveness(
-    plantId: str = Query(...), db: AsyncSession = Depends(get_db),
+    plantId: str = Depends(resolve_plant_id), db: AsyncSession = Depends(get_db),
 ):
     buckets: dict[str, dict[str, int]] = {}
 
@@ -438,7 +461,7 @@ async def control_effectiveness(
 
 
 @router.get("/coverage", response_model=CoverageStats)
-async def coverage(plantId: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def coverage(plantId: str = Depends(resolve_plant_id), db: AsyncSession = Depends(get_db)):
     total = (
         await db.execute(
             select(func.count(Department.id)).where(Department.plantId == plantId)
@@ -480,7 +503,7 @@ async def coverage(plantId: str = Query(...), db: AsyncSession = Depends(get_db)
 
 
 @router.get("/review-compliance", response_model=ReviewComplianceStats)
-async def review_compliance(plantId: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def review_compliance(plantId: str = Depends(resolve_plant_id), db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
 
     total_hira = (
@@ -553,7 +576,7 @@ async def review_compliance(plantId: str = Query(...), db: AsyncSession = Depend
 
 
 @router.get("/top-categories", response_model=list[TopCategoryRow])
-async def top_categories(plantId: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def top_categories(plantId: str = Depends(resolve_plant_id), db: AsyncSession = Depends(get_db)):
     rows: list[TopCategoryRow] = []
 
     hira_cats = (
@@ -597,7 +620,7 @@ async def top_categories(plantId: str = Query(...), db: AsyncSession = Depends(g
 
 
 @router.get("/incident-linkage", response_model=list[IncidentLinkageRow])
-async def incident_linkage(plantId: str = Query(...), db: AsyncSession = Depends(get_db)):
+async def incident_linkage(plantId: str = Depends(resolve_plant_id), db: AsyncSession = Depends(get_db)):
     cutoff = datetime.now(timezone.utc) - timedelta(days=90)
     rows = (
         await db.execute(

@@ -18,6 +18,16 @@ class ObservationType(str, enum.Enum):
 
 
 class ObservationCategory(str, enum.Enum):
+    """Categories accepted by the read path.
+
+    Some legacy / seeded rows were written with names that the original
+    enum didn't list (OTHERS, EMERGENCY_PREP, …). Reads via the ORM
+    eagerly enum-coerce the value, so any DB string that isn't in this
+    enum throws LookupError and 500s the endpoint. We accept the drift
+    here (additive, non-breaking) and document the canonical name. New
+    writes should still use OTHER / EMERGENCY.
+    """
+
     PPE = "PPE"
     HOUSEKEEPING = "HOUSEKEEPING"
     WORK_AT_HEIGHT = "WORK_AT_HEIGHT"
@@ -28,7 +38,14 @@ class ObservationCategory(str, enum.Enum):
     CONFINED_SPACE = "CONFINED_SPACE"
     CHEMICAL_HANDLING = "CHEMICAL_HANDLING"
     EMERGENCY = "EMERGENCY"
+    EMERGENCY_PREP = "EMERGENCY_PREP"  # legacy alias of EMERGENCY
     OTHER = "OTHER"
+    OTHERS = "OTHERS"  # legacy alias of OTHER
+    ENVIRONMENT = "ENVIRONMENT"
+    ERGONOMICS = "ERGONOMICS"
+    BEHAVIOUR = "BEHAVIOUR"
+    PROCESS_SAFETY = "PROCESS_SAFETY"
+    LIFTING = "LIFTING"
 
 
 class Severity(str, enum.Enum):

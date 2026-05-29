@@ -37,6 +37,8 @@ from app.schemas.workflow import (
     ResubmitRequest,
     SubmitExecutionRequest,
     VerifyRequest,
+    WorkflowTaskListResponse,
+    WorkflowTaskOut,
 )
 from app.services import workflow_engine
 from app.services.permissions import get_user_role_codes
@@ -433,15 +435,71 @@ async def my_count(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MyCountResponse:
-    """Inbox unread badge — counts pending tasks directly assigned to the user.
-    Group-queue support is disabled because the `eligibleGroupRoles` column
-    isn't in Prisma's schema."""
-    direct = (
+    """Inbox counters — pending / overdue / completed for the current user."""
+    now = datetime.now(timezone.utc)
+    pending_stmt = (
         select(func.count())
         .select_from(WorkflowTask)
         .where(WorkflowTask.assignedToId == user.id)
         .where(WorkflowTask.status == TaskStatus.PENDING.value)
     )
-    direct_count = (await db.execute(direct)).scalar_one()
-    group_count = 0
-    return MyCountResponse(count=int(direct_count) + int(group_count))
+    overdue_stmt = (
+        select(func.count())
+        .select_from(WorkflowTask)
+        .where(WorkflowTask.assignedToId == user.id)
+        .where(WorkflowTask.status == TaskStatus.PENDING.value)
+        .where(WorkflowTask.dueAt.is_not(None))
+        .where(WorkflowTask.dueAt < now)
+    )
+    completed_stmt = (
+        select(func.count())
+        .select_from(WorkflowTask)
+        .where(WorkflowTask.assignedToId == user.id)
+        .where(WorkflowTask.status == TaskStatus.COMPLETED.value)
+    )
+    pending = int((await db.execute(pending_stmt)).scalar_one())
+    overdue = int((await db.execute(overdue_stmt)).scalar_one())
+    completed = int((await db.execute(completed_stmt)).scalar_one())
+    return MyCountResponse(count=pending, pending=pending, overdue=overdue, completed=completed)
+
+
+@router.get("/tasks", response_model=WorkflowTaskListResponse)
+async def list_my_tasks(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    status_filter: str | None = None,
+    limit: int = 50,
+) -> WorkflowTaskListResponse:
+    """Inbox feed — workflow tasks assigned directly to the caller.
+
+    `status_filter` accepts PENDING (default), COMPLETED or ALL. Results are
+    capped at `limit` (max 200) and ordered by assignedAt desc — newest first
+    so the inbox surfaces the freshest work without an explicit sort.
+    """
+    capped_limit = max(1, min(limit, 200))
+    stmt = select(WorkflowTask).where(WorkflowTask.assignedToId == user.id)
+    sf = (status_filter or "PENDING").upper()
+    if sf == "PENDING":
+        stmt = stmt.where(WorkflowTask.status == TaskStatus.PENDING.value)
+    elif sf == "COMPLETED":
+        stmt = stmt.where(WorkflowTask.status == TaskStatus.COMPLETED.value)
+    # sf == "ALL" — no filter
+    stmt = stmt.order_by(WorkflowTask.assignedAt.desc()).limit(capped_limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    items = [
+        WorkflowTaskOut(
+            id=t.id,
+            module=t.module,
+            recordId=t.recordId,
+            recordNumber=t.recordNumber,
+            recordTitle=t.recordTitle,
+            stepName=t.stepName,
+            taskType=t.taskType.value if hasattr(t.taskType, "value") else str(t.taskType),
+            status=t.status,
+            priority=t.priority,
+            assignedAt=t.assignedAt,
+            dueAt=t.dueAt,
+        )
+        for t in rows
+    ]
+    return WorkflowTaskListResponse(items=items, total=len(items))

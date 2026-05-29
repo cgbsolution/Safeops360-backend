@@ -19,7 +19,10 @@ from app.routers import (
     anomalies,
     auth,
     capa,
+    dashboard,
+    devices,
     eai,
+    plants,
     flra,
     hira,
     incidents,
@@ -94,10 +97,20 @@ def create_app() -> FastAPI:
     app.include_router(eai.router)
     app.include_router(risk_register.router)
     app.include_router(risk_dashboard.router)
+    app.include_router(devices.router)
+    app.include_router(plants.router)
+    app.include_router(dashboard.router)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:
         return {"status": "ok", "env": settings.app_env}
+
+    @app.get("/api/meta/min-version", tags=["meta"])
+    async def min_supported_version() -> dict[str, str]:
+        """Force-update gate consumed by the mobile Bootstrapper. Returns the
+        oldest app version we still allow to talk to this backend. Bump these
+        to push users off a known-broken build."""
+        return {"ios": "1.0.0", "android": "1.0.0"}
 
     return app
 

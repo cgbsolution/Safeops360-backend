@@ -24,6 +24,43 @@ router = APIRouter(prefix="/api/inspections", tags=["inspections"])
 VALID_RESULTS = {"Pass", "Partial", "Fail"}
 
 
+@router.get("/equipment")
+async def list_inspection_equipment(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Equipment available for the inspection-create form. Scoped to the
+    plants the caller can act in (via INSPECTION.CREATE) so the mobile
+    picker can't offer items that will only 403 on submit.
+
+    Used by the mobile InspectionCreateScreen — the web flow loads the
+    same data directly from Prisma in src/app/(dashboard)/inspections/new.
+    """
+    create_check = await can(db, user.id, "INSPECTION.CREATE", PermissionContext())
+    if not create_check.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, create_check.reason or "Access denied")
+    plants = await get_accessible_plants(db, user.id)
+    stmt = select(Equipment).where(Equipment.active == True)
+    if plants is not None:
+        if not plants:
+            return []
+        stmt = stmt.where(Equipment.plantId.in_(plants))
+    rows = (await db.execute(stmt.order_by(Equipment.name))).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "code": r.code,
+            "name": r.name,
+            "plantId": r.plantId,
+            "frequency": r.frequency,
+            "category": r.category,
+            "location": r.location,
+            "checklistTemplate": r.checklistTemplate,
+        }
+        for r in rows
+    ]
+
+
 @router.get("")
 async def list_inspections(
     user: User = Depends(get_current_user),

@@ -49,7 +49,38 @@ class ReassignRequest(BaseModel):
 
 
 class MyCountResponse(BaseModel):
+    """Inbox counters for the workflow-task header / dashboard pill.
+
+    The legacy `count` field is kept for back-compat with older callers; new
+    clients should consume the structured pending / overdue / completed
+    triplet which mirrors the mobile inbox layout.
+    """
+
     count: int
+    pending: int = 0
+    overdue: int = 0
+    completed: int = 0
+
+
+class WorkflowTaskOut(BaseModel):
+    id: str
+    module: str
+    recordId: str
+    recordNumber: str | None = None
+    recordTitle: str | None = None
+    stepName: str
+    taskType: str
+    status: str
+    priority: str
+    assignedAt: datetime
+    dueAt: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class WorkflowTaskListResponse(BaseModel):
+    items: list[WorkflowTaskOut]
+    total: int
 
 
 # ─── Definition admin ────────────────────────────────────────────────────
