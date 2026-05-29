@@ -21,6 +21,7 @@ Design notes:
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -37,6 +38,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models._base import Base, IdMixin
+
+if TYPE_CHECKING:
+    from app.models.masters import Department
+    from app.models.plant import Area, Plant
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -239,6 +244,13 @@ class HiraStudy(Base, IdMixin):
     entries: Mapped[list["HiraEntry"]] = relationship(back_populates="study", cascade="all, delete-orphan")
     attachments: Mapped[list["HiraStudyAttachment"]] = relationship(back_populates="study", cascade="all, delete-orphan")
 
+    # Single-sided lookups used by the list endpoint (selectinload). No
+    # back_populates — Plant / Department / Area do not need a back-ref
+    # for the queries we run.
+    plant: Mapped["Plant"] = relationship("Plant", foreign_keys=[plantId])
+    department: Mapped["Department | None"] = relationship("Department", foreign_keys=[departmentId])
+    area: Mapped["Area | None"] = relationship("Area", foreign_keys=[areaId])
+
 
 class HiraStudyTeamMember(Base, IdMixin):
     __tablename__ = "HiraStudyTeamMember"
@@ -291,6 +303,7 @@ class HiraEntry(Base, IdMixin):
 
     activityDescription: Mapped[str] = mapped_column(Text, nullable=False)
     areaId: Mapped[str | None] = mapped_column(ForeignKey("Area.id"))
+    area: Mapped["Area | None"] = relationship("Area", foreign_keys=[areaId])
     subLocation: Mapped[str | None] = mapped_column(String)
     gpsLatitude: Mapped[float | None] = mapped_column(Float)
     gpsLongitude: Mapped[float | None] = mapped_column(Float)
