@@ -260,11 +260,11 @@ async def evaluate_layer_a(
         try:
             rows = (
                 await db.execute(
-                    select(Incident.id, Incident.severity, getattr(Incident, "incidentDateTime", None))
+                    select(Incident.id, Incident.severity, Incident.date)
                     .where(Incident.plantId == plant_id)
-                    .where(getattr(Incident, "areaId", None) == area_id)
+                    .where(Incident.areaId == area_id)
                     .where(Incident.severity.in_(["HIGH", "CRITICAL"]))
-                    .where(getattr(Incident, "incidentDateTime", datetime.utcnow()) >= cutoff)
+                    .where(Incident.date >= cutoff)
                     .limit(10)
                 )
             ).all()

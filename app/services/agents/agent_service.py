@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentInvocation, AgentPrompt, AgentToolCall
 from app.models.capa import Capa
+from app.models.hira import HiraEntry, HiraStudy
 from app.models.incident import Incident
 from app.models.near_miss import NearMiss
 from app.models.observation import Observation
@@ -442,6 +443,15 @@ async def _resolve_source_plant_id(
     """Look up the plantId on the source record so per-plant rate limits
     and dashboard filters work. Returns None when the module doesn't
     have a plant (shouldn't happen for any operational module today)."""
+    # HIRA's source record is a HiraEntry, which carries no plantId of its
+    # own — the plant lives on the parent study. Resolve via the study.
+    if source_module == "HIRA":
+        entry = await db.get(HiraEntry, source_record_id)
+        if entry is None:
+            return None
+        study = await db.get(HiraStudy, entry.studyId)
+        return study.plantId if study is not None else None
+
     table_map: dict[str, type[Any]] = {
         "INCIDENT": Incident,
         "OBSERVATION": Observation,

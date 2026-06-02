@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -22,6 +22,7 @@ from app.models.workflow import (
     InstanceStatus,
     StepType,
     TaskStatus,
+    TaskType,
     WorkflowDefinition,
     WorkflowHistory,
     WorkflowInstance,
@@ -430,26 +431,87 @@ async def repair_orphan(
     return {"repaired": True, "taskId": task.id, "stepName": step.name}
 
 
+# ─── Inbox tab helpers ─────────────────────────────────────────────────────
+
+
+_INBOX_TABS = (
+    "pending_approvals",
+    "my_tasks",
+    "pending_verification",
+    "submitted_by_me",
+    "overdue_escalated",
+)
+
+
+def _apply_tab_filter(stmt, tab: str, user_id: str, now: datetime):
+    """Narrow a WorkflowTask query to one of the five inbox tabs.
+
+    Each tab corresponds to a column in the web Inbox segmented control:
+      • pending_approvals    — APPROVAL tasks assigned to me, status PENDING
+      • my_tasks             — EXECUTION tasks assigned to me, status PENDING
+      • pending_verification — VERIFICATION tasks assigned to me, status PENDING
+      • submitted_by_me      — instances I started (any status)
+      • overdue_escalated    — pending tasks past their dueAt OR URGENT
+    """
+    if tab == "pending_approvals":
+        return (
+            stmt.where(WorkflowTask.assignedToId == user_id)
+            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.taskType == TaskType.APPROVAL.value)
+        )
+    if tab == "my_tasks":
+        return (
+            stmt.where(WorkflowTask.assignedToId == user_id)
+            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.taskType == TaskType.EXECUTION.value)
+        )
+    if tab == "pending_verification":
+        return (
+            stmt.where(WorkflowTask.assignedToId == user_id)
+            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.taskType == TaskType.VERIFICATION.value)
+        )
+    if tab == "submitted_by_me":
+        # tasks whose parent instance was kicked off by me
+        my_instances = select(WorkflowInstance.id).where(WorkflowInstance.initiatedById == user_id)
+        return stmt.where(WorkflowTask.instanceId.in_(my_instances))
+    if tab == "overdue_escalated":
+        return (
+            stmt.where(WorkflowTask.assignedToId == user_id)
+            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(
+                or_(
+                    and_(WorkflowTask.dueAt.is_not(None), WorkflowTask.dueAt < now),
+                    WorkflowTask.priority.in_(("URGENT", "ESCALATED")),
+                )
+            )
+        )
+    return stmt
+
+
 @router.get("/my-count", response_model=MyCountResponse)
 async def my_count(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MyCountResponse:
-    """Inbox counters — pending / overdue / completed for the current user."""
+    """Inbox counters — totals for the five tabs the mobile Inbox renders."""
     now = datetime.now(timezone.utc)
+
+    async def _count_tab(tab: str) -> int:
+        stmt = _apply_tab_filter(select(func.count()).select_from(WorkflowTask), tab, user.id, now)
+        return int((await db.execute(stmt)).scalar_one())
+
+    tab_pa = await _count_tab("pending_approvals")
+    tab_my = await _count_tab("my_tasks")
+    tab_pv = await _count_tab("pending_verification")
+    tab_sm = await _count_tab("submitted_by_me")
+    tab_oe = await _count_tab("overdue_escalated")
+
     pending_stmt = (
         select(func.count())
         .select_from(WorkflowTask)
         .where(WorkflowTask.assignedToId == user.id)
         .where(WorkflowTask.status == TaskStatus.PENDING.value)
-    )
-    overdue_stmt = (
-        select(func.count())
-        .select_from(WorkflowTask)
-        .where(WorkflowTask.assignedToId == user.id)
-        .where(WorkflowTask.status == TaskStatus.PENDING.value)
-        .where(WorkflowTask.dueAt.is_not(None))
-        .where(WorkflowTask.dueAt < now)
     )
     completed_stmt = (
         select(func.count())
@@ -458,48 +520,94 @@ async def my_count(
         .where(WorkflowTask.status == TaskStatus.COMPLETED.value)
     )
     pending = int((await db.execute(pending_stmt)).scalar_one())
-    overdue = int((await db.execute(overdue_stmt)).scalar_one())
     completed = int((await db.execute(completed_stmt)).scalar_one())
-    return MyCountResponse(count=pending, pending=pending, overdue=overdue, completed=completed)
+
+    return MyCountResponse(
+        count=pending,
+        pending=pending,
+        overdue=tab_oe,
+        completed=completed,
+        tabPendingApprovals=tab_pa,
+        tabMyTasks=tab_my,
+        tabPendingVerification=tab_pv,
+        tabSubmittedByMe=tab_sm,
+        tabOverdueEscalated=tab_oe,
+    )
 
 
 @router.get("/tasks", response_model=WorkflowTaskListResponse)
 async def list_my_tasks(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    tab: str | None = None,
     status_filter: str | None = None,
     limit: int = 50,
 ) -> WorkflowTaskListResponse:
-    """Inbox feed — workflow tasks assigned directly to the caller.
+    """Inbox feed.
 
-    `status_filter` accepts PENDING (default), COMPLETED or ALL. Results are
-    capped at `limit` (max 200) and ordered by assignedAt desc — newest first
-    so the inbox surfaces the freshest work without an explicit sort.
+    Two modes:
+      • `tab=<tab>` (preferred) — one of pending_approvals / my_tasks /
+        pending_verification / submitted_by_me / overdue_escalated. Matches
+        the web Inbox segmented control.
+      • `status_filter=PENDING|COMPLETED|ALL` (legacy) — kept for back-compat
+        with the older single-list inbox.
+
+    Results are capped at `limit` (max 200) and ordered by assignedAt desc.
+    The response includes initiator info + an `isOverdue` flag so the
+    mobile row can render the full web-style metadata in one pass.
     """
     capped_limit = max(1, min(limit, 200))
-    stmt = select(WorkflowTask).where(WorkflowTask.assignedToId == user.id)
-    sf = (status_filter or "PENDING").upper()
-    if sf == "PENDING":
-        stmt = stmt.where(WorkflowTask.status == TaskStatus.PENDING.value)
-    elif sf == "COMPLETED":
-        stmt = stmt.where(WorkflowTask.status == TaskStatus.COMPLETED.value)
-    # sf == "ALL" — no filter
+    now = datetime.now(timezone.utc)
+
+    # Join the instance so we can surface initiatedBy + initiator name.
+    stmt = (
+        select(WorkflowTask, WorkflowInstance, User)
+        .join(WorkflowInstance, WorkflowInstance.id == WorkflowTask.instanceId)
+        .outerjoin(User, User.id == WorkflowInstance.initiatedById)
+    )
+
+    if tab and tab.lower() in _INBOX_TABS:
+        stmt = _apply_tab_filter(stmt, tab.lower(), user.id, now)
+    else:
+        # Legacy status_filter path.
+        stmt = stmt.where(WorkflowTask.assignedToId == user.id)
+        sf = (status_filter or "PENDING").upper()
+        if sf == "PENDING":
+            stmt = stmt.where(WorkflowTask.status == TaskStatus.PENDING.value)
+        elif sf == "COMPLETED":
+            stmt = stmt.where(WorkflowTask.status == TaskStatus.COMPLETED.value)
+
     stmt = stmt.order_by(WorkflowTask.assignedAt.desc()).limit(capped_limit)
-    rows = (await db.execute(stmt)).scalars().all()
-    items = [
-        WorkflowTaskOut(
-            id=t.id,
-            module=t.module,
-            recordId=t.recordId,
-            recordNumber=t.recordNumber,
-            recordTitle=t.recordTitle,
-            stepName=t.stepName,
-            taskType=t.taskType.value if hasattr(t.taskType, "value") else str(t.taskType),
-            status=t.status,
-            priority=t.priority,
-            assignedAt=t.assignedAt,
-            dueAt=t.dueAt,
+    rows = (await db.execute(stmt)).all()
+
+    items: list[WorkflowTaskOut] = []
+    for t, _instance, initiator in rows:
+        due_aware = (
+            t.dueAt.replace(tzinfo=timezone.utc)
+            if t.dueAt is not None and t.dueAt.tzinfo is None
+            else t.dueAt
         )
-        for t in rows
-    ]
+        is_overdue = (
+            t.status == TaskStatus.PENDING.value
+            and due_aware is not None
+            and due_aware < now
+        )
+        items.append(
+            WorkflowTaskOut(
+                id=t.id,
+                module=t.module,
+                recordId=t.recordId,
+                recordNumber=t.recordNumber,
+                recordTitle=t.recordTitle,
+                stepName=t.stepName,
+                taskType=t.taskType.value if hasattr(t.taskType, "value") else str(t.taskType),
+                status=t.status,
+                priority=t.priority,
+                assignedAt=t.assignedAt,
+                dueAt=t.dueAt,
+                initiatedById=initiator.id if initiator is not None else None,
+                initiatedByName=initiator.name if initiator is not None else None,
+                isOverdue=is_overdue,
+            )
+        )
     return WorkflowTaskListResponse(items=items, total=len(items))

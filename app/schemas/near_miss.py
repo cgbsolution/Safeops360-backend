@@ -195,6 +195,11 @@ class NearMissOut(BaseModel):
     createdAt: datetime
     updatedAt: datetime
 
+    # AI agent outputs persisted by the workflow engine. Mirrors the
+    # shape on Observation.closureTriggers — [{ruleId, ruleName, fired,
+    # data}]. Empty / null means no agent has fired yet.
+    closureTriggers: list[dict] | None = None
+
     model_config = {"from_attributes": True}
 
 

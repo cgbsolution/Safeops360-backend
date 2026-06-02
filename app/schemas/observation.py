@@ -60,6 +60,11 @@ class ObservationOut(BaseModel):
     status: ObservationStatus
     createdAt: datetime
     updatedAt: datetime
+    # AI agent outputs persisted by the workflow engine (rule_triage_on_submit
+    # + rule_lessons_distribution). Shape: [{ruleId, ruleName, fired, data}].
+    # The mobile / web clients render whatever the rules emitted; an empty
+    # array or `null` means no agent has fired yet.
+    closureTriggers: list[dict] | None = None
 
     model_config = {"from_attributes": True}
 

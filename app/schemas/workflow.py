@@ -53,13 +53,19 @@ class MyCountResponse(BaseModel):
 
     The legacy `count` field is kept for back-compat with older callers; new
     clients should consume the structured pending / overdue / completed
-    triplet which mirrors the mobile inbox layout.
+    triplet which mirrors the mobile inbox layout. The five `tabXxx` fields
+    drive the segmented Inbox tab bar.
     """
 
     count: int
     pending: int = 0
     overdue: int = 0
     completed: int = 0
+    tabPendingApprovals: int = 0
+    tabMyTasks: int = 0
+    tabPendingVerification: int = 0
+    tabSubmittedByMe: int = 0
+    tabOverdueEscalated: int = 0
 
 
 class WorkflowTaskOut(BaseModel):
@@ -74,6 +80,11 @@ class WorkflowTaskOut(BaseModel):
     priority: str
     assignedAt: datetime
     dueAt: datetime | None = None
+    # Initiator info — surfaced by /api/workflow/tasks so the mobile inbox
+    # can render "Initiated by X · Received Y" without an extra round-trip.
+    initiatedById: str | None = None
+    initiatedByName: str | None = None
+    isOverdue: bool = False
 
     model_config = {"from_attributes": True}
 

@@ -30,9 +30,14 @@ ADDITIONAL_ROLES: list[dict[str, Any]] = [
     {"code": "LD_MANAGER", "name": "L&D Manager", "description": "Owns training programs across all plants.", "isSystem": False, "sortOrder": 55, "defaultLanding": "/training"},
     {"code": "TRAINER", "name": "Trainer", "description": "Conducts training sessions and records outcomes.", "isSystem": False, "sortOrder": 90, "defaultLanding": "/training"},
     {"code": "CONTRACTOR_WORKMAN", "name": "Contractor Workman", "description": "External crew member; restricted to records they're crew on.", "isSystem": False, "sortOrder": 110, "defaultLanding": "/inbox"},
+    # Skill Matrix — Phase 1 IMS (only HR_HEAD + EXTERNAL_ASSESSOR are new).
+    {"code": "HR_HEAD", "name": "HR Head", "description": "Owns competency management cross-plant.", "isSystem": False, "sortOrder": 35, "defaultLanding": "/skill-matrix"},
+    {"code": "EXTERNAL_ASSESSOR", "name": "External Assessor", "description": "External party scoped to assigned competency assessments.", "isSystem": False, "sortOrder": 95, "defaultLanding": "/skill-matrix"},
 ]
 
-OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS"]
+# NOTE: this backend list is a deliberate subset (omits HIRA/CAPA/EAI which are
+# seeded canonically by prisma/seed-rbac.ts). SKILL_MATRIX added for Phase 1 IMS.
+OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS", "SKILL_MATRIX"]
 OPERATIONAL_ACTIONS = ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"]
 
 EXTRA_PERMISSIONS = [
@@ -42,12 +47,22 @@ EXTRA_PERMISSIONS = [
     {"code": "CONFIGURATION.PERMISSIONS", "module": "CONFIGURATION", "action": "PERMISSIONS", "description": "Edit role × permission matrix"},
     {"code": "CONFIGURATION.ROLES", "module": "CONFIGURATION", "action": "ROLES", "description": "Create / edit roles and assign role membership"},
     {"code": "AUDIT.VIEW", "module": "AUDIT", "action": "VIEW", "description": "Read audit log"},
+    # Skill Matrix non-CRUD (CRUD comes from OPERATIONAL_MODULES.SKILL_MATRIX)
+    {"code": "SKILL_MATRIX.COMPETENCY_CONFIGURE", "module": "SKILL_MATRIX", "action": "COMPETENCY_CONFIGURE", "description": "Create / edit Competency + Skill masters"},
+    {"code": "SKILL_MATRIX.ROLE_DEF_CONFIGURE", "module": "SKILL_MATRIX", "action": "ROLE_DEF_CONFIGURE", "description": "Create / edit RoleDefinition + requirements"},
+    {"code": "SKILL_MATRIX.ASSESS", "module": "SKILL_MATRIX", "action": "ASSESS", "description": "Conduct competency assessments / sign supervised records"},
+    {"code": "SKILL_MATRIX.SUSPEND", "module": "SKILL_MATRIX", "action": "SUSPEND", "description": "Suspend / reinstate a competency"},
+    {"code": "SKILL_MATRIX.APPROVE_OVERRIDE", "module": "SKILL_MATRIX", "action": "APPROVE_OVERRIDE", "description": "Approve role assignment beyond grace period"},
+    {"code": "SKILL_MATRIX.RECERT_CYCLE", "module": "SKILL_MATRIX", "action": "RECERT_CYCLE", "description": "Initiate / manage re-certification cycles"},
+    {"code": "SKILL_MATRIX.CROSS_PERSON_VIEW", "module": "SKILL_MATRIX", "action": "CROSS_PERSON_VIEW", "description": "View competency records outside the holder's scope"},
+    {"code": "SKILL_MATRIX.VERSION_VIEW", "module": "SKILL_MATRIX", "action": "VERSION_VIEW", "description": "View CompetencyRecordVersion history"},
 ]
 
 
 # scope: ALL_PLANTS / OWN_PLANT / OWN_DEPARTMENT / OWN_RECORDS
 ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     "WORKER": [
+        {"module": "SKILL_MATRIX", "actions": ["READ"], "scope": "OWN_RECORDS"},
         {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
@@ -56,6 +71,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_RECORDS"},
     ],
     "CONTRACTOR_WORKMAN": [
+        {"module": "SKILL_MATRIX", "actions": ["READ"], "scope": "OWN_RECORDS"},
         {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
@@ -63,6 +79,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
     ],
     "SUPERVISOR": [
+        {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS", "EXECUTE"], "scope": "OWN_DEPARTMENT"},
         {"module": "OBSERVATION", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
@@ -92,6 +109,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"},
         {"module": "MANHOURS", "actions": ["CREATE", "READ", "UPDATE", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "SKILL_MATRIX", "actions": ["READ", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "OWN_PLANT"},
     ],
     "PLANT_HEAD": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
@@ -101,6 +119,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "TRAINING", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "MANHOURS", "actions": ["READ", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "SKILL_MATRIX", "actions": ["READ", "APPROVE_OVERRIDE", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "OWN_PLANT"},
     ],
     "CORPORATE_HSE": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
@@ -112,14 +131,18 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "MANHOURS", "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"},
         {"module": "CONFIGURATION", "actions": ["MASTERS"], "scope": "ALL_PLANTS"},
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "SKILL_MATRIX", "actions": ["READ", "APPROVE_OVERRIDE", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
     ],
     "TRAINER": [
+        {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS"], "scope": "OWN_RECORDS"},
         {"module": "TRAINING", "actions": ["READ", "EXECUTE"], "scope": "OWN_PLANT"},
     ],
     "LD_MANAGER": [
+        {"module": "SKILL_MATRIX", "actions": ["READ", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
         {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "EXPORT"], "scope": "ALL_PLANTS"},
     ],
     "DEPARTMENT_HEAD": [
+        {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE"], "scope": "OWN_DEPARTMENT"},
         {"module": "OBSERVATION", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
@@ -153,12 +176,22 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     ] + [
         {"module": "CONFIGURATION", "actions": ["MASTERS", "WORKFLOWS", "USERS", "PERMISSIONS", "ROLES"], "scope": "ALL_PLANTS"},
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
     ],
     "SYSTEM_ADMIN": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in OPERATIONAL_MODULES
     ] + [
         {"module": "CONFIGURATION", "actions": ["MASTERS", "WORKFLOWS", "USERS", "PERMISSIONS", "ROLES"], "scope": "ALL_PLANTS"},
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
+    ],
+    # ─── Skill Matrix — 2 new roles (Phase 1 IMS), grants per spec §8.1 ───
+    "HR_HEAD": [
+        {"module": "SKILL_MATRIX", "actions": ["READ", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "TRAINING", "actions": ["READ", "EXPORT"], "scope": "ALL_PLANTS"},
+    ],
+    "EXTERNAL_ASSESSOR": [
+        {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS"], "scope": "OWN_RECORDS"},
     ],
 }
 
