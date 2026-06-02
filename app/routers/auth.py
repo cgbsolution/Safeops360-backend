@@ -95,8 +95,15 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     stmt = select(User).where(User.email == payload.email.lower())
     result = await db.execute(stmt)
     user = result.scalar_one_or_none()
-    if user is None or not verify_password(payload.password, user.passwordHash):
-        # Constant-time-ish: don't leak which one failed
+    if user is None:
+        # Product decision: the login surfaces "user not found" distinctly from
+        # "wrong password" so an operator can tell an absent/typo'd account from
+        # a bad password. This deliberately trades the anti-enumeration stance
+        # (the /demo-user lookup below already enumerates @safeops360.in users)
+        # for a clearer demo UX. The web frontend maps 404 -> "User not found"
+        # and 401 -> "Invalid credentials. Please try again."
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if not verify_password(payload.password, user.passwordHash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
 
     token = create_access_token(

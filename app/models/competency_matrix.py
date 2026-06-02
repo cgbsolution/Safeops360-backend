@@ -117,7 +117,8 @@ class Skill(Base, IdMixin):
 class RoleDefinition(Base, IdMixin):
     __tablename__ = "RoleDefinition"
 
-    plantId: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # null = global template role definition (applies to all plants).
+    plantId: Mapped[str | None] = mapped_column(String, index=True)
     roleMasterId: Mapped[str | None] = mapped_column(String)  # FK-by-value Role.id
     roleName: Mapped[str] = mapped_column(String, nullable=False)
 
