@@ -94,6 +94,29 @@ class WorkflowTaskListResponse(BaseModel):
     total: int
 
 
+class WorkflowHistoryEntry(BaseModel):
+    """One row in the per-record audit trail. Pivoted by the workflow
+    engine each time a step is approved / rejected / executed / verified
+    / reassigned / commented / escalated."""
+
+    id: str
+    stepName: str
+    action: str
+    performedById: str
+    performedByName: str | None = None
+    comments: str | None = None
+    fromStatus: str | None = None
+    toStatus: str | None = None
+    performedAt: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class WorkflowHistoryResponse(BaseModel):
+    items: list[WorkflowHistoryEntry]
+    total: int
+
+
 # ─── Definition admin ────────────────────────────────────────────────────
 
 

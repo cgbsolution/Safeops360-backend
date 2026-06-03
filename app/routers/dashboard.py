@@ -298,6 +298,8 @@ async def dashboard_overview(
     ]
 
     # --- Recent activity feed -------------------------------------------------
+    # Each row carries `recordId` + `module` so the mobile dashboard can
+    # deep-link directly to the matching detail screen on tap.
     feed: list[RecentActivityItem] = []
     for o in obs_rows[:4]:
         desc = o.description or ""
@@ -308,6 +310,8 @@ async def dashboard_overview(
                 meta=o.number,
                 date=o.date,
                 tone="primary",
+                recordId=o.id,
+                module="OBSERVATION",
             )
         )
     for n in nm_rows[:3]:
@@ -319,6 +323,8 @@ async def dashboard_overview(
                 meta=n.number,
                 date=n.date,
                 tone="warning",
+                recordId=n.id,
+                module="NEAR_MISS",
             )
         )
     for p in permit_rows[:3]:
@@ -330,6 +336,8 @@ async def dashboard_overview(
                 meta=f"{p.number} · {_humanize(p.type)} · {_humanize(p.status)}",
                 date=p.createdAt,
                 tone="info",
+                recordId=p.id,
+                module="PTW",
             )
         )
     for i in incident_rows[:2]:
@@ -341,6 +349,8 @@ async def dashboard_overview(
                 meta=f"{i.number} · {_humanize(i.type)}",
                 date=i.date,
                 tone="danger",
+                recordId=i.id,
+                module="INCIDENT",
             )
         )
     feed.sort(key=lambda x: x.date, reverse=True)

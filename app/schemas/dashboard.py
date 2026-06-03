@@ -47,6 +47,10 @@ class RecentActivityItem(BaseModel):
     meta: str
     date: datetime
     tone: str
+    # Deep-link info — the mobile client uses these to navigate straight to
+    # the record's detail screen when the user taps the row.
+    recordId: str | None = None
+    module: str | None = None
 
 
 class DashboardOverview(BaseModel):

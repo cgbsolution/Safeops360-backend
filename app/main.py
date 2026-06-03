@@ -29,6 +29,7 @@ from app.routers import (
     incidents,
     inspections,
     manhours,
+    moc,
     near_miss,
     observations,
     ptw,
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
     app.include_router(capa.router)
     app.include_router(eai.router)
     app.include_router(competency.router)
+    app.include_router(moc.router)
     app.include_router(risk_register.router)
     app.include_router(risk_dashboard.router)
     app.include_router(devices.router)
