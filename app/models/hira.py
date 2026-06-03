@@ -395,6 +395,11 @@ class HiraEntryHazard(Base, IdMixin):
     entryId: Mapped[str] = mapped_column(ForeignKey("HiraEntry.id", ondelete="CASCADE"), nullable=False, index=True)
     entry: Mapped[HiraEntry] = relationship(back_populates="hazards")
     hazardId: Mapped[str] = mapped_column(ForeignKey("HiraHazard.id"), nullable=False)
+    # Forward relationship to the hazard library row. get_entry() eager-loads
+    # this (selectinload(HiraEntryHazard.hazard)) to denormalise hazard
+    # code/category/name for the editor & report. Uni-directional — HiraHazard
+    # needs no back-reference to entry links.
+    hazard: Mapped["HiraHazard"] = relationship("HiraHazard", foreign_keys=[hazardId])
 
     contextualDescription: Mapped[str | None] = mapped_column(Text)
     potentialHarm: Mapped[list | None] = mapped_column(JSON)

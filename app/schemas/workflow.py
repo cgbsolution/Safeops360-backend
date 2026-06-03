@@ -117,6 +117,28 @@ class WorkflowHistoryResponse(BaseModel):
     total: int
 
 
+class WorkflowPendingTask(BaseModel):
+    """Currently pending task on a record — drives the "Awaiting Action"
+    callout on each module's detail page."""
+
+    id: str
+    stepName: str
+    taskType: str
+    priority: str
+    assignedToId: str
+    assignedToName: str | None = None
+    assignedToRole: str | None = None
+    assignedToDepartment: str | None = None
+    assignedAt: datetime
+    dueAt: datetime | None = None
+    isOverdue: bool = False
+
+
+class WorkflowPendingResponse(BaseModel):
+    items: list[WorkflowPendingTask]
+    total: int
+
+
 # ─── Definition admin ────────────────────────────────────────────────────
 
 

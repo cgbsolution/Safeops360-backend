@@ -38,6 +38,10 @@ from app.schemas.workflow import (
     ResubmitRequest,
     SubmitExecutionRequest,
     VerifyRequest,
+    WorkflowHistoryEntry,
+    WorkflowHistoryResponse,
+    WorkflowPendingResponse,
+    WorkflowPendingTask,
     WorkflowTaskListResponse,
     WorkflowTaskOut,
 )
@@ -611,3 +615,137 @@ async def list_my_tasks(
             )
         )
     return WorkflowTaskListResponse(items=items, total=len(items))
+
+
+@router.get(
+    "/history/{module}/{record_id}",
+    response_model=WorkflowHistoryResponse,
+)
+async def get_record_history(
+    module: str,
+    record_id: str,
+    user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate only
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowHistoryResponse:
+    """Per-record audit trail.
+
+    Returns the chronological list of workflow actions taken on the given
+    record (approvals / rejections / executions / verifications /
+    reassignments / comments / escalations). Joins the User table so the
+    mobile + web clients can render the actor's display name without an
+    extra round-trip.
+
+    `module` is the same uppercase string the workflow engine writes
+    (`OBSERVATION`, `NEAR_MISS`, `PTW`, `FLRA`, `INCIDENT`, `CAPA`,
+    `HIRA`). If no workflow instance exists for the record an empty list
+    is returned — that's a valid state for records that bypass the
+    workflow engine.
+    """
+    instance = (
+        await db.execute(
+            select(WorkflowInstance.id).where(
+                WorkflowInstance.module == module.upper(),
+                WorkflowInstance.recordId == record_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if instance is None:
+        return WorkflowHistoryResponse(items=[], total=0)
+
+    rows = (
+        await db.execute(
+            select(WorkflowHistory, User)
+            .outerjoin(User, User.id == WorkflowHistory.performedById)
+            .where(WorkflowHistory.instanceId == instance)
+            .order_by(WorkflowHistory.performedAt.asc())
+        )
+    ).all()
+
+    items = [
+        WorkflowHistoryEntry(
+            id=h.id,
+            stepName=h.stepName,
+            action=h.action.value if hasattr(h.action, "value") else str(h.action),
+            performedById=h.performedById,
+            performedByName=u.name if u is not None else None,
+            comments=h.comments,
+            fromStatus=h.fromStatus,
+            toStatus=h.toStatus,
+            performedAt=h.performedAt,
+        )
+        for h, u in rows
+    ]
+    return WorkflowHistoryResponse(items=items, total=len(items))
+
+
+@router.get(
+    "/pending/{module}/{record_id}",
+    response_model=WorkflowPendingResponse,
+)
+async def get_record_pending_tasks(
+    module: str,
+    record_id: str,
+    user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate only
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowPendingResponse:
+    """Currently-pending workflow tasks for a record.
+
+    Powers the "AWAITING ACTION" callout on every module detail page —
+    surfaces who needs to act next, what step they're on, when it's due,
+    and whether the deadline has already passed. Joins the User table so
+    the mobile / web clients can render the assignee's display name,
+    designation and department in a single round-trip.
+
+    Returns an empty list when the record has no open task (e.g. the
+    record is closed, hasn't been submitted, or bypasses the workflow
+    engine altogether).
+    """
+    instance_id = (
+        await db.execute(
+            select(WorkflowInstance.id).where(
+                WorkflowInstance.module == module.upper(),
+                WorkflowInstance.recordId == record_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if instance_id is None:
+        return WorkflowPendingResponse(items=[], total=0)
+
+    rows = (
+        await db.execute(
+            select(WorkflowTask, User)
+            .outerjoin(User, User.id == WorkflowTask.assignedToId)
+            .where(WorkflowTask.instanceId == instance_id)
+            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .order_by(WorkflowTask.assignedAt.asc())
+        )
+    ).all()
+
+    now = datetime.now(timezone.utc)
+    items: list[WorkflowPendingTask] = []
+    for t, u in rows:
+        due_aware = (
+            t.dueAt.replace(tzinfo=timezone.utc)
+            if t.dueAt is not None and t.dueAt.tzinfo is None
+            else t.dueAt
+        )
+        is_overdue = due_aware is not None and due_aware < now
+        items.append(
+            WorkflowPendingTask(
+                id=t.id,
+                stepName=t.stepName,
+                taskType=t.taskType.value if hasattr(t.taskType, "value") else str(t.taskType),
+                priority=t.priority,
+                assignedToId=t.assignedToId,
+                assignedToName=u.name if u is not None else None,
+                assignedToRole=u.role if u is not None else None,
+                assignedToDepartment=u.department if u is not None else None,
+                assignedAt=t.assignedAt,
+                dueAt=t.dueAt,
+                isOverdue=is_overdue,
+            )
+        )
+
+    return WorkflowPendingResponse(items=items, total=len(items))

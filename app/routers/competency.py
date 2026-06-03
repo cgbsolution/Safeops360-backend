@@ -22,6 +22,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.deps import get_current_user
 from app.models.competency_matrix import (
     Competency,
     CompetencyRecord,
@@ -29,8 +30,24 @@ from app.models.competency_matrix import (
     RoleDefinition,
 )
 from app.models.user import User
+from app.services.competency_state import sync_plant_from_training
 
 router = APIRouter(prefix="/api/skill-matrix", tags=["skill-matrix"])
+
+
+@router.post("/sync-from-training")
+async def sync_from_training(
+    plantId: str = Query(..., description="Plant whose matrix to recompute from training"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Recompute every competency cell in the plant from current training
+    evidence ("training feeds competency", D1). Idempotent — running it twice
+    with unchanged training is a no-op. Each cell that moves writes an audit
+    version row.
+    """
+    stats = await sync_plant_from_training(db, plant_id=plantId, actor_user_id=user.id)
+    return {"plantId": plantId, **stats}
 
 
 @router.get("/competencies")
