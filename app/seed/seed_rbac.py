@@ -30,14 +30,17 @@ ADDITIONAL_ROLES: list[dict[str, Any]] = [
     {"code": "LD_MANAGER", "name": "L&D Manager", "description": "Owns training programs across all plants.", "isSystem": False, "sortOrder": 55, "defaultLanding": "/training"},
     {"code": "TRAINER", "name": "Trainer", "description": "Conducts training sessions and records outcomes.", "isSystem": False, "sortOrder": 90, "defaultLanding": "/training"},
     {"code": "CONTRACTOR_WORKMAN", "name": "Contractor Workman", "description": "External crew member; restricted to records they're crew on.", "isSystem": False, "sortOrder": 110, "defaultLanding": "/inbox"},
+    # PPE Management — Phase 2 IMS. Store Keeper owns the safety store: issuance + receipt.
+    {"code": "STORE_KEEPER", "name": "Store Keeper", "description": "Owns the safety store; issues / receives PPE and records goods receipt.", "isSystem": False, "sortOrder": 85, "defaultLanding": "/ppe"},
     # Skill Matrix — Phase 1 IMS (only HR_HEAD + EXTERNAL_ASSESSOR are new).
     {"code": "HR_HEAD", "name": "HR Head", "description": "Owns competency management cross-plant.", "isSystem": False, "sortOrder": 35, "defaultLanding": "/skill-matrix"},
     {"code": "EXTERNAL_ASSESSOR", "name": "External Assessor", "description": "External party scoped to assigned competency assessments.", "isSystem": False, "sortOrder": 95, "defaultLanding": "/skill-matrix"},
 ]
 
 # NOTE: this backend list is a deliberate subset (omits HIRA/CAPA/EAI which are
-# seeded canonically by prisma/seed-rbac.ts). SKILL_MATRIX added for Phase 1 IMS.
-OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS", "SKILL_MATRIX"]
+# seeded canonically by prisma/seed-rbac.ts). SKILL_MATRIX added for Phase 1 IMS;
+# PPE added for Phase 2 IMS (gives PPE.{CREATE,READ,UPDATE,EXPORT,…} codes).
+OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS", "SKILL_MATRIX", "PPE"]
 OPERATIONAL_ACTIONS = ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"]
 
 EXTRA_PERMISSIONS = [
@@ -56,6 +59,12 @@ EXTRA_PERMISSIONS = [
     {"code": "SKILL_MATRIX.RECERT_CYCLE", "module": "SKILL_MATRIX", "action": "RECERT_CYCLE", "description": "Initiate / manage re-certification cycles"},
     {"code": "SKILL_MATRIX.CROSS_PERSON_VIEW", "module": "SKILL_MATRIX", "action": "CROSS_PERSON_VIEW", "description": "View competency records outside the holder's scope"},
     {"code": "SKILL_MATRIX.VERSION_VIEW", "module": "SKILL_MATRIX", "action": "VERSION_VIEW", "description": "View CompetencyRecordVersion history"},
+    # PPE non-CRUD (CRUD comes from OPERATIONAL_MODULES.PPE) — Phase 2 IMS
+    {"code": "PPE.ISSUE", "module": "PPE", "action": "ISSUE", "description": "Issue / return PPE to a person"},
+    {"code": "PPE.INSPECT", "module": "PPE", "action": "INSPECT", "description": "Conduct a PPE inspection"},
+    {"code": "PPE.CATALOG_MANAGE", "module": "PPE", "action": "CATALOG_MANAGE", "description": "Create / edit PPE catalog types"},
+    {"code": "PPE.RETIRE_APPROVE", "module": "PPE", "action": "RETIRE_APPROVE", "description": "Approve PPE item retirement"},
+    {"code": "PPE.RECALL_MANAGE", "module": "PPE", "action": "RECALL_MANAGE", "description": "Initiate / resolve PPE batch recalls"},
 ]
 
 
@@ -69,6 +78,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
         {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        {"module": "PPE", "actions": ["READ"], "scope": "OWN_RECORDS"},
     ],
     "CONTRACTOR_WORKMAN": [
         {"module": "SKILL_MATRIX", "actions": ["READ"], "scope": "OWN_RECORDS"},
@@ -77,6 +87,11 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        {"module": "PPE", "actions": ["READ"], "scope": "OWN_RECORDS"},
+    ],
+    "STORE_KEEPER": [
+        {"module": "PPE", "actions": ["CREATE", "READ", "UPDATE", "EXPORT", "ISSUE"], "scope": "OWN_PLANT"},
+        {"module": "INSPECTION", "actions": ["READ"], "scope": "OWN_PLANT"},
     ],
     "SUPERVISOR": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS", "EXECUTE"], "scope": "OWN_DEPARTMENT"},
@@ -86,6 +101,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "FLRA", "actions": ["CREATE", "READ", "EXECUTE"], "scope": "OWN_DEPARTMENT"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        {"module": "PPE", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
     ],
     "PERMIT_ISSUER": [
         {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
@@ -102,6 +118,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "PTW", "actions": ["READ", "APPROVE"], "scope": "OWN_PLANT"},
         {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": ["READ", "VERIFY"], "scope": "OWN_PLANT"},
+        {"module": "PPE", "actions": ["READ", "CREATE", "UPDATE", "EXPORT", "ISSUE", "INSPECT", "VERIFY", "RETIRE_APPROVE"], "scope": "OWN_PLANT"},
     ],
     "HSE_MANAGER": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
@@ -110,6 +127,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "INSPECTION", "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"},
         {"module": "MANHOURS", "actions": ["CREATE", "READ", "UPDATE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "SKILL_MATRIX", "actions": ["READ", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "OWN_PLANT"},
+        {"module": "PPE", "actions": list(OPERATIONAL_ACTIONS) + ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "OWN_PLANT"},
     ],
     "PLANT_HEAD": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
@@ -120,6 +138,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "INSPECTION", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "MANHOURS", "actions": ["READ", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "SKILL_MATRIX", "actions": ["READ", "APPROVE_OVERRIDE", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "OWN_PLANT"},
+        {"module": "PPE", "actions": ["READ", "EXPORT", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "OWN_PLANT"},
     ],
     "CORPORATE_HSE": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
@@ -132,6 +151,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "CONFIGURATION", "actions": ["MASTERS"], "scope": "ALL_PLANTS"},
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
         {"module": "SKILL_MATRIX", "actions": ["READ", "APPROVE_OVERRIDE", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "PPE", "actions": ["READ", "EXPORT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
     ],
     "TRAINER": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS"], "scope": "OWN_RECORDS"},
@@ -151,6 +171,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     "MAINTENANCE_HEAD": [
         {"module": "INSPECTION", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "PPE", "actions": ["READ"], "scope": "OWN_PLANT"},
     ],
     "ENVIRONMENT_MANAGER": [
         {"module": "OBSERVATION", "actions": ["READ"], "scope": "OWN_PLANT"},
@@ -177,6 +198,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "CONFIGURATION", "actions": ["MASTERS", "WORKFLOWS", "USERS", "PERMISSIONS", "ROLES"], "scope": "ALL_PLANTS"},
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
         {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "PPE", "actions": ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
     ],
     "SYSTEM_ADMIN": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in OPERATIONAL_MODULES
@@ -184,6 +206,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "CONFIGURATION", "actions": ["MASTERS", "WORKFLOWS", "USERS", "PERMISSIONS", "ROLES"], "scope": "ALL_PLANTS"},
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
         {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
+        {"module": "PPE", "actions": ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
     ],
     # ─── Skill Matrix — 2 new roles (Phase 1 IMS), grants per spec §8.1 ───
     "HR_HEAD": [

@@ -116,6 +116,14 @@ from app.models.permit import (
     PermitType,
 )
 from app.models.plant import Area, Plant
+from app.models.ppe import (
+    PpeBatch,
+    PpeInspection,
+    PpeIssuance,
+    PpeItem,
+    PpeRequirementProfile,
+    PpeType,
+)
 from app.models.training import (
     TrainingAssessment,
     TrainingAssessmentResponse,
@@ -224,6 +232,12 @@ __all__ = [
     "PermitStatus",
     "PermitType",
     "Plant",
+    "PpeBatch",
+    "PpeInspection",
+    "PpeIssuance",
+    "PpeItem",
+    "PpeRequirementProfile",
+    "PpeType",
     "Role",
     "RolePermission",
     "Severity",

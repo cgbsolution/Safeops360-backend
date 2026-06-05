@@ -151,6 +151,35 @@ async def get_invocation_detail(
     return AgentInvocationDetailOut.model_validate(invocation)
 
 
+@router.get(
+    "/api/agents/latest-invocation",
+    response_model=AgentInvocationOut | None,
+)
+async def latest_invocation(
+    sourceModule: str,
+    sourceRecordId: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> AgentInvocationOut | None:
+    """The most recent invocation for a source record. Lets the UI hydrate the
+    agent card on page load so a finished result shows immediately — instead of
+    being lost when the client-side poll state goes away."""
+    inv = (
+        await db.execute(
+            select(AgentInvocation)
+            .where(AgentInvocation.sourceModule == sourceModule)
+            .where(AgentInvocation.sourceRecordId == sourceRecordId)
+            .order_by(AgentInvocation.createdAt.desc())
+            .limit(1)
+            .options(selectinload(AgentInvocation.toolCalls))
+        )
+    ).scalar_one_or_none()
+    if inv is None:
+        return None
+    await _authorise_view(db, user, inv)
+    return AgentInvocationOut.model_validate(inv)
+
+
 # ─── Human decision ──────────────────────────────────────────────────
 
 

@@ -28,14 +28,18 @@ from app.routers import (
     hira,
     incidents,
     inspections,
+    kaizen,
     manhours,
     moc,
     near_miss,
     observations,
+    ppe,
     ptw,
     ptw_active,
     risk_dashboard,
     risk_register,
+    sci,
+    scr,
     training,
     users,
     workflow,
@@ -101,6 +105,10 @@ def create_app() -> FastAPI:
     app.include_router(moc.router)
     app.include_router(risk_register.router)
     app.include_router(risk_dashboard.router)
+    app.include_router(scr.router)
+    app.include_router(sci.router)
+    app.include_router(kaizen.router)
+    app.include_router(ppe.router)
     app.include_router(devices.router)
     app.include_router(plants.router)
     app.include_router(dashboard.router)

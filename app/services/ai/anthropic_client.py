@@ -44,7 +44,10 @@ def _get_client():
         try:
             from anthropic import Anthropic  # noqa: PLC0415
 
-            _client = Anthropic(api_key=settings.anthropic_api_key)
+            # Cap per-request time so a hung call fails fast (~90s) instead of
+            # the SDK default (~10 min) — which is what left invocations
+            # "Running" for minutes. One retry covers transient 5xx/timeouts.
+            _client = Anthropic(api_key=settings.anthropic_api_key, timeout=90.0, max_retries=1)
         except Exception as e:  # noqa: BLE001
             print(f"[ai] Failed to init Anthropic client: {e}", file=sys.stderr)
             return None
@@ -76,7 +79,10 @@ async def complete_json(
     settings = get_settings()
     used_model = model or settings.anthropic_model
     try:
-        msg = client.messages.create(
+        # Run the sync SDK call off the event loop so it never blocks other
+        # requests (e.g. the frontend status-poll) while the model thinks.
+        msg = await asyncio.to_thread(
+            client.messages.create,
             model=used_model,
             max_tokens=max_tokens,
             temperature=temperature,
