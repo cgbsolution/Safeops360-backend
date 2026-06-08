@@ -55,6 +55,7 @@ class _UserSnapshot:
     rows: list[_CachedRow]
     role_codes: list[str]  # all active role codes for the user
     plant_id: str | None
+    plant_ids: set[str]  # all plants accessible via primary plantId + PLANT-scoped UserRoles
     department: str | None
     expires_at: float = field(default_factory=lambda: time.time() + 300.0)
 
@@ -99,6 +100,12 @@ async def _load_user_snapshot(db: AsyncSession, user_id: str) -> _UserSnapshot:
 
     rows: list[_CachedRow] = []
     role_codes: list[str] = []
+    # Collect all plant IDs accessible to this user: primary plantId + all
+    # PLANT-scoped UserRole entries (mirrors getAccessiblePlantIds() in TS).
+    plant_ids: set[str] = set()
+    if user.plantId:
+        plant_ids.add(user.plantId)
+
     for ur in user_roles:
         if not ur.role.isActive:
             continue
@@ -114,11 +121,15 @@ async def _load_user_snapshot(db: AsyncSession, user_id: str) -> _UserSnapshot:
                     role_id=ur.roleId,
                 )
             )
+        # Collect cross-plant access from PLANT-scoped UserRole entries
+        if ur.scopeType == "PLANT" and ur.scopeValue:
+            plant_ids.add(ur.scopeValue)
 
     snap = _UserSnapshot(
         rows=rows,
         role_codes=role_codes,
         plant_id=user.plantId,
+        plant_ids=plant_ids,
         department=user.department,
         expires_at=time.time() + _TTL_SECONDS,
     )
@@ -133,14 +144,15 @@ async def _load_user_permissions(db: AsyncSession, user_id: str) -> list[_Cached
 
 # Lightweight stand-in for callers that previously asked for the User row.
 class _UserProfileLite:
-    def __init__(self, plant_id: str | None, department: str | None) -> None:
+    def __init__(self, plant_id: str | None, plant_ids: set[str], department: str | None) -> None:
         self.plantId = plant_id
+        self.plantIds = plant_ids
         self.department = department
 
 
 async def _load_user_profile(db: AsyncSession, user_id: str) -> _UserProfileLite:
     snap = await _load_user_snapshot(db, user_id)
-    return _UserProfileLite(snap.plant_id, snap.department)
+    return _UserProfileLite(snap.plant_id, snap.plant_ids, snap.department)
 
 
 # Owner-style fields we recognise for OWN_RECORDS scope checks. Mirror of the
@@ -195,7 +207,7 @@ async def can(
 
     for m in matches:
         if m.scope == "OWN_PLANT":
-            if ctx.plant_id and profile.plantId and ctx.plant_id == profile.plantId:
+            if ctx.plant_id and profile.plantIds and ctx.plant_id in profile.plantIds:
                 return CanResult(allowed=True, matched_scope="OWN_PLANT")
             if not ctx.plant_id and not ctx.record_id:
                 return CanResult(allowed=True, matched_scope="OWN_PLANT")
@@ -263,14 +275,16 @@ async def get_module_scopes(db: AsyncSession, user_id: str, module_prefix: str) 
 
 
 async def get_accessible_plants(db: AsyncSession, user_id: str) -> list[str] | None:
-    """Returns the plant IDs the user can act in. None == unrestricted."""
+    """Returns the plant IDs the user can act in. None == unrestricted.
+    Includes the user's primary plantId plus all PLANT-scoped UserRole entries
+    (mirrors getAccessiblePlantIds() in the Next.js frontend)."""
     rows = await _load_user_permissions(db, user_id)
     if any(r.scope == "ALL_PLANTS" for r in rows):
         return None
     profile = await _load_user_profile(db, user_id)
     if profile is None:
         return []
-    return [profile.plantId] if profile.plantId else []
+    return list(profile.plantIds) if profile.plantIds else []
 
 
 async def get_user_role_codes(db: AsyncSession, user_id: str) -> list[str]:
