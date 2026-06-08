@@ -553,9 +553,10 @@ class HiraVersionOut(BaseModel):
     entryId: str
     versionNumber: int
     snapshot: dict[str, Any]
-    changes: list[Any]
-    changeReason: str
-    changeTrigger: str
+    # JSON column — seeded records may store list or dict; accept either
+    changes: Any
+    changeReason: str | None = None
+    changeTrigger: str | None = None
     createdAt: datetime
     createdById: str
 
