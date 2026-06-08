@@ -33,7 +33,8 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
-from app.models.masters import ContractorCompany, Department, MasterItem
+from app.models.masters import Department, MasterItem
+from app.models.epc import ContractorCompany
 from app.models.near_miss import NearMiss, NearMissStatus
 from app.models.near_miss_children import (
     NearMissAttachment,

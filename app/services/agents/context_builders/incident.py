@@ -36,7 +36,8 @@ from app.models.incident import (
     IncidentTimelineEvent,
     IncidentWitnessStatement,
 )
-from app.models.masters import ContractorCompany, Department
+from app.models.masters import Department
+from app.models.epc import ContractorCompany
 from app.models.near_miss import NearMiss
 from app.models.permit import Permit
 from app.models.plant import Area, Plant

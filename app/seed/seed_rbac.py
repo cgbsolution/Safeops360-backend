@@ -35,12 +35,16 @@ ADDITIONAL_ROLES: list[dict[str, Any]] = [
     # Skill Matrix — Phase 1 IMS (only HR_HEAD + EXTERNAL_ASSESSOR are new).
     {"code": "HR_HEAD", "name": "HR Head", "description": "Owns competency management cross-plant.", "isSystem": False, "sortOrder": 35, "defaultLanding": "/skill-matrix"},
     {"code": "EXTERNAL_ASSESSOR", "name": "External Assessor", "description": "External party scoped to assigned competency assessments.", "isSystem": False, "sortOrder": 95, "defaultLanding": "/skill-matrix"},
+    # EPC — Engineering, Procurement & Construction module roles
+    {"code": "SITE_HSE_MANAGER", "name": "Site HSE Manager (EPC)", "description": "HSE Manager at a specific construction site. Approves mobilizations, conducts inductions, overrides gate clearance.", "isSystem": False, "sortOrder": 42, "defaultLanding": "/epc"},
+    {"code": "CONTRACTOR_COORDINATOR", "name": "Contractor Coordinator", "description": "Manages contractor company registration and worker mobilization.", "isSystem": False, "sortOrder": 58, "defaultLanding": "/epc/contractors"},
+    {"code": "GATE_GUARD", "name": "Gate Guard", "description": "Performs gate clearance checks at construction site entry points.", "isSystem": False, "sortOrder": 105, "defaultLanding": "/epc/gate"},
 ]
 
 # NOTE: this backend list is a deliberate subset (omits HIRA/CAPA/EAI which are
 # seeded canonically by prisma/seed-rbac.ts). SKILL_MATRIX added for Phase 1 IMS;
 # PPE added for Phase 2 IMS (gives PPE.{CREATE,READ,UPDATE,EXPORT,…} codes).
-OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS", "SKILL_MATRIX", "PPE"]
+OPERATIONAL_MODULES = ["OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "TRAINING", "INSPECTION", "MANHOURS", "SKILL_MATRIX", "PPE", "EPC"]
 OPERATIONAL_ACTIONS = ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"]
 
 EXTRA_PERMISSIONS = [
@@ -65,6 +69,11 @@ EXTRA_PERMISSIONS = [
     {"code": "PPE.CATALOG_MANAGE", "module": "PPE", "action": "CATALOG_MANAGE", "description": "Create / edit PPE catalog types"},
     {"code": "PPE.RETIRE_APPROVE", "module": "PPE", "action": "RETIRE_APPROVE", "description": "Approve PPE item retirement"},
     {"code": "PPE.RECALL_MANAGE", "module": "PPE", "action": "RECALL_MANAGE", "description": "Initiate / resolve PPE batch recalls"},
+    # EPC — Engineering, Procurement & Construction module
+    {"code": "EPC.GATE_OVERRIDE", "module": "EPC", "action": "GATE_OVERRIDE", "description": "Override a gate clearance rejection (HSE Manager / Site Manager only)"},
+    {"code": "EPC.INDUCTION_CONDUCT", "module": "EPC", "action": "INDUCTION_CONDUCT", "description": "Conduct and record site inductions"},
+    {"code": "EPC.MOBILIZATION_APPROVE", "module": "EPC", "action": "MOBILIZATION_APPROVE", "description": "Approve worker mobilization to a site"},
+    {"code": "EPC.PREQUALIFY", "module": "EPC", "action": "PREQUALIFY", "description": "Approve or reject contractor company pre-qualification"},
 ]
 
 
@@ -128,6 +137,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "MANHOURS", "actions": ["CREATE", "READ", "UPDATE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "SKILL_MATRIX", "actions": ["READ", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "OWN_PLANT"},
         {"module": "PPE", "actions": list(OPERATIONAL_ACTIONS) + ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "OWN_PLANT"},
+        {"module": "EPC", "actions": ["CREATE", "READ", "UPDATE", "MOBILIZATION_APPROVE", "GATE_OVERRIDE", "INDUCTION_CONDUCT", "PREQUALIFY"], "scope": "OWN_PLANT"},
     ],
     "PLANT_HEAD": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
@@ -152,6 +162,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "AUDIT", "actions": ["VIEW"], "scope": "ALL_PLANTS"},
         {"module": "SKILL_MATRIX", "actions": ["READ", "APPROVE_OVERRIDE", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
         {"module": "PPE", "actions": ["READ", "EXPORT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
+        {"module": "EPC", "actions": ["READ", "CREATE", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT", "GATE_OVERRIDE", "MOBILIZATION_APPROVE", "INDUCTION_CONDUCT", "PREQUALIFY"], "scope": "ALL_PLANTS"},
     ],
     "TRAINER": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS"], "scope": "OWN_RECORDS"},
@@ -180,6 +191,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     "CONTRACTOR_COORDINATOR": [
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "EPC", "actions": ["CREATE", "READ", "UPDATE", "INDUCTION_CONDUCT"], "scope": "OWN_PLANT"},
     ],
     "OCCUPATIONAL_HEALTH_OFFICER": [
         {"module": "INCIDENT", "actions": ["READ"], "scope": "OWN_PLANT"},
@@ -215,6 +227,13 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     ],
     "EXTERNAL_ASSESSOR": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS"], "scope": "OWN_RECORDS"},
+    ],
+    # ─── EPC — Engineering, Procurement & Construction roles ───────────────────
+    "SITE_HSE_MANAGER": [
+        {"module": "EPC", "actions": ["CREATE", "READ", "UPDATE", "MOBILIZATION_APPROVE", "GATE_OVERRIDE", "INDUCTION_CONDUCT", "PREQUALIFY"], "scope": "OWN_PLANT"},
+    ],
+    "GATE_GUARD": [
+        {"module": "EPC", "actions": ["READ", "GATE_OVERRIDE"], "scope": "OWN_PLANT"},
     ],
 }
 

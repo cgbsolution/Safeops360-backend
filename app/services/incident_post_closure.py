@@ -53,7 +53,7 @@ _CONTRACTOR_SCORE_DEDUCTION: dict[str, int] = {
 async def _rule_contractor_score(db: AsyncSession, incident: Incident) -> dict[str, Any]:
     """Decrement ContractorCompany.score for every contractor whose
     workman was involved in this incident (deduplicated)."""
-    from app.models.masters import ContractorCompany
+    from app.models.epc import ContractorCompany
 
     deduction = _CONTRACTOR_SCORE_DEDUCTION.get(incident.severity or "LOW", 1)
 

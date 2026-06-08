@@ -38,7 +38,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.equipment import Equipment, Inspection
-from app.models.masters import ContractorCompany
+from app.models.epc import ContractorCompany
 from app.models.near_miss import NearMiss
 from app.models.permit import Permit
 
