@@ -169,7 +169,10 @@ class EaiStudyUpdate(BaseModel):
     customReviewMonths: int | None = None
     applicableRegulations: list[str] | None = None
     regulatoryReviewRequired: bool | None = None
-    status: str | None = None
+
+
+class EaiStudyTransitionRequest(BaseModel):
+    notes: str | None = None
 
 
 class EaiStudyOut(BaseModel):
@@ -419,6 +422,9 @@ class EaiEntryUpdate(BaseModel):
 
     linkedHiraEntryIds: list[str] | None = None
 
+    changeReason: str | None = None
+    changeTrigger: str | None = None
+
     status: str | None = None
 
 
@@ -530,6 +536,10 @@ class EaiReviewCycleOut(BaseModel):
     outcome: str | None
     outcomeNotes: str | None
     changesMade: list[dict[str, Any]] | None
+    entryTitle: str | None = None
+    entrySequenceNumber: int | None = None
+    studyNumber: str | None = None
+    studyTitle: str | None = None
 
 
 class EaiReviewCycleSubmitRequest(BaseModel):
@@ -593,3 +603,11 @@ class EaiDashboardSignificant(BaseModel):
     total: int
     byLevel: dict[str, int]
     byCategory: dict[str, int]
+
+
+class EaiBulkNoCycleRequest(BaseModel):
+    cycleIds: list[str]
+
+
+class BulkNoChangeResponse(BaseModel):
+    updated: int

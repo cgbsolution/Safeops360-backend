@@ -57,7 +57,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_permission_with_context
 from app.models.eai import (
     EaiAspect,
     EaiAspectCategory,
@@ -83,8 +83,10 @@ from app.models.eai import (
 from app.models.plant import Plant
 from app.models.user import User
 from app.schemas.eai import (
+    BulkNoChangeResponse,
     EaiAspectCategoryOut,
     EaiAspectOut,
+    EaiBulkNoCycleRequest,
     EaiComplianceObligationIn,
     EaiComplianceObligationOut,
     EaiDashboardCoverage,
@@ -115,6 +117,7 @@ from app.schemas.eai import (
     EaiStudyListResponse,
     EaiStudyOut,
     EaiStudyTeamMemberOut,
+    EaiStudyTransitionRequest,
     EaiStudyUpdate,
     EaiVersionOut,
     EnvironmentalImpactMatrixCellOut,
@@ -154,7 +157,10 @@ async def _require_eai_enabled(db: AsyncSession, plant_id: str) -> None:
 
 
 @router.get("/aspect-categories", response_model=list[EaiAspectCategoryOut])
-async def list_aspect_categories(db: AsyncSession = Depends(get_db)):
+async def list_aspect_categories(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     rows = (
         await db.execute(
             select(EaiAspectCategory)
@@ -171,6 +177,7 @@ async def list_aspects(
     categoryId: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     stmt = select(EaiAspect).where(EaiAspect.isActive.is_(True))
     if categoryId:
@@ -190,7 +197,10 @@ async def list_aspects(
 
 
 @router.get("/receptors", response_model=list[EaiReceptorOut])
-async def list_receptors(db: AsyncSession = Depends(get_db)):
+async def list_receptors(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     rows = (
         await db.execute(
             select(EaiReceptor)
@@ -202,7 +212,10 @@ async def list_receptors(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/regulations", response_model=list[EaiRegulationOut])
-async def list_regulations(db: AsyncSession = Depends(get_db)):
+async def list_regulations(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     rows = (
         await db.execute(
             select(EaiRegulation)
@@ -214,7 +227,10 @@ async def list_regulations(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/impact-matrices", response_model=list[EnvironmentalImpactMatrixOut])
-async def list_impact_matrices(db: AsyncSession = Depends(get_db)):
+async def list_impact_matrices(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     rows = (
         await db.execute(
             select(EnvironmentalImpactMatrix)
@@ -231,7 +247,11 @@ async def list_impact_matrices(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/impact-matrices/{matrix_id}", response_model=EnvironmentalImpactMatrixOut)
-async def get_impact_matrix(matrix_id: str, db: AsyncSession = Depends(get_db)):
+async def get_impact_matrix(
+    matrix_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     row = (
         await db.execute(
             select(EnvironmentalImpactMatrix)
@@ -277,27 +297,38 @@ async def list_studies(
     plantId: str = Query(...),
     status_: str | None = Query(None, alias="status"),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     await _require_eai_enabled(db, plantId)
-    stmt = select(EaiStudy).where(EaiStudy.plantId == plantId)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=plantId)
+
+    entry_count_sq = (
+        select(EaiEntry.studyId, func.count(EaiEntry.id).label("entry_count"))
+        .group_by(EaiEntry.studyId)
+        .subquery()
+    )
+    sig_count_sq = (
+        select(EaiEntry.studyId, func.count(EaiEntry.id).label("sig_count"))
+        .where(EaiEntry.residualSignificant.is_(True))
+        .group_by(EaiEntry.studyId)
+        .subquery()
+    )
+    stmt = (
+        select(
+            EaiStudy,
+            func.coalesce(entry_count_sq.c.entry_count, 0).label("entry_count"),
+            func.coalesce(sig_count_sq.c.sig_count, 0).label("sig_count"),
+        )
+        .outerjoin(entry_count_sq, entry_count_sq.c.studyId == EaiStudy.id)
+        .outerjoin(sig_count_sq, sig_count_sq.c.studyId == EaiStudy.id)
+        .where(EaiStudy.plantId == plantId)
+    )
     if status_:
         stmt = stmt.where(EaiStudy.status == status_)
     stmt = stmt.order_by(EaiStudy.initiatedAt.desc())
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()
     items: list[EaiStudyListItem] = []
-    for s in rows:
-        entry_count = (
-            await db.execute(
-                select(func.count(EaiEntry.id)).where(EaiEntry.studyId == s.id)
-            )
-        ).scalar_one()
-        sig_count = (
-            await db.execute(
-                select(func.count(EaiEntry.id))
-                .where(EaiEntry.studyId == s.id)
-                .where(EaiEntry.residualSignificant.is_(True))
-            )
-        ).scalar_one()
+    for s, entry_count, sig_count in rows:
         items.append(
             EaiStudyListItem(
                 id=s.id,
@@ -381,7 +412,11 @@ async def create_study(
 
 
 @router.get("/studies/{study_id}", response_model=EaiStudyOut)
-async def get_study(study_id: str, db: AsyncSession = Depends(get_db)):
+async def get_study(
+    study_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     study = (
         await db.execute(
             select(EaiStudy)
@@ -392,6 +427,7 @@ async def get_study(study_id: str, db: AsyncSession = Depends(get_db)):
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=study.plantId)
     return study
 
 
@@ -406,13 +442,15 @@ async def update_study(
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
 
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    PROTECTED_FIELDS = {"status", "approvedAt", "approvedById", "effectiveFrom"}
+    update_data = payload.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        if field in PROTECTED_FIELDS:
+            continue
         setattr(study, field, value)
     study.updatedById = user.id
-    if payload.status == "APPROVED" and study.approvedAt is None:
-        study.approvedAt = datetime.now(timezone.utc)
-        study.approvedById = user.id
     await db.commit()
     study_full = (
         await db.execute(
@@ -424,7 +462,7 @@ async def update_study(
     return study_full
 
 
-@router.delete("/studies/{study_id}", response_model=EaiStudyOut)
+@router.delete("/studies/{study_id}", response_model=EaiStudyOut, status_code=status.HTTP_200_OK)
 async def archive_study(
     study_id: str,
     db: AsyncSession = Depends(get_db),
@@ -434,6 +472,7 @@ async def archive_study(
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.EXECUTE", user, db, plant_id=study.plantId)
     study.status = "ARCHIVED"
     study.updatedById = user.id
     await db.commit()
@@ -442,6 +481,89 @@ async def archive_study(
             select(EaiStudy)
             .where(EaiStudy.id == study.id)
             .options(selectinload(EaiStudy.team))
+        )
+    ).scalar_one()
+    return study_full
+
+
+@router.post("/studies/{study_id}/submit", response_model=EaiStudyOut)
+async def submit_study(
+    study_id: str,
+    payload: EaiStudyTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    study = await db.get(EaiStudy, study_id)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
+    transitions = {
+        "DRAFT": "IN_PROGRESS",
+        "IN_PROGRESS": "TEAM_REVIEW",
+        "TEAM_REVIEW": "APPROVAL_PENDING",
+    }
+    if study.status not in transitions:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot submit from status {study.status!r}")
+    study.status = transitions[study.status]
+    study.updatedById = user.id
+    await db.commit()
+    study_full = (
+        await db.execute(
+            select(EaiStudy).where(EaiStudy.id == study_id).options(selectinload(EaiStudy.team))
+        )
+    ).scalar_one()
+    return study_full
+
+
+@router.post("/studies/{study_id}/approve", response_model=EaiStudyOut)
+async def approve_study(
+    study_id: str,
+    payload: EaiStudyTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    study = await db.get(EaiStudy, study_id)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.EXECUTE", user, db, plant_id=study.plantId)
+    if study.status != "APPROVAL_PENDING":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Can only approve from APPROVAL_PENDING; current: {study.status!r}")
+    study.status = "APPROVED"
+    study.approvedAt = datetime.now(timezone.utc)
+    study.approvedById = user.id
+    study.updatedById = user.id
+    await db.commit()
+    study_full = (
+        await db.execute(
+            select(EaiStudy).where(EaiStudy.id == study_id).options(selectinload(EaiStudy.team))
+        )
+    ).scalar_one()
+    return study_full
+
+
+@router.post("/studies/{study_id}/activate", response_model=EaiStudyOut)
+async def activate_study(
+    study_id: str,
+    payload: EaiStudyTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    study = await db.get(EaiStudy, study_id)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.EXECUTE", user, db, plant_id=study.plantId)
+    if study.status != "APPROVED":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Can only activate from APPROVED; current: {study.status!r}")
+    study.status = "ACTIVE"
+    study.effectiveFrom = datetime.now(timezone.utc)
+    study.updatedById = user.id
+    await db.commit()
+    study_full = (
+        await db.execute(
+            select(EaiStudy).where(EaiStudy.id == study_id).options(selectinload(EaiStudy.team))
         )
     ).scalar_one()
     return study_full
@@ -480,11 +602,13 @@ def _is_acceptable(matrix: EnvironmentalImpactMatrix, level: str, occurrence: st
 async def list_entries(
     study_id: str,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     study = await db.get(EaiStudy, study_id)
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=study.plantId)
     rows = (
         await db.execute(
             select(EaiEntry)
@@ -518,6 +642,9 @@ async def create_entry(
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
+    if study.status in ("ARCHIVED",):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot add entries to an archived study")
 
     matrix = await db.get(EnvironmentalImpactMatrix, study.impactMatrixId)
     if matrix is None:
@@ -586,7 +713,7 @@ async def create_entry(
     return await _load_entry_with_children(db, entry.id)
 
 
-async def _load_entry_with_children(db: AsyncSession, entry_id: str) -> EaiEntry:
+async def _load_entry_with_children(db: AsyncSession, entry_id: str) -> EaiEntry | None:
     entry = (
         await db.execute(
             select(EaiEntry)
@@ -600,18 +727,23 @@ async def _load_entry_with_children(db: AsyncSession, entry_id: str) -> EaiEntry
                 selectinload(EaiEntry.regulationRefs),
             )
         )
-    ).scalar_one()
+    ).scalar_one_or_none()
     return entry
 
 
 @router.get("/entries/{entry_id}", response_model=EaiEntryOut)
-async def get_entry(entry_id: str, db: AsyncSession = Depends(get_db)):
+async def get_entry(
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     entry = await _load_entry_with_children(db, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
     study = await db.get(EaiStudy, entry.studyId)
     if study:
         await _require_eai_enabled(db, study.plantId)
+        await require_permission_with_context("EAI.READ", user, db, plant_id=study.plantId)
     return entry
 
 
@@ -629,7 +761,10 @@ async def update_entry(
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     matrix = await db.get(EnvironmentalImpactMatrix, study.impactMatrixId)
+    if matrix is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Study impact matrix missing")
 
     update_data = payload.model_dump(exclude_unset=True)
 
@@ -675,14 +810,48 @@ async def update_entry(
                     _is_acceptable(matrix, level, entry.occurrence) if matrix else None
                 )
 
+    # Write version snapshot when entry changes under a locked study
+    change_reason = update_data.pop("changeReason", None)
+    change_trigger = update_data.pop("changeTrigger", None)
+    locked_study = study.status in ("APPROVED", "ACTIVE")
+    if locked_study:
+        if not change_reason:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "changeReason is required when modifying an entry under an APPROVED or ACTIVE study",
+            )
+        # compute diff before applying changes
+        changes = []
+        for field, new_val in update_data.items():
+            old_val = getattr(entry, field, None)
+            if str(old_val) != str(new_val):
+                changes.append({"field": field, "from": str(old_val), "to": str(new_val)})
+        # bump version
+        entry.versionNumber = (entry.versionNumber or 1) + 1
+
+    ENTRY_PROTECTED_FIELDS = {"changeReason", "changeTrigger", "versionNumber", "isCurrentVersion", "status"}
     for field, value in update_data.items():
-        if field in {
-            "initialLikelihoodId", "initialMagnitudeId",
-            "residualLikelihoodId", "residualMagnitudeId",
-        }:
-            setattr(entry, field, value)
+        if field in ENTRY_PROTECTED_FIELDS:
             continue
         setattr(entry, field, value)
+
+    # Snapshot captured AFTER field values are applied so it reflects the new state
+    if locked_study:
+        snap = {c: str(getattr(entry, c, None)) for c in [
+            "activityDescription", "occurrence", "frequency",
+            "initialLikelihoodScore", "initialMagnitudeScore", "initialImpactScore", "initialImpactLevel",
+            "residualLikelihoodScore", "residualMagnitudeScore", "residualImpactScore", "residualImpactLevel",
+            "legalComplianceStatus",
+        ]}
+        db.add(EaiVersion(
+            entryId=entry.id,
+            versionNumber=entry.versionNumber,
+            snapshot=snap,
+            changes=changes,
+            changeReason=change_reason,
+            changeTrigger=change_trigger or "MANUAL_EDIT",
+            createdById=user.id,
+        ))
 
     entry.updatedById = user.id
     await db.commit()
@@ -697,10 +866,16 @@ async def replace_entry_aspects(
     entry_id: str,
     payload: list[EaiEntryAspectIn],
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     entry = await db.get(EaiEntry, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     existing = (
         await db.execute(select(EaiEntryAspect).where(EaiEntryAspect.entryId == entry_id))
     ).scalars().all()
@@ -723,10 +898,16 @@ async def replace_entry_impacts(
     entry_id: str,
     payload: list[EaiEntryImpactIn],
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     entry = await db.get(EaiEntry, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     existing = (
         await db.execute(select(EaiEntryImpact).where(EaiEntryImpact.entryId == entry_id))
     ).scalars().all()
@@ -749,10 +930,16 @@ async def replace_entry_controls(
     entry_id: str,
     payload: list[EaiEntryControlIn],
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     entry = await db.get(EaiEntry, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     existing = (
         await db.execute(select(EaiEntryControl).where(EaiEntryControl.entryId == entry_id))
     ).scalars().all()
@@ -775,10 +962,16 @@ async def replace_entry_recommended_controls(
     entry_id: str,
     payload: list[EaiEntryRecommendedControlIn],
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     entry = await db.get(EaiEntry, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     existing = (
         await db.execute(select(EaiEntryRecommendedControl).where(EaiEntryRecommendedControl.entryId == entry_id))
     ).scalars().all()
@@ -791,6 +984,7 @@ async def replace_entry_recommended_controls(
         await db.execute(
             select(EaiEntryRecommendedControl)
             .where(EaiEntryRecommendedControl.entryId == entry_id)
+            .order_by(EaiEntryRecommendedControl.sortOrder.asc())
         )
     ).scalars().all()
 
@@ -800,10 +994,16 @@ async def replace_compliance_obligations(
     entry_id: str,
     payload: list[EaiComplianceObligationIn],
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     entry = await db.get(EaiEntry, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     existing = (
         await db.execute(select(EaiComplianceObligation).where(EaiComplianceObligation.entryId == entry_id))
     ).scalars().all()
@@ -814,7 +1014,9 @@ async def replace_compliance_obligations(
     await db.commit()
     return (
         await db.execute(
-            select(EaiComplianceObligation).where(EaiComplianceObligation.entryId == entry_id)
+            select(EaiComplianceObligation)
+            .where(EaiComplianceObligation.entryId == entry_id)
+            .order_by(EaiComplianceObligation.id.asc())
         )
     ).scalars().all()
 
@@ -824,10 +1026,16 @@ async def replace_regulation_refs(
     entry_id: str,
     payload: list[EaiEntryRegulationRefIn],
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     entry = await db.get(EaiEntry, entry_id)
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
     existing = (
         await db.execute(select(EaiEntryRegulationRef).where(EaiEntryRegulationRef.entryId == entry_id))
     ).scalars().all()
@@ -838,13 +1046,27 @@ async def replace_regulation_refs(
     await db.commit()
     return (
         await db.execute(
-            select(EaiEntryRegulationRef).where(EaiEntryRegulationRef.entryId == entry_id)
+            select(EaiEntryRegulationRef)
+            .where(EaiEntryRegulationRef.entryId == entry_id)
+            .order_by(EaiEntryRegulationRef.id.asc())
         )
     ).scalars().all()
 
 
 @router.get("/entries/{entry_id}/versions", response_model=list[EaiVersionOut])
-async def get_entry_versions(entry_id: str, db: AsyncSession = Depends(get_db)):
+async def get_entry_versions(
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    entry = await db.get(EaiEntry, entry_id)
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    study = await db.get(EaiStudy, entry.studyId)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await _require_eai_enabled(db, study.plantId)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=study.plantId)
     rows = (
         await db.execute(
             select(EaiVersion)
@@ -866,20 +1088,97 @@ async def list_review_cycles(
     assignedToId: str | None = Query(None),
     status_: str | None = Query(None, alias="status"),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    stmt = select(EaiReviewCycle)
+    if plantId:
+        await _require_eai_enabled(db, plantId)
+        await require_permission_with_context("EAI.READ", user, db, plant_id=plantId)
+    stmt = (
+        select(EaiReviewCycle, EaiEntry.activityDescription, EaiEntry.sequenceNumber,
+               EaiStudy.number, EaiStudy.title)
+        .join(EaiEntry, EaiEntry.id == EaiReviewCycle.entryId)
+        .join(EaiStudy, EaiStudy.id == EaiEntry.studyId)
+    )
     if assignedToId:
         stmt = stmt.where(EaiReviewCycle.assignedToId == assignedToId)
     if status_:
         stmt = stmt.where(EaiReviewCycle.status == status_)
     if plantId:
-        # Filter by study plant
-        stmt = stmt.join(EaiEntry, EaiEntry.id == EaiReviewCycle.entryId).join(
-            EaiStudy, EaiStudy.id == EaiEntry.studyId
-        ).where(EaiStudy.plantId == plantId)
+        stmt = stmt.where(EaiStudy.plantId == plantId)
     stmt = stmt.order_by(EaiReviewCycle.scheduledFor.asc())
-    rows = (await db.execute(stmt)).scalars().all()
-    return rows
+    rows = (await db.execute(stmt)).all()
+    result = []
+    for cycle, entry_title, entry_seq, study_number, study_title in rows:
+        out = EaiReviewCycleOut.model_validate(
+            cycle,
+            update={
+                "entryTitle": entry_title,
+                "entrySequenceNumber": entry_seq,
+                "studyNumber": study_number,
+                "studyTitle": study_title,
+            },
+        )
+        result.append(out)
+    return result
+
+
+@router.post("/review-cycles/bulk-no-change", response_model=BulkNoChangeResponse)
+async def bulk_no_change(
+    payload: EaiBulkNoCycleRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    updated = 0
+    for cycle_id in payload.cycleIds:
+        cycle = await db.get(EaiReviewCycle, cycle_id)
+        if cycle is None or cycle.status not in ("SCHEDULED", "IN_PROGRESS"):
+            continue
+        entry = await db.get(EaiEntry, cycle.entryId)
+        if entry is not None:
+            study = await db.get(EaiStudy, entry.studyId)
+            if study is not None:
+                await _require_eai_enabled(db, study.plantId)
+                await require_permission_with_context("EAI.UPDATE", user, db, plant_id=study.plantId)
+        cycle.status = "COMPLETED"
+        cycle.completedAt = datetime.now(timezone.utc)
+        cycle.completedById = user.id
+        cycle.outcome = "NO_CHANGE_REQUIRED"
+        if entry is not None:
+            entry.lastReviewedAt = datetime.now(timezone.utc)
+            entry.lastReviewedById = user.id
+            entry.reviewCount = (entry.reviewCount or 0) + 1
+            entry.lastReviewType = cycle.triggeredBy
+        updated += 1
+    await db.commit()
+    return BulkNoChangeResponse(updated=updated)
+
+
+@router.get("/review-cycles/{cycle_id}", response_model=EaiReviewCycleOut)
+async def get_review_cycle(
+    cycle_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    row = (
+        await db.execute(
+            select(EaiReviewCycle, EaiEntry.activityDescription, EaiEntry.sequenceNumber,
+                   EaiStudy.number, EaiStudy.title, EaiStudy.plantId)
+            .join(EaiEntry, EaiEntry.id == EaiReviewCycle.entryId)
+            .join(EaiStudy, EaiStudy.id == EaiEntry.studyId)
+            .where(EaiReviewCycle.id == cycle_id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Review cycle not found")
+    cycle, entry_title, entry_seq, study_number, study_title, plant_id = row
+    await _require_eai_enabled(db, plant_id)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=plant_id)
+    out = EaiReviewCycleOut.model_validate(cycle)
+    out.entryTitle = entry_title
+    out.entrySequenceNumber = entry_seq
+    out.studyNumber = study_number
+    out.studyTitle = study_title
+    return out
 
 
 @router.post("/review-cycles/{cycle_id}/submit", response_model=EaiReviewCycleOut)
@@ -892,6 +1191,18 @@ async def submit_review_cycle(
     cycle = await db.get(EaiReviewCycle, cycle_id)
     if cycle is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Review cycle not found")
+    if cycle.status not in ("SCHEDULED", "IN_PROGRESS"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Review cycle cannot be submitted from status {cycle.status!r}",
+        )
+    # Resolve parent study for feature-flag and RBAC checks
+    _submit_entry = await db.get(EaiEntry, cycle.entryId)
+    if _submit_entry is not None:
+        _submit_study = await db.get(EaiStudy, _submit_entry.studyId)
+        if _submit_study is not None:
+            await _require_eai_enabled(db, _submit_study.plantId)
+            await require_permission_with_context("EAI.UPDATE", user, db, plant_id=_submit_study.plantId)
     cycle.status = "COMPLETED"
     cycle.completedAt = datetime.now(timezone.utc)
     cycle.completedById = user.id
@@ -904,12 +1215,47 @@ async def submit_review_cycle(
     if entry is not None:
         entry.lastReviewedAt = datetime.now(timezone.utc)
         entry.lastReviewedById = user.id
-        entry.reviewCount = (entry.reviewCount or 0) + 1
         entry.lastReviewType = cycle.triggeredBy
+        # Only increment reviewCount and update nextReviewDue on non-MAJOR_REVISION outcomes
+        if payload.outcome != "MAJOR_REVISION":
+            entry.reviewCount = (entry.reviewCount or 0) + 1
+        # MAJOR_REVISION: create version snapshot documenting the review finding
+        if payload.outcome == "MAJOR_REVISION" and payload.outcomeNotes:
+            next_ver = (entry.versionNumber or 1) + 1
+            entry.versionNumber = next_ver
+            db.add(EaiVersion(
+                entryId=entry.id,
+                versionNumber=next_ver,
+                snapshot={"outcome": payload.outcome, "notes": payload.outcomeNotes or ""},
+                changes=[{"field": "review_outcome", "from": "PENDING", "to": "MAJOR_REVISION"}],
+                changeReason=payload.outcomeNotes or "Major revision from review cycle",
+                changeTrigger=cycle.triggeredBy or "REVIEW",
+                createdById=user.id,
+            ))
 
     await db.commit()
-    await db.refresh(cycle)
-    return cycle
+    # Re-query with joined context fields to populate EaiReviewCycleOut correctly
+    row = (
+        await db.execute(
+            select(EaiReviewCycle, EaiEntry.activityDescription, EaiEntry.sequenceNumber,
+                   EaiStudy.number, EaiStudy.title)
+            .join(EaiEntry, EaiEntry.id == EaiReviewCycle.entryId)
+            .join(EaiStudy, EaiStudy.id == EaiEntry.studyId)
+            .where(EaiReviewCycle.id == cycle_id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Review cycle not found after commit")
+    cycle_out, entry_title, entry_seq, study_number, study_title = row
+    return EaiReviewCycleOut.model_validate(
+        cycle_out,
+        update={
+            "entryTitle": entry_title,
+            "entrySequenceNumber": entry_seq,
+            "studyNumber": study_number,
+            "studyTitle": study_title,
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -919,8 +1265,12 @@ async def submit_review_cycle(
 
 @router.get("/dashboard/coverage", response_model=EaiDashboardCoverage)
 async def dashboard_coverage(
-    plantId: str = Query(...), db: AsyncSession = Depends(get_db)
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
+    await _require_eai_enabled(db, plantId)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=plantId)
     from app.models.masters import Department
 
     departments_total = (
@@ -950,8 +1300,12 @@ async def dashboard_coverage(
 
 @router.get("/dashboard/significant", response_model=EaiDashboardSignificant)
 async def dashboard_significant(
-    plantId: str = Query(...), db: AsyncSession = Depends(get_db)
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
+    await _require_eai_enabled(db, plantId)
+    await require_permission_with_context("EAI.READ", user, db, plant_id=plantId)
     rows = (
         await db.execute(
             select(EaiEntry.residualImpactLevel, func.count(EaiEntry.id))
@@ -992,7 +1346,11 @@ async def dashboard_significant(
 
 
 @router.get("/feature-flag/{plant_id}", response_model=EaiFeatureFlagOut)
-async def get_feature_flag(plant_id: str, db: AsyncSession = Depends(get_db)):
+async def get_feature_flag(
+    plant_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     flag = (
         await db.execute(select(EaiFeatureFlag).where(EaiFeatureFlag.plantId == plant_id))
     ).scalar_one_or_none()
@@ -1019,6 +1377,7 @@ async def update_feature_flag(
     plant = await db.get(Plant, plant_id)
     if plant is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plant not found")
+    await require_permission_with_context("EAI.EXECUTE", user, db, plant_id=plant_id)
 
     flag = (
         await db.execute(select(EaiFeatureFlag).where(EaiFeatureFlag.plantId == plant_id))

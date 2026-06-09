@@ -21,6 +21,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+try:
+    from dateutil.relativedelta import relativedelta as _relativedelta
+    _HAS_RELATIVEDELTA = True
+except ImportError:
+    _HAS_RELATIVEDELTA = False
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +35,7 @@ from sqlalchemy.orm import selectinload
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
 from app.models.hira import (
+    HiraCapa,
     HiraControl,
     HiraEntry,
     HiraEntryControl,
@@ -48,6 +55,9 @@ from app.models.hira import (
 from app.models.plant import Plant
 from app.models.user import User
 from app.schemas.hira import (
+    HiraCapaCreate,
+    HiraCapaOut,
+    HiraCapaUpdate,
     HiraControlOut,
     HiraDashboardCoverage,
     HiraDashboardHighRisk,
@@ -56,17 +66,21 @@ from app.schemas.hira import (
     HiraDashboardTopHazard,
     HiraEntryControlReplaceRequest,
     HiraEntryCreate,
+    HiraEntryHazardReplaceItem,
     HiraEntryListItem,
     HiraEntryListResponse,
     HiraEntryOut,
     HiraEntryRecommendedControlReplaceRequest,
     HiraEntryRegulationRefReplaceRequest,
+    HiraEntryTransitionRequest,
     HiraEntryUpdate,
     HiraHazardOut,
     HiraIntegrationEntry,
     HiraIntegrationForFlraResponse,
     HiraIntegrationForPtwResponse,
     HiraInspectionPriorityResult,
+    HiraReviewCycleBulkNoChangeRequest,
+    HiraReviewCycleListItem,
     HiraReviewCycleOut,
     HiraReviewCycleSubmitRequest,
     HiraStudyCreate,
@@ -74,6 +88,7 @@ from app.schemas.hira import (
     HiraStudyListResponse,
     HiraStudyDetailResponse,
     HiraStudyOut,
+    HiraStudyTransitionRequest,
     HiraStudyUpdate,
     HiraVersionOut,
     RiskMatrixOut,
@@ -302,14 +317,21 @@ async def create_study(
     if matrix is None or not matrix.isActive:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid risk matrix")
 
-    # Number generation — HIRA-YYYY-PLT-NNN
-    count_stmt = (
-        select(func.count())
-        .select_from(HiraStudy)
-        .where(HiraStudy.plantId == payload.plantId)
-    )
-    last = (await db.execute(count_stmt)).scalar_one()
-    number = f"HIRA-{datetime.now(timezone.utc).year}-{plant.code}-{last + 1:03d}"
+    leader = await db.get(User, payload.teamLeaderId)
+    if leader is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="teamLeaderId does not exist")
+
+    # Number generation — HIRA-YYYY-PLT-NNN (MAX-based, gap-safe)
+    max_stmt = select(func.max(HiraStudy.number)).where(HiraStudy.plantId == payload.plantId)
+    last_number = (await db.execute(max_stmt)).scalar_one_or_none()
+    if last_number:
+        try:
+            last_seq = int(last_number.rsplit("-", 1)[-1])
+        except (ValueError, AttributeError):
+            last_seq = 0
+    else:
+        last_seq = 0
+    number = f"HIRA-{datetime.now(timezone.utc).year}-{plant.code}-{last_seq + 1:03d}"
 
     study = HiraStudy(
         number=number,
@@ -556,20 +578,26 @@ def _compute_risk(
 ) -> tuple[int, str, str]:
     """Return (riskScore, riskLevel, colorHex) from the matrix cell.
 
-    Falls back to multiplicative score + heuristic level if no exact cell
-    matches (defensive — the seed creates all cells).
+    Falls back to closest-cell-by-score proximity if no exact cell matches
+    (defensive — the seed creates all cells).
     """
     for c in matrix_cells:
         if c.likelihoodScore == likelihood_score and c.severityScore == severity_score:
             return c.riskScore, c.riskLevel, c.colorHex
     score = likelihood_score * severity_score
+    # Fallback: use closest cell by score proximity
+    cells = matrix_cells
+    closest = min(cells, key=lambda c: abs(c.riskScore - score)) if cells else None
+    if closest:
+        return closest.riskScore, closest.riskLevel, closest.colorHex
+    # Last resort fallback
     if score >= 15:
-        return score, "CRITICAL", "#EF4444"
-    if score >= 8:
-        return score, "HIGH", "#F97316"
-    if score >= 4:
-        return score, "MODERATE", "#F59E0B"
-    return score, "LOW", "#10B981"
+        return score, "CRITICAL", "#dc2626"
+    elif score >= 8:
+        return score, "HIGH", "#ea580c"
+    elif score >= 4:
+        return score, "MODERATE", "#ca8a04"
+    return score, "LOW", "#16a34a"
 
 
 @router.post(
@@ -611,9 +639,15 @@ async def create_entry(
     cells = list((await db.execute(cells_stmt)).scalars().all())
     risk_score, risk_level, risk_color = _compute_risk(cells, likelihood.score, severity.score)
 
+    # Auto-assign sequenceNumber atomically
+    seq_result = await db.execute(
+        select(func.coalesce(func.max(HiraEntry.sequenceNumber), 0) + 1).where(HiraEntry.studyId == study_id)
+    )
+    next_seq = seq_result.scalar_one()
+
     entry = HiraEntry(
         studyId=study_id,
-        sequenceNumber=payload.sequenceNumber,
+        sequenceNumber=next_seq,
         groupLabel=payload.groupLabel,
         activityDescription=payload.activityDescription,
         areaId=payload.areaId,
@@ -625,6 +659,7 @@ async def create_entry(
         personsContractors=payload.personsContractors,
         personsVisitors=payload.personsVisitors,
         personsPublic=payload.personsPublic,
+        affectedPersonGroups=payload.affectedPersonGroups,
         equipmentUsed=payload.equipmentUsed,
         materialsUsed=payload.materialsUsed,
         energySourcesPresent=payload.energySourcesPresent,
@@ -646,12 +681,26 @@ async def create_entry(
     await db.flush()
     await db.refresh(entry)
 
-    # Re-load with children eagerly (empty collections at create)
+    # Save hazards with their consequence descriptions
+    for idx, h in enumerate(payload.hazards):
+        db.add(
+            HiraEntryHazard(
+                entryId=entry.id,
+                hazardId=h.hazardId,
+                contextualDescription=h.contextualDescription,
+                consequence=h.consequence,
+                sortOrder=idx,
+            )
+        )
+    if payload.hazards:
+        await db.flush()
+
+    # Re-load with children eagerly
     stmt = (
         select(HiraEntry)
         .where(HiraEntry.id == entry.id)
         .options(
-            selectinload(HiraEntry.hazards),
+            selectinload(HiraEntry.hazards).selectinload(HiraEntryHazard.hazard),
             selectinload(HiraEntry.existingControls),
             selectinload(HiraEntry.recommendedControls),
             selectinload(HiraEntry.regulationRefs),
@@ -675,6 +724,7 @@ async def get_entry(
             selectinload(HiraEntry.existingControls),
             selectinload(HiraEntry.recommendedControls),
             selectinload(HiraEntry.regulationRefs),
+            selectinload(HiraEntry.capas),
             selectinload(HiraEntry.study),
         )
     )
@@ -727,14 +777,17 @@ async def update_study(
     editable_in_active = {"nextScheduledReviewDate"}
     if study.status in ("APPROVED", "ACTIVE"):
         for field, value in payload.model_dump(exclude_unset=True).items():
-            if field not in editable_in_active and value is not None:
+            if field not in editable_in_active:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     "Study is approved/active. Substantive edits require a review cycle.",
                 )
 
+    PROTECTED_FIELDS = {"status", "approvedAt", "approvedById", "effectiveFrom"}
     data = payload.model_dump(exclude_unset=True)
     for k, v in data.items():
+        if k in PROTECTED_FIELDS:
+            continue
         setattr(study, k, v)
     study.updatedById = user.id
 
@@ -774,6 +827,78 @@ async def archive_study(
     study = (await db.execute(stmt)).scalar_one()
     return HiraStudyOut.model_validate(study)
 
+
+
+
+@router.post("/studies/{study_id}/submit", response_model=HiraStudyOut)
+async def submit_study(
+    study_id: str,
+    payload: HiraStudyTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraStudyOut:
+    study = await db.get(HiraStudy, study_id)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await require_permission_with_context(
+        "HIRA.UPDATE", user, db, plant_id=study.plantId, record_id=study.id
+    )
+    TRANSITIONS = {"DRAFT": "IN_PROGRESS", "IN_PROGRESS": "TEAM_REVIEW", "TEAM_REVIEW": "APPROVAL_PENDING"}
+    if study.status not in TRANSITIONS:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Cannot submit study in status {study.status}")
+    study.status = TRANSITIONS[study.status]
+    study.updatedById = user.id
+    await db.flush()
+    await db.refresh(study)
+    return HiraStudyOut.model_validate(study)
+
+
+@router.post("/studies/{study_id}/approve", response_model=HiraStudyOut)
+async def approve_study(
+    study_id: str,
+    payload: HiraStudyTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraStudyOut:
+    study = await db.get(HiraStudy, study_id)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await require_permission_with_context(
+        "HIRA.APPROVE", user, db, plant_id=study.plantId, record_id=study.id
+    )
+    if study.status != "APPROVAL_PENDING":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Study must be APPROVAL_PENDING to approve, current: {study.status}")
+    now = datetime.now(timezone.utc)
+    study.status = "APPROVED"
+    study.approvedById = user.id
+    study.approvedAt = now
+    study.effectiveFrom = now
+    study.updatedById = user.id
+    await db.flush()
+    await db.refresh(study)
+    return HiraStudyOut.model_validate(study)
+
+
+@router.post("/studies/{study_id}/activate", response_model=HiraStudyOut)
+async def activate_study(
+    study_id: str,
+    payload: HiraStudyTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraStudyOut:
+    study = await db.get(HiraStudy, study_id)
+    if study is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
+    await require_permission_with_context(
+        "HIRA.APPROVE", user, db, plant_id=study.plantId, record_id=study.id
+    )
+    if study.status != "APPROVED":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Study must be APPROVED to activate, current: {study.status}")
+    study.status = "ACTIVE"
+    study.updatedById = user.id
+    await db.flush()
+    await db.refresh(study)
+    return HiraStudyOut.model_validate(study)
 
 def _derive_level(score: int) -> str:
     if score >= 15:
@@ -844,9 +969,24 @@ async def update_entry(
 
     # Residual recompute
     if "residualLikelihoodId" in data or "residualSeverityId" in data:
-        l_id = data.get("residualLikelihoodId", entry.residualLikelihoodId)
-        s_id = data.get("residualSeverityId", entry.residualSeverityId)
-        if l_id and s_id:
+        # Only clear all residual fields if BOTH are explicitly set to None
+        both_null = (
+            "residualLikelihoodId" in data and data["residualLikelihoodId"] is None
+            and "residualSeverityId" in data and data["residualSeverityId"] is None
+        )
+        l_id = data.get("residualLikelihoodId") if "residualLikelihoodId" in data else entry.residualLikelihoodId
+        s_id = data.get("residualSeverityId") if "residualSeverityId" in data else entry.residualSeverityId
+
+        if both_null:
+            entry.residualLikelihoodId = None
+            entry.residualLikelihoodScore = None
+            entry.residualSeverityId = None
+            entry.residualSeverityScore = None
+            entry.residualRiskScore = None
+            entry.residualRiskLevel = None
+            entry.residualRiskColor = None
+            entry.residualAcceptable = None
+        elif l_id and s_id:
             l = await db.get(RiskMatrixLikelihood, l_id)
             s = await db.get(RiskMatrixSeverity, s_id)
             if not l or l.matrixId != entry.study.riskMatrixId:
@@ -874,15 +1014,6 @@ async def update_entry(
             entry.residualAcceptable = (
                 _acceptability_ok(residual_level, threshold) if threshold else None
             )
-        else:
-            entry.residualLikelihoodId = None
-            entry.residualLikelihoodScore = None
-            entry.residualSeverityId = None
-            entry.residualSeverityScore = None
-            entry.residualRiskScore = None
-            entry.residualRiskLevel = None
-            entry.residualRiskColor = None
-            entry.residualAcceptable = None
         data.pop("residualLikelihoodId", None)
         data.pop("residualSeverityId", None)
 
@@ -913,12 +1044,21 @@ async def update_entry(
                 if not k.startswith("_") and not isinstance(v, list)
             }
         }
+        changes = []
+        for field, new_val in data.items():
+            old_val = getattr(entry, field, None)
+            if old_val != new_val:
+                changes.append({
+                    "field": field,
+                    "from": str(old_val) if old_val is not None else None,
+                    "to": str(new_val) if new_val is not None else None,
+                })
         db.add(
             HiraVersion(
                 entryId=entry.id,
                 versionNumber=entry.versionNumber,
                 snapshot=snapshot_dict,
-                changes=[],
+                changes=changes,
                 changeReason=change_reason,
                 changeTrigger=change_trigger,
                 createdById=user.id,
@@ -926,8 +1066,11 @@ async def update_entry(
         )
         entry.versionNumber += 1
 
-    # Apply remaining scalar fields
+    # Apply remaining scalar fields (protected fields cannot be patched via PATCH)
+    ENTRY_PROTECTED_FIELDS = {"status", "versionNumber", "isCurrentVersion"}
     for k, v in data.items():
+        if k in ENTRY_PROTECTED_FIELDS:
+            continue
         setattr(entry, k, v)
     entry.updatedById = user.id
 
@@ -948,10 +1091,176 @@ async def update_entry(
     return HiraEntryOut.model_validate(entry)
 
 
+
+
+async def _get_entry_detail(entry_id: str, db: AsyncSession) -> HiraEntryOut:
+    """Shared helper to reload an entry with all child relations."""
+    stmt = (
+        select(HiraEntry)
+        .where(HiraEntry.id == entry_id)
+        .options(
+            selectinload(HiraEntry.hazards).selectinload(HiraEntryHazard.hazard),
+            selectinload(HiraEntry.existingControls),
+            selectinload(HiraEntry.recommendedControls),
+            selectinload(HiraEntry.regulationRefs),
+            selectinload(HiraEntry.capas),
+            selectinload(HiraEntry.study),
+        )
+    )
+    entry = (await db.execute(stmt)).scalar_one_or_none()
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    return HiraEntryOut.model_validate(entry)
+
+
+@router.post("/entries/{entry_id}/submit-for-review", response_model=HiraEntryOut)
+async def submit_entry_for_review(
+    entry_id: str,
+    payload: HiraEntryTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraEntryOut:
+    entry = await db.get(HiraEntry, entry_id, options=[selectinload(HiraEntry.study)])
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context(
+        "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
+    )
+    if entry.status not in ("DRAFT", "FLAGGED_FOR_REVIEW"):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Entry cannot be submitted from status {entry.status}")
+    entry.status = "IN_REVIEW"
+    entry.updatedById = user.id
+    await db.flush()
+    return await _get_entry_detail(entry_id, db)
+
+
+@router.post("/entries/{entry_id}/approve", response_model=HiraEntryOut)
+async def approve_entry(
+    entry_id: str,
+    payload: HiraEntryTransitionRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraEntryOut:
+    entry = await db.get(HiraEntry, entry_id, options=[selectinload(HiraEntry.study)])
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context(
+        "HIRA.APPROVE", user, db, plant_id=entry.study.plantId, record_id=entry.id
+    )
+    if entry.status != "IN_REVIEW":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Entry must be IN_REVIEW to approve, current: {entry.status}")
+    entry.status = "APPROVED"
+    entry.updatedById = user.id
+    await db.flush()
+    return await _get_entry_detail(entry_id, db)
+
+
+@router.get("/entries/{entry_id}/capas", response_model=list[HiraCapaOut])
+async def list_entry_capas(
+    entry_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[HiraCapaOut]:
+    entry = await db.get(HiraEntry, entry_id, options=[selectinload(HiraEntry.study)])
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context("HIRA.READ", user, db, plant_id=entry.study.plantId, record_id=entry.id)
+    rows = (await db.execute(
+        select(HiraCapa).where(HiraCapa.entryId == entry_id).order_by(HiraCapa.createdAt)
+    )).scalars().all()
+    return [HiraCapaOut.model_validate(r) for r in rows]
+
+
+@router.post("/entries/{entry_id}/capas", response_model=HiraCapaOut, status_code=status.HTTP_201_CREATED)
+async def create_entry_capa(
+    entry_id: str,
+    payload: HiraCapaCreate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraCapaOut:
+    entry = await db.get(HiraEntry, entry_id, options=[selectinload(HiraEntry.study)])
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context("HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id)
+    # Auto-generate CAPA number
+    count_r = await db.execute(select(func.count()).select_from(HiraCapa).where(HiraCapa.entryId == entry_id))
+    count = count_r.scalar_one()
+    capa_number = f"CAPA-{entry_id[:8].upper()}-{count + 1:03d}"
+    capa = HiraCapa(
+        entryId=entry_id,
+        number=capa_number,
+        description=payload.description,
+        controlHierarchy=payload.controlHierarchy,
+        ownerId=payload.ownerId,
+        targetDate=payload.targetDate,
+        status="OPEN",
+        createdById=user.id,
+        updatedById=user.id,
+    )
+    db.add(capa)
+    await db.flush()
+    await db.refresh(capa)
+    return HiraCapaOut.model_validate(capa)
+
+
+@router.patch("/capas/{capa_id}", response_model=HiraCapaOut)
+async def update_capa(
+    capa_id: str,
+    payload: HiraCapaUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraCapaOut:
+    capa = await db.get(HiraCapa, capa_id, options=[selectinload(HiraCapa.entry).selectinload(HiraEntry.study)])
+    if capa is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "CAPA not found")
+    await require_permission_with_context("HIRA.UPDATE", user, db, plant_id=capa.entry.study.plantId)
+    data = payload.model_dump(exclude_unset=True)
+    for k, v in data.items():
+        setattr(capa, k, v)
+    capa.updatedById = user.id
+    await db.flush()
+    await db.refresh(capa)
+    return HiraCapaOut.model_validate(capa)
+
+
+@router.put("/entries/{entry_id}/hazards", response_model=dict)
+async def replace_entry_hazards(
+    entry_id: str,
+    payload: list[HiraEntryHazardReplaceItem],
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    entry = await db.get(
+        HiraEntry, entry_id,
+        options=[selectinload(HiraEntry.study), selectinload(HiraEntry.hazards)],
+    )
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context(
+        "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
+    )
+    # Delete existing hazards
+    for hz in entry.hazards:
+        await db.delete(hz)
+    await db.flush()
+    # Insert new hazards
+    for idx, h in enumerate(payload):
+        db.add(HiraEntryHazard(
+            entryId=entry.id,
+            hazardId=h.hazardId,
+            contextualDescription=h.contextualDescription,
+            consequence=h.consequence,
+            sortOrder=h.sortOrder if h.sortOrder is not None else idx,
+        ))
+    await db.flush()
+    return {"count": len(payload)}
+
+
 @router.put("/entries/{entry_id}/existing-controls")
 async def replace_existing_controls(
     entry_id: str,
     payload: HiraEntryControlReplaceRequest,
+    change_reason: str | None = Query(None, alias="changeReason"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -966,6 +1275,25 @@ async def replace_existing_controls(
     await require_permission_with_context(
         "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
+
+    needs_version = entry.study.status in ("APPROVED", "ACTIVE")
+    if needs_version:
+        if not change_reason:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "changeReason is required when study is APPROVED or ACTIVE")
+        snapshot = {k: v for k, v in entry.__dict__.items() if not k.startswith("_") and not isinstance(v, list)}
+        version = HiraVersion(
+            entryId=entry.id,
+            versionNumber=entry.versionNumber + 1,
+            isCurrentVersion=False,
+            snapshot=snapshot,
+            changes=[{"action": "controls_replaced", "changeReason": change_reason}],
+            changeTrigger="CONTROLS_UPDATED",
+            changeReason=change_reason,
+            changedById=user.id,
+        )
+        db.add(version)
+        entry.versionNumber += 1
+        await db.flush()
 
     # Wholesale replace
     existing = (
@@ -986,6 +1314,7 @@ async def replace_existing_controls(
                 verificationFreq=c.verificationFreq,
                 responsibleRole=c.responsibleRole,
                 evidenceAttached=c.evidenceAttached,
+                documentReference=c.documentReference,
                 sortOrder=c.sortOrder if c.sortOrder is not None else idx,
             )
         )
@@ -1007,6 +1336,7 @@ async def replace_existing_controls(
 async def replace_recommended_controls(
     entry_id: str,
     payload: HiraEntryRecommendedControlReplaceRequest,
+    change_reason: str | None = Query(None, alias="changeReason"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -1021,6 +1351,25 @@ async def replace_recommended_controls(
     await require_permission_with_context(
         "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
+
+    needs_version = entry.study.status in ("APPROVED", "ACTIVE")
+    if needs_version:
+        if not change_reason:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "changeReason is required when study is APPROVED or ACTIVE")
+        snapshot = {k: v for k, v in entry.__dict__.items() if not k.startswith("_") and not isinstance(v, list)}
+        version = HiraVersion(
+            entryId=entry.id,
+            versionNumber=entry.versionNumber + 1,
+            isCurrentVersion=False,
+            snapshot=snapshot,
+            changes=[{"action": "controls_replaced", "changeReason": change_reason}],
+            changeTrigger="CONTROLS_UPDATED",
+            changeReason=change_reason,
+            changedById=user.id,
+        )
+        db.add(version)
+        entry.versionNumber += 1
+        await db.flush()
 
     existing = (
         await db.execute(
@@ -1047,6 +1396,7 @@ async def replace_recommended_controls(
             row.targetSeverityReduction = c.targetSeverityReduction
             row.estimatedCostBand = c.estimatedCostBand
             row.proposedImplementationDate = c.proposedImplementationDate
+            row.responsibleId = c.responsibleId
             row.status = c.status
         else:
             db.add(
@@ -1059,6 +1409,7 @@ async def replace_recommended_controls(
                     targetSeverityReduction=c.targetSeverityReduction,
                     estimatedCostBand=c.estimatedCostBand,
                     proposedImplementationDate=c.proposedImplementationDate,
+                    responsibleId=c.responsibleId,
                     status=c.status,
                 )
             )
@@ -1131,12 +1482,13 @@ async def replace_regulation_refs(
 # ─────────────────────────────────────────────────────────────────────
 
 
-@router.get("/review-cycles", response_model=list[HiraReviewCycleOut])
+@router.get("/review-cycles", response_model=list[HiraReviewCycleListItem])
 async def list_review_cycles(
     status_filter: str | None = Query(None, alias="status"),
+    trigger_filter: str | None = Query(None, alias="trigger"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> list[HiraReviewCycleOut]:
+) -> list[HiraReviewCycleListItem]:
     check = await can(db, user.id, "HIRA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
@@ -1146,6 +1498,9 @@ async def list_review_cycles(
         select(HiraReviewCycle)
         .join(HiraEntry, HiraReviewCycle.entryId == HiraEntry.id)
         .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
+        .options(
+            selectinload(HiraReviewCycle.entry).selectinload(HiraEntry.study)
+        )
     )
     if accessible is None:
         pass
@@ -1157,9 +1512,84 @@ async def list_review_cycles(
         stmt = stmt.where(HiraReviewCycle.status == status_filter)
     else:
         stmt = stmt.where(HiraReviewCycle.status.in_(["SCHEDULED", "IN_PROGRESS"]))
+    if trigger_filter:
+        stmt = stmt.where(HiraReviewCycle.triggeredBy == trigger_filter)
     stmt = stmt.order_by(HiraReviewCycle.scheduledFor.asc()).limit(200)
     rows = (await db.execute(stmt)).scalars().all()
-    return [HiraReviewCycleOut.model_validate(r) for r in rows]
+
+    result = []
+    for r in rows:
+        item = HiraReviewCycleListItem(
+            id=r.id,
+            entryId=r.entryId,
+            scheduledFor=r.scheduledFor,
+            triggeredBy=r.triggeredBy,
+            triggerReferenceId=r.triggerReferenceId,
+            status=r.status,
+            assignedToId=r.assignedToId,
+            outcome=r.outcome,
+            createdAt=r.createdAt,
+            entryTitle=r.entry.activityDescription if r.entry else None,
+            entrySequenceNumber=r.entry.sequenceNumber if r.entry else None,
+            studyNumber=r.entry.study.number if r.entry and r.entry.study else None,
+            studyTitle=r.entry.study.title if r.entry and r.entry.study else None,
+        )
+        result.append(item)
+    return result
+
+
+@router.post("/review-cycles/bulk-no-change")
+async def bulk_no_change(
+    payload: HiraReviewCycleBulkNoChangeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Mark multiple SCHEDULED/IN_PROGRESS cycles as NO_CHANGE_REQUIRED in one call."""
+    check = await can(db, user.id, "HIRA.EXECUTE", PermissionContext())
+    if not check.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+
+    accessible_plants = await get_accessible_plants(db, user.id)
+
+    rows = (
+        await db.execute(
+            select(HiraReviewCycle)
+            .where(HiraReviewCycle.id.in_(payload.cycleIds))
+            .options(selectinload(HiraReviewCycle.entry).selectinload(HiraEntry.study))
+        )
+    ).scalars().all()
+
+    # Filter to only cycles within accessible plants
+    if accessible_plants is not None:
+        rows = [r for r in rows if r.entry and r.entry.study and r.entry.study.plantId in accessible_plants]
+
+    now = datetime.now(timezone.utc)
+    notes = payload.notes or "No change required — bulk submission"
+    updated: list[str] = []
+    skipped: list[str] = []
+
+    for cycle in rows:
+        if cycle.status not in ("SCHEDULED", "IN_PROGRESS"):
+            skipped.append(cycle.id)
+            continue
+        next_due = _compute_next_review_due(
+            cycle.entry.study.reviewFrequency, cycle.entry.study.customReviewMonths
+        )
+        cycle.status = "COMPLETED"
+        cycle.completedAt = now
+        cycle.completedById = user.id
+        cycle.outcome = "NO_CHANGE_REQUIRED"
+        cycle.outcomeNotes = notes
+        cycle.entry.lastReviewedAt = now
+        cycle.entry.lastReviewedById = user.id
+        cycle.entry.nextReviewDue = next_due
+        cycle.entry.reviewCount = (cycle.entry.reviewCount or 0) + 1
+        cycle.entry.lastReviewType = "SCHEDULED"
+        cycle.entry.status = "ACTIVE"
+        updated.append(cycle.id)
+
+    await db.flush()
+    return {"updated": updated, "skipped": skipped}
 
 
 @router.get("/review-cycles/{cycle_id}", response_model=HiraReviewCycleOut)
@@ -1187,7 +1617,11 @@ def _compute_next_review_due(frequency: str, custom_months: int | None) -> datet
         "CUSTOM": custom_months or 12,
         "TRIGGERED_ONLY": 36,
     }.get(frequency, 12)
-    return datetime.now(timezone.utc) + timedelta(days=months * 30)
+    now = datetime.now(timezone.utc)
+    if _HAS_RELATIVEDELTA:
+        return now + _relativedelta(months=months)
+    else:
+        return now + timedelta(days=months * 30)
 
 
 @router.post("/review-cycles/{cycle_id}/submit", response_model=HiraReviewCycleOut)
@@ -1233,21 +1667,30 @@ async def submit_review_cycle(
     elif payload.outcome in ("NO_CHANGE_REQUIRED", "MINOR_REVISION"):
         entry_status_patch = "ACTIVE"
 
-    cycle.status = "COMPLETED"
-    cycle.completedAt = now
-    cycle.completedById = user.id
+    # MAJOR_REVISION stays IN_PROGRESS until Team Leader re-approves the entry
+    if payload.outcome == "MAJOR_REVISION":
+        cycle.status = "IN_PROGRESS"
+    else:
+        cycle.status = "COMPLETED"
+        cycle.completedAt = now
+        cycle.completedById = user.id
     cycle.outcome = payload.outcome
     cycle.outcomeNotes = payload.outcomeNotes
 
     cycle.entry.lastReviewedAt = now
     cycle.entry.lastReviewedById = user.id
-    cycle.entry.nextReviewDue = next_due
-    cycle.entry.reviewCount = (cycle.entry.reviewCount or 0) + 1
+    if payload.outcome != "MAJOR_REVISION":
+        cycle.entry.nextReviewDue = next_due
+        cycle.entry.reviewCount = (cycle.entry.reviewCount or 0) + 1
     cycle.entry.lastReviewType = {
         "SCHEDULE": "SCHEDULED",
         "INCIDENT": "INCIDENT_TRIGGERED",
         "MOC": "MOC_TRIGGERED",
         "AUDIT_FINDING": "AUDIT_TRIGGERED",
+        "MANUAL": "MANUAL_TRIGGERED",
+        "NEAR_MISS": "NEAR_MISS_TRIGGERED",
+        "OBSERVATION": "OBSERVATION_TRIGGERED",
+        "REGULATORY_CHANGE": "REGULATORY_CHANGE_TRIGGERED",
     }.get(cycle.triggeredBy, "AD_HOC")
     cycle.entry.triggeredByRecordId = cycle.triggerReferenceId
     if entry_status_patch:
@@ -1345,7 +1788,7 @@ async def for_flra(
         stmt = stmt.where(HiraEntry.areaId == area_id)
     if activity_keyword:
         stmt = stmt.where(HiraEntry.activityDescription.ilike(f"%{activity_keyword}%"))
-    stmt = stmt.limit(25)
+    stmt = stmt.limit(200)
     rows = (await db.execute(stmt)).all()
     entries = [_serialize_integration_entry(e, s) for e, s in rows]
     return HiraIntegrationForFlraResponse(entries=entries, count=len(entries))
@@ -1374,20 +1817,22 @@ async def for_ptw(
     if area_id:
         base = base.where(HiraEntry.areaId == area_id)
 
-    explicit = base.where(HiraEntry.influencesPtwRiskLevel.is_(True)).limit(30)
+    explicit_q = base.where(HiraEntry.influencesPtwRiskLevel.is_(True))
+    if permit_type:
+        # Filter in SQL using JSON contains — fall back to Python if DB doesn't support it
+        explicit_q = explicit_q.where(
+            or_(
+                HiraEntry.influencesPtwPermitTypes.is_(None),
+                HiraEntry.influencesPtwPermitTypes.contains([permit_type]),
+            )
+        )
+    explicit = explicit_q.limit(200)
     high_risk = base.where(
         or_(HiraEntry.residualRiskLevel == "HIGH", HiraEntry.residualRiskLevel == "CRITICAL")
-    ).limit(30)
+    ).limit(200)
 
     explicit_rows = (await db.execute(explicit)).all()
     high_rows = (await db.execute(high_risk)).all()
-
-    if permit_type:
-        explicit_rows = [
-            (e, s)
-            for e, s in explicit_rows
-            if not e.influencesPtwPermitTypes or permit_type in (e.influencesPtwPermitTypes or [])
-        ]
 
     by_id: dict[str, tuple[HiraEntry, HiraStudy]] = {}
     for e, s in explicit_rows:
@@ -1549,7 +1994,7 @@ async def export_study_csv(
                 e.area.name if e.area else "",
                 e.routine,
                 e.frequency,
-                "; ".join(f"{h.hazard.name} [{h.hazard.category}]" for h in e.hazards),
+                "; ".join(f"{h.hazard.name if h.hazard else '(deleted)'} [{h.hazard.category if h.hazard else '?'}]" for h in e.hazards),
                 str(e.initialLikelihoodScore),
                 str(e.initialSeverityScore),
                 str(e.initialRiskScore),
@@ -1709,9 +2154,9 @@ async def cron_review_scheduler(
     from datetime import timedelta
 
     # Allow CORPORATE_HSE / ADMIN / SYSTEM_ADMIN to run this (cron-internal users)
-    check = await can(db, user.id, "HIRA.READ", PermissionContext())
+    check = await can(db, user.id, "HIRA.EXECUTE", PermissionContext())
     if not check.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cron job requires HIRA.READ")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cron job requires HIRA.EXECUTE")
 
     now = datetime.now(timezone.utc)
     in30 = now + timedelta(days=30)
@@ -1833,9 +2278,9 @@ async def cron_training_expiry(
 
     from app.models.training import TrainingCertificate
 
-    check = await can(db, user.id, "HIRA.READ", PermissionContext())
+    check = await can(db, user.id, "HIRA.EXECUTE", PermissionContext())
     if not check.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cron job requires HIRA.READ")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cron job requires HIRA.EXECUTE")
 
     now = datetime.now(timezone.utc)
     day_ago = now - timedelta(days=1)
@@ -1953,13 +2398,14 @@ async def study_wizard_options(
             .order_by(Area.name)
         )
     ).all() if plant_ids else []
-    users = (
-        await db.execute(
-            select(User.id, User.name, User.email, User.department, User.plantId)
-            .order_by(User.name)
-            .limit(500)
-        )
-    ).all()
+    users_q = (
+        select(User.id, User.name, User.email, User.department, User.plantId)
+        .order_by(User.name)
+        .limit(500)
+    )
+    if plant_ids:
+        users_q = users_q.where(User.plantId.in_(plant_ids))
+    users = (await db.execute(users_q)).all()
     matrices = (
         await db.execute(
             select(
@@ -2041,7 +2487,9 @@ async def entry_wizard_options(
             selectinload(RiskMatrix.cells),
         )
     )
-    matrix = (await db.execute(matrix_stmt)).scalar_one()
+    matrix = (await db.execute(matrix_stmt)).scalar_one_or_none()
+    if matrix is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Risk matrix not found or inactive")
 
     hazards = (
         await db.execute(

@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class RiskMatrixLikelihoodOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    matrixId: str
     score: int
     label: str
     description: str
@@ -31,6 +32,7 @@ class RiskMatrixLikelihoodOut(BaseModel):
 class RiskMatrixSeverityOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    matrixId: str
     score: int
     label: str
     description: str
@@ -43,6 +45,7 @@ class RiskMatrixSeverityOut(BaseModel):
 
 class RiskMatrixCellOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+    id: str
     likelihoodScore: int
     severityScore: int
     riskScore: int
@@ -148,12 +151,14 @@ class HiraStudyUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     title: str | None = None
     description: str | None = None
-    status: str | None = None
     targetCompletionDate: datetime | None = None
     reviewFrequency: str | None = None
     customReviewMonths: int | None = None
     applicableRegulations: list[str] | None = None
     regulatoryReviewRequired: bool | None = None
+    teamLeaderId: str | None = None
+    supersedesStudyId: str | None = None
+    supersessionReason: str | None = None
 
 
 class HiraStudyTeamMemberOut(BaseModel):
@@ -163,6 +168,7 @@ class HiraStudyTeamMemberOut(BaseModel):
     teamRole: str
     department: str | None
     signedAt: datetime | None
+    signedNote: str | None = None
 
 
 class HiraStudyOut(BaseModel):
@@ -248,6 +254,7 @@ class HiraEntryHazardOut(BaseModel):
     contextualDescription: str | None
     potentialHarm: list[Any] | None
     affectedPersons: list[Any] | None
+    consequence: str | None = None
     sortOrder: int
     # Denormalised hazard library fields so the editor renders without a
     # second lookup.
@@ -267,6 +274,7 @@ class HiraEntryControlOut(BaseModel):
     verificationFreq: str | None
     responsibleRole: str | None
     evidenceAttached: bool
+    documentReference: str | None = None
     sortOrder: int
 
 
@@ -293,6 +301,13 @@ class HiraEntryRegulationRefOut(BaseModel):
     requirementSummary: str | None
 
 
+class HiraEntryHazardCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    hazardId: str
+    contextualDescription: str | None = None
+    consequence: str | None = None
+
+
 class HiraEntryCreate(BaseModel):
     """Minimal create — Phase 2 vertical slice.
 
@@ -304,7 +319,7 @@ class HiraEntryCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     studyId: str
-    sequenceNumber: int
+    sequenceNumber: int | None = None  # auto-assigned by router if omitted
     groupLabel: str | None = None
 
     activityDescription: str = Field(min_length=4)
@@ -318,6 +333,7 @@ class HiraEntryCreate(BaseModel):
     personsContractors: int = 0
     personsVisitors: int = 0
     personsPublic: int = 0
+    affectedPersonGroups: str | None = None
 
     equipmentUsed: list[str] | None = None
     materialsUsed: list[str] | None = None
@@ -328,6 +344,8 @@ class HiraEntryCreate(BaseModel):
     initialLikelihoodRationale: str | None = None
     initialSeverityRationale: str | None = None
 
+    hazards: list[HiraEntryHazardCreate] = []
+
 
 class HiraEntryUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -335,6 +353,7 @@ class HiraEntryUpdate(BaseModel):
     routine: str | None = None
     frequency: str | None = None
     typicalDurationMin: int | None = None
+    affectedPersonGroups: str | None = None
 
     initialLikelihoodId: str | None = None
     initialSeverityId: str | None = None
@@ -347,7 +366,43 @@ class HiraEntryUpdate(BaseModel):
     residualSeverityRationale: str | None = None
     residualAcceptanceRationale: str | None = None
 
-    status: str | None = None
+    personsEmployees: int | None = None
+    personsContractors: int | None = None
+    personsVisitors: int | None = None
+    personsPublic: int | None = None
+    gpsLatitude: float | None = None
+    gpsLongitude: float | None = None
+    subLocation: str | None = None
+    areaId: str | None = None
+    equipmentUsed: list[str] | None = None
+    materialsUsed: list[str] | None = None
+    energySourcesPresent: list[str] | None = None
+    triggersTrainingProgramIds: list[str] | None = None
+    triggersInspectionTypeIds: list[str] | None = None
+    influencesPtwRiskLevel: bool | None = None
+    influencesPtwPermitTypes: list[str] | None = None
+    linkedEmergencyProcIds: list[str] | None = None
+    linkedEnvironmentalAspects: list[str] | None = None
+
+
+class HiraCapaOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    entryId: str
+    number: str
+    description: str
+    controlHierarchy: str | None = None
+    ownerId: str
+    targetDate: datetime | None = None
+    status: str
+    completedAt: datetime | None = None
+    completionNote: str | None = None
+    verifierId: str | None = None
+    verifiedAt: datetime | None = None
+    verifyMethod: str | None = None
+    effectiveness: str | None = None
+    createdAt: datetime
+    updatedAt: datetime
 
 
 class HiraEntryOut(BaseModel):
@@ -366,6 +421,7 @@ class HiraEntryOut(BaseModel):
     personsContractors: int
     personsVisitors: int
     personsPublic: int
+    affectedPersonGroups: str | None = None
     equipmentUsed: list[Any] | None
     materialsUsed: list[Any] | None
     energySourcesPresent: list[Any] | None
@@ -399,6 +455,8 @@ class HiraEntryOut(BaseModel):
     nextReviewDue: datetime | None
     reviewCount: int
     lastReviewType: str | None
+    lastReviewedById: str | None = None
+    parentVersionId: str | None = None
     triggeredByRecordId: str | None
     status: str
     versionNumber: int
@@ -411,6 +469,7 @@ class HiraEntryOut(BaseModel):
     existingControls: list[HiraEntryControlOut] = []
     recommendedControls: list[HiraEntryRecommendedControlOut] = []
     regulationRefs: list[HiraEntryRegulationRefOut] = []
+    capas: list[HiraCapaOut] = []
 
 
 class HiraEntryListItem(BaseModel):
@@ -477,6 +536,7 @@ class HiraEntryControlReplaceItem(BaseModel):
     verificationFreq: str | None = None
     responsibleRole: str | None = None
     evidenceAttached: bool = False
+    documentReference: str | None = None
     sortOrder: int = 0
 
 
@@ -494,7 +554,9 @@ class HiraEntryRecommendedControlReplaceItem(BaseModel):
     targetSeverityReduction: int | None = None
     estimatedCostBand: str | None = None
     proposedImplementationDate: datetime | None = None
+    responsibleId: str | None = None
     status: str = "PROPOSED"
+    capaId: str | None = None
 
 
 class HiraEntryRecommendedControlReplaceRequest(BaseModel):
@@ -533,7 +595,35 @@ class HiraReviewCycleOut(BaseModel):
     completedById: str | None
     outcome: str | None
     outcomeNotes: str | None
+    changesMade: list[Any] | None = None
     createdAt: datetime
+
+
+class HiraReviewCycleListItem(BaseModel):
+    """Enriched row for the review-cycles list page. Includes denormalised
+    entry and study fields so the list renders without extra round-trips."""
+
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    entryId: str
+    scheduledFor: datetime
+    triggeredBy: str
+    triggerReferenceId: str | None
+    status: str
+    assignedToId: str
+    outcome: str | None
+    createdAt: datetime
+    # Denormalised from HiraEntry
+    entryTitle: str | None = None
+    entrySequenceNumber: int | None = None
+    # Denormalised from HiraStudy
+    studyNumber: str | None = None
+    studyTitle: str | None = None
+
+
+class HiraReviewCycleBulkNoChangeRequest(BaseModel):
+    cycleIds: list[str] = Field(min_length=1)
+    notes: str | None = None
 
 
 class HiraReviewCycleSubmitRequest(BaseModel):
@@ -555,8 +645,8 @@ class HiraVersionOut(BaseModel):
     snapshot: dict[str, Any]
     # JSON column — seeded records may store list or dict; accept either
     changes: Any
-    changeReason: str | None = None
-    changeTrigger: str | None = None
+    changeReason: str
+    changeTrigger: str
     createdAt: datetime
     createdById: str
 
@@ -638,6 +728,51 @@ class HiraDashboardTopHazard(BaseModel):
     count: int
 
 
+class HiraEntryHazardReplaceItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str | None = None
+    hazardId: str
+    contextualDescription: str | None = None
+    potentialHarm: list[Any] | None = None
+    affectedPersons: list[Any] | None = None
+    consequence: str | None = None
+    sortOrder: int = 0
+
+
+class HiraCapaCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    description: str
+    controlHierarchy: str | None = None
+    ownerId: str
+    targetDate: datetime | None = None
+
+
+class HiraCapaUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    status: str | None = None
+    completionNote: str | None = None
+    completedAt: datetime | None = None
+    verifierId: str | None = None
+    verifiedAt: datetime | None = None
+    verifyMethod: str | None = None
+    effectiveness: str | None = None
+
+
+class HiraStudyTeamMemberSignRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    signedNote: str | None = None
+
+
+class HiraStudyTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    reason: str | None = None
+
+
+class HiraEntryTransitionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    reason: str | None = None
+
+
 __all__ = [
     "RiskMatrixOut",
     "RiskMatrixLikelihoodOut",
@@ -652,6 +787,7 @@ __all__ = [
     "HiraStudyTeamMemberOut",
     "HiraStudyListItem",
     "HiraStudyListResponse",
+    "HiraEntryHazardCreate",
     "HiraEntryCreate",
     "HiraEntryUpdate",
     "HiraEntryOut",
@@ -667,6 +803,8 @@ __all__ = [
     "HiraEntryRecommendedControlReplaceRequest",
     "HiraEntryRegulationRefReplaceItem",
     "HiraEntryRegulationRefReplaceRequest",
+    "HiraReviewCycleListItem",
+    "HiraReviewCycleBulkNoChangeRequest",
     "HiraReviewCycleOut",
     "HiraReviewCycleSubmitRequest",
     "HiraVersionOut",
@@ -680,4 +818,11 @@ __all__ = [
     "HiraDashboardRiskReduction",
     "HiraDashboardTopHazard",
     "HiraStudyDetailResponse",
+    "HiraEntryHazardReplaceItem",
+    "HiraCapaCreate",
+    "HiraCapaUpdate",
+    "HiraCapaOut",
+    "HiraStudyTeamMemberSignRequest",
+    "HiraStudyTransitionRequest",
+    "HiraEntryTransitionRequest",
 ]

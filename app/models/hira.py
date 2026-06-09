@@ -28,6 +28,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -193,6 +194,11 @@ class HiraControl(Base, IdMixin):
 
 class HiraStudy(Base, IdMixin):
     __tablename__ = "HiraStudy"
+    __table_args__ = (
+        Index("ix_HiraStudy_plantId_status", "plantId", "status"),
+        Index("ix_HiraStudy_status_nextScheduledReviewDate", "status", "nextScheduledReviewDate"),
+        Index("ix_HiraStudy_plantId_departmentId", "plantId", "departmentId"),
+    )
 
     number: Mapped[str] = mapped_column(String, unique=True, nullable=False)
 
@@ -318,6 +324,7 @@ class HiraEntry(Base, IdMixin):
     personsContractors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     personsVisitors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     personsPublic: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    affectedPersonGroups: Mapped[str | None] = mapped_column(Text)
 
     equipmentUsed: Mapped[list | None] = mapped_column(JSON)
     materialsUsed: Mapped[list | None] = mapped_column(JSON)
@@ -404,6 +411,7 @@ class HiraEntryHazard(Base, IdMixin):
     contextualDescription: Mapped[str | None] = mapped_column(Text)
     potentialHarm: Mapped[list | None] = mapped_column(JSON)
     affectedPersons: Mapped[list | None] = mapped_column(JSON)
+    consequence: Mapped[str | None] = mapped_column(Text)
 
     sortOrder: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -423,6 +431,7 @@ class HiraEntryControl(Base, IdMixin):
     verificationFreq: Mapped[str | None] = mapped_column(String)
     responsibleRole: Mapped[str | None] = mapped_column(String)
     evidenceAttached: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    documentReference: Mapped[str | None] = mapped_column(String)
 
     sortOrder: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -430,6 +439,9 @@ class HiraEntryControl(Base, IdMixin):
 
 class HiraEntryRecommendedControl(Base, IdMixin):
     __tablename__ = "HiraEntryRecommendedControl"
+    __table_args__ = (
+        Index("ix_HiraRecommendedControl_entryId_status", "entryId", "status"),
+    )
 
     entryId: Mapped[str] = mapped_column(ForeignKey("HiraEntry.id", ondelete="CASCADE"), nullable=False, index=True)
     entry: Mapped[HiraEntry] = relationship(back_populates="recommendedControls")
@@ -471,6 +483,10 @@ class HiraEntryRegulationRef(Base, IdMixin):
 
 class HiraCapa(Base, IdMixin):
     __tablename__ = "HiraCapa"
+    __table_args__ = (
+        Index("ix_HiraCapa_entryId_status", "entryId", "status"),
+        Index("ix_HiraCapa_ownerId_status", "ownerId", "status"),
+    )
 
     entryId: Mapped[str] = mapped_column(ForeignKey("HiraEntry.id", ondelete="CASCADE"), nullable=False, index=True)
     entry: Mapped[HiraEntry] = relationship(back_populates="capas")
@@ -501,6 +517,10 @@ class HiraCapa(Base, IdMixin):
 
 class HiraReviewCycle(Base, IdMixin):
     __tablename__ = "HiraReviewCycle"
+    __table_args__ = (
+        Index("ix_HiraReviewCycle_assignedToId_status", "assignedToId", "status"),
+        Index("ix_HiraReviewCycle_status_scheduledFor", "status", "scheduledFor"),
+    )
 
     entryId: Mapped[str] = mapped_column(ForeignKey("HiraEntry.id", ondelete="CASCADE"), nullable=False, index=True)
     entry: Mapped[HiraEntry] = relationship(back_populates="reviewCycles")
