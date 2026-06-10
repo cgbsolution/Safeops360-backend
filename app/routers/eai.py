@@ -1109,15 +1109,13 @@ async def list_review_cycles(
     rows = (await db.execute(stmt)).all()
     result = []
     for cycle, entry_title, entry_seq, study_number, study_title in rows:
-        out = EaiReviewCycleOut.model_validate(
-            cycle,
-            update={
-                "entryTitle": entry_title,
-                "entrySequenceNumber": entry_seq,
-                "studyNumber": study_number,
-                "studyTitle": study_title,
-            },
-        )
+        # NB: model_validate has no `update=` kwarg in Pydantic v2 — assign
+        # the joined display fields after validation (same as get_review_cycle).
+        out = EaiReviewCycleOut.model_validate(cycle)
+        out.entryTitle = entry_title
+        out.entrySequenceNumber = entry_seq
+        out.studyNumber = study_number
+        out.studyTitle = study_title
         result.append(out)
     return result
 
@@ -1247,15 +1245,12 @@ async def submit_review_cycle(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Review cycle not found after commit")
     cycle_out, entry_title, entry_seq, study_number, study_title = row
-    return EaiReviewCycleOut.model_validate(
-        cycle_out,
-        update={
-            "entryTitle": entry_title,
-            "entrySequenceNumber": entry_seq,
-            "studyNumber": study_number,
-            "studyTitle": study_title,
-        },
-    )
+    out = EaiReviewCycleOut.model_validate(cycle_out)
+    out.entryTitle = entry_title
+    out.entrySequenceNumber = entry_seq
+    out.studyNumber = study_number
+    out.studyTitle = study_title
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────

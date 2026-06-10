@@ -37,7 +37,9 @@ PERMISSIONS = [
 GRANTS: dict[str, tuple[list[str], str]] = {
     "WORKER": (["READ"], "OWN_RECORDS"),
     "CONTRACTOR_WORKMAN": (["READ"], "OWN_RECORDS"),
-    "SUPERVISOR": (["READ"], "OWN_DEPARTMENT"),
+    # Spec §3: Dept Supervisor issues PPE and records returns for OWN dept
+    # (the return route also gates on PPE.ISSUE).
+    "SUPERVISOR": (["READ", "ISSUE"], "OWN_DEPARTMENT"),
     # PTW issuers pre-flight crew PPE via POST /api/ppe/compliance/ptw-gate-check
     # (PPE-01 Pass 2) — needs read access to PPE compliance state.
     "PERMIT_ISSUER": (["READ"], "OWN_PLANT"),

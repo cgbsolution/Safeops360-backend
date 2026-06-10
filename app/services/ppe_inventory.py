@@ -316,6 +316,15 @@ async def issue_item(
     by_user = await db.get(User, by_user_id)
     if to_user is None:
         raise ValueError("Recipient user not found")
+    # Multi-plant scoping: stock belongs to one plant store; issuing it to a
+    # worker of another plant records the issuance under the item's plant
+    # where the worker's own compliance view never sees it. Plant-less users
+    # (corporate roles) are allowed.
+    if to_user.plantId and to_user.plantId != item.plantId:
+        raise ValueError(
+            f"Cannot issue — {to_user.name} belongs to a different plant. "
+            "Transfer the stock or issue from their plant's store."
+        )
 
     now = _utcnow()
     plant_short = await _plant_short(db, item.plantId)
@@ -435,6 +444,23 @@ async def record_inspection(
         else:
             item_status_after = "returned_to_service"
 
+    # A failed item can NEVER go straight back into service — only to
+    # quarantine, repair, or end-of-life. Without this guard a fail +
+    # returned_to_service combination silently reset the item to "good".
+    ALLOWED_AFTER: dict[str, set[str]] = {
+        "pass": {"returned_to_service", "recalled_to_store"},
+        "conditional_pass": {"returned_to_service", "recalled_to_store", "quarantined_pending_repair"},
+        "fail": {"quarantined_pending_repair", "retired", "condemned"},
+    }
+    allowed = ALLOWED_AFTER.get(overall_result)
+    if allowed is None:
+        raise ValueError(f"Unknown inspection result '{overall_result}'")
+    if item_status_after not in allowed:
+        raise ValueError(
+            f"Inspection result '{overall_result}' cannot set item status "
+            f"'{item_status_after}' — allowed: {', '.join(sorted(allowed))}"
+        )
+
     _, remaining = service_life_status(item, now)
     inspection = PpeInspection(
         tenantId=None,
@@ -482,6 +508,25 @@ async def record_inspection(
         target = "in_stock"
     else:
         target = item.status
+
+    # Every outcome other than returned_to_service physically withdraws the
+    # item from its holder — the open issuance MUST close and the holder
+    # fields MUST clear, or the item is "in stock" while an issuance is still
+    # ACTIVE (it could then be issued a second time → two workers covered by
+    # one physical item).
+    if item_status_after != "returned_to_service" and item.currentIssuanceId:
+        issuance = await db.get(PpeIssuance, item.currentIssuanceId)
+        if issuance is not None and issuance.status == "active":
+            issuance.status = "returned"
+            issuance.returnedAt = now
+            issuance.returnedByUserId = inspector_user_id
+            issuance.conditionAtReturn = item.condition
+            issuance.conditionNotesAtReturn = (
+                f"Withdrawn by inspection ({overall_result} → {item_status_after})"
+            )
+        item.currentHolderUserId = None
+        item.currentIssuanceId = None
+        item.issuedSince = None
 
     if target != item.status:
         _push_history(item, item.status, target, inspector_user_id, f"Inspection {overall_result} → {item_status_after}")

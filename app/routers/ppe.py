@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
@@ -59,9 +60,19 @@ class CommissionBody(BaseModel):
     cost: float | None = None
 
 
+# Closed vocabularies (mirror the model docstrings) — enforced at the API
+# boundary so reports/filters never see free-text variants like "manual".
+IssuancePurpose = Literal["personal_assignment", "permit_task", "training", "temporary_loan"]
+ReturnCondition = Literal["good", "fair", "damaged", "destroyed"]
+InspectionType = Literal["pre_use", "periodic", "annual", "post_incident", "fitness_reassessment"]
+InspectionTrigger = Literal["scheduled", "recalled", "damage_assessment", "incident", "fitness_reassessment"]
+InspectionResult = Literal["pass", "fail", "conditional_pass"]
+ItemStatusAfter = Literal["returned_to_service", "recalled_to_store", "quarantined_pending_repair", "retired", "condemned"]
+
+
 class IssueBody(BaseModel):
     toUserId: str
-    purpose: str = "personal_assignment"
+    purpose: IssuancePurpose = "personal_assignment"
     linkedPermitId: str | None = None
     conditionAtIssuance: str = "good"
     briefingProvided: bool = True
@@ -70,15 +81,15 @@ class IssueBody(BaseModel):
 
 
 class ReturnBody(BaseModel):
-    conditionAtReturn: str = "good"
+    conditionAtReturn: ReturnCondition = "good"
     notes: str = ""
 
 
 class InspectBody(BaseModel):
-    inspectionType: str = "periodic"
-    trigger: str = "scheduled"
-    overallResult: str = "pass"
-    itemStatusAfter: str | None = None
+    inspectionType: InspectionType = "periodic"
+    trigger: InspectionTrigger = "scheduled"
+    overallResult: InspectionResult = "pass"
+    itemStatusAfter: ItemStatusAfter | None = None
     checklistItems: list[dict] | None = None
     defectsFound: list[dict] | None = None
     conditions: str = ""
@@ -287,7 +298,19 @@ async def commission(
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
-    return {"created": len(items), "items": [svc.item_dict(i) for i in items]}
+    dicts = [svc.item_dict(i) for i in items]
+    # Goods received with an old manufacture date can be expired on arrival
+    # (shelf life from manufacture). Surface it instead of creating silently
+    # unissuable stock.
+    born_expired = sum(1 for d in dicts if d["serviceLifeExceeded"])
+    warning = (
+        f"{born_expired} of {len(dicts)} item(s) are already past their service "
+        "life based on the manufacture date — they cannot be issued. Check the "
+        "manufacture date or retire them."
+        if born_expired
+        else None
+    )
+    return {"created": len(dicts), "items": dicts, "warning": warning}
 
 
 @router.post("/items/{item_id}/issue", status_code=status.HTTP_201_CREATED)
