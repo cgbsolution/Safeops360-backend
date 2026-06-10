@@ -420,6 +420,19 @@ async def add_crew(
             f"Cannot edit crew on a {permit.status.value} permit.",
         )
 
+    # PPE snapshot for the joining member (PPE-01 Pass 2). Non-blocking —
+    # the re-FLRA + activation gate enforce PPE before work resumes.
+    from app.services.ppe_gate import check_ppe_for_user
+
+    ppe_res = await check_ppe_for_user(
+        db,
+        user_id=payload.userId,
+        plant_id=permit.plantId,
+        permit_type_code=(
+            permit.type.value if hasattr(permit.type, "value") else str(permit.type)
+        ),
+    )
+
     # Reactivate a previously-removed row if present, else insert.
     existing = (
         await db.execute(
@@ -436,12 +449,16 @@ async def add_crew(
         existing.removedAt = None
         existing.removalReason = None
         existing.role = payload.role
+        existing.ppeValidAtIssuance = ppe_res.ok
+        existing.ppeValidationNotes = ppe_res.summary() if not ppe_res.ok else None
     else:
         db.add(
             PermitCrewMember(
                 permitId=permit_id,
                 userId=payload.userId,
                 role=payload.role,
+                ppeValidAtIssuance=ppe_res.ok,
+                ppeValidationNotes=ppe_res.summary() if not ppe_res.ok else None,
             )
         )
 

@@ -585,7 +585,17 @@ async def people_compliance(db: AsyncSession, *, plant_id: str) -> dict[str, Any
             type_code = req.get("ppe_type_code")
             level = req.get("requirement_level", "mandatory")
             is_mandatory = level == "mandatory"
-            match = next(((iss, it) for (iss, it) in holdings if iss.ppeTypeCode == type_code), None)
+            # A person can hold several items of one type (e.g. an expired
+            # pair not yet returned plus its replacement) — judge them by
+            # their BEST holding, never the first row found.
+            candidates = [(iss, it) for (iss, it) in holdings if iss.ppeTypeCode == type_code]
+            match = None
+            if candidates:
+                rank = {"pass": 0, "warn": 1, "block": 2}
+                match = min(
+                    candidates,
+                    key=lambda c: rank[item_validity(c[1], now)["level"]] if c[1] else rank["block"],
+                )
             if match is None:
                 status = "block" if is_mandatory else "recommended"
                 if is_mandatory:

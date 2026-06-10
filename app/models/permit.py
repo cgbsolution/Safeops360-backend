@@ -191,6 +191,10 @@ class PermitCrewMember(Base, IdMixin):
     trainingValidationNotes: Mapped[str | None] = mapped_column(String)
     medicalValidAtIssuance: Mapped[bool | None] = mapped_column(Boolean)
     contractorActiveAtIssuance: Mapped[bool | None] = mapped_column(Boolean)
+    # PPE snapshot at crew add (PPE-01 Pass 2). Audit only — the activation
+    # gate re-checks PPE live because issuance state moves fast.
+    ppeValidAtIssuance: Mapped[bool | None] = mapped_column(Boolean)
+    ppeValidationNotes: Mapped[str | None] = mapped_column(String)
 
     removedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     removalReason: Mapped[str | None] = mapped_column(String)

@@ -38,6 +38,9 @@ GRANTS: dict[str, tuple[list[str], str]] = {
     "WORKER": (["READ"], "OWN_RECORDS"),
     "CONTRACTOR_WORKMAN": (["READ"], "OWN_RECORDS"),
     "SUPERVISOR": (["READ"], "OWN_DEPARTMENT"),
+    # PTW issuers pre-flight crew PPE via POST /api/ppe/compliance/ptw-gate-check
+    # (PPE-01 Pass 2) — needs read access to PPE compliance state.
+    "PERMIT_ISSUER": (["READ"], "OWN_PLANT"),
     "STORE_KEEPER": (["CREATE", "READ", "UPDATE", "EXPORT", "ISSUE"], "OWN_PLANT"),
     "SAFETY_OFFICER": (["READ", "CREATE", "UPDATE", "EXPORT", "ISSUE", "INSPECT", "VERIFY", "RETIRE_APPROVE"], "OWN_PLANT"),
     "MAINTENANCE_HEAD": (["READ"], "OWN_PLANT"),

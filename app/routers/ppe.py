@@ -2,9 +2,10 @@
 
 Core vertical slice: catalog + the full item lifecycle (commission → issue →
 return → inspect → retire) + the People Compliance view + dashboards + a
-statutory compliance CSV. Cross-module gates (PTW PPE gate, Skill Matrix
-competency-on-issue) land in a later pass. RBAC: reads need PPE.READ; each
-write needs its specific action permission.
+statutory compliance CSV + the PTW gate-check contract (Pass 2 —
+services/ppe_gate.py). Skill Matrix competency-on-issue lands in a later
+pass. RBAC: reads need PPE.READ; each write needs its specific action
+permission.
 """
 
 from __future__ import annotations
@@ -615,3 +616,67 @@ async def people_compliance_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="ppe-compliance-{plantId}.csv"'},
     )
+
+
+# ─── PTW integration: PPE compliance gate check (Build Prompt §9.1) ───────
+
+
+class PtwGateCheckBody(BaseModel):
+    ptwId: str | None = None  # informational — echoed back
+    plantId: str
+    permitType: str | None = None  # e.g. WORK_AT_HEIGHT; adds enablesPermitTypes PPE
+    workers: list[str]  # user ids
+
+
+@router.post("/compliance/ptw-gate-check")
+async def ptw_gate_check(
+    body: PtwGateCheckBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Integration contract for the PTW module: are these workers PPE-
+    compliant right now? Same engine as the activation gate
+    (ppe_gate.check_ppe_for_crew) — exposed so the PTW UI can pre-flight a
+    crew before submission. No override path exists yet: the activation
+    gate is a hard block."""
+    await _require(db, user, "PPE.READ")
+    from app.services.ppe_gate import check_ppe_for_crew
+
+    results = await check_ppe_for_crew(
+        db,
+        plant_id=body.plantId,
+        user_ids=body.workers,
+        permit_type_code=body.permitType,
+    )
+    user_rows = (
+        await db.execute(select(User).where(User.id.in_(body.workers)))
+    ).scalars().all() if body.workers else []
+    names_by_id = {u.id: u.name for u in user_rows}
+
+    compliant: list[str] = []
+    non_compliant: list[dict] = []
+    for worker_id in body.workers:
+        res = results[worker_id]
+        if res.ok:
+            compliant.append(worker_id)
+        else:
+            non_compliant.append({
+                "workerId": worker_id,
+                "workerName": names_by_id.get(worker_id, worker_id),
+                "gaps": [
+                    {
+                        "ppeTypeCode": g.ppeTypeCode,
+                        "ppeTypeName": g.ppeTypeName,
+                        "reason": g.code,
+                        "message": g.message,
+                    }
+                    for g in res.blockers
+                ],
+            })
+    return {
+        "ptwId": body.ptwId,
+        "gateStatus": "BLOCKED" if non_compliant else "CLEAR",
+        "compliantWorkers": compliant,
+        "nonCompliantWorkers": non_compliant,
+        "overrideAllowed": False,
+    }

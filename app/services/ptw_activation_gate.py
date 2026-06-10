@@ -10,6 +10,10 @@ ACTIVE state when **all** of these checks pass:
     OR has been removed (removedAt set)
   • Every isolation row has isolationVerifiedAt set (isolations physically
     locked-out and tagged before work starts)
+  • Every crew member holds valid, acknowledged PPE for their role profile
+    AND the permit type (PPE-01 Pass 2 — Build Prompt §6.4). Checked LIVE
+    via ppe_gate.check_ppe_for_crew, not from the crew-add snapshot,
+    because PPE state (returns, recalls, failed inspections) moves fast.
 
 The blockers list is **all-at-once** — we don't short-circuit, so the UI
 can render every reason in a single panel.
@@ -57,6 +61,8 @@ class PtwActivationGateStatus:
     crew_validity_issues: list[str] = field(default_factory=list)
     isolations_pending: int = 0
     isolations_total: int = 0
+    crew_ppe_issues: list[str] = field(default_factory=list)
+    crew_ppe_warnings: list[str] = field(default_factory=list)
 
 
 def _utc_aware(dt: datetime | None) -> datetime | None:
@@ -220,7 +226,56 @@ async def can_ptw_transition_to_active(
             )
         )
 
-    # ─── 4. Isolations verified ────────────────────────────────────────
+    # ─── 4. PPE compliance (live, per crew member) ────────────────────
+    # Role-profile mandatory PPE + permit-type PPE (PpeType.enablesPermitTypes)
+    # must be issued, acknowledged, and serviceable for every active crew
+    # member. Lazy import keeps the PPE module optional at import time.
+    from app.services.ppe_gate import check_ppe_for_crew
+
+    if active_crew:
+        permit_type_code = (
+            permit.type.value if hasattr(permit.type, "value") else str(permit.type)
+        )
+        ppe_results = await check_ppe_for_crew(
+            db,
+            plant_id=permit.plantId,
+            user_ids=crew_user_ids,
+            permit_type_code=permit_type_code,
+        )
+        for c in active_crew:
+            res = ppe_results.get(c.userId)
+            if res is None:
+                continue
+            name = crew_names_by_id.get(c.userId, c.userId)
+            if not res.ok:
+                status.crew_ppe_issues.append(f"{name}: {res.summary()}")
+            elif res.warnings:
+                status.crew_ppe_warnings.append(
+                    f"{name}: " + "; ".join(w.message for w in res.warnings)
+                )
+
+    if status.crew_ppe_issues:
+        status.ok = False
+        status.blockers.append(
+            GateBlocker(
+                code="CREW_PPE",
+                message=(
+                    "Crew PPE non-compliance: "
+                    + " | ".join(status.crew_ppe_issues)
+                    + ". Issue or replace PPE before activation."
+                ),
+            )
+        )
+    if status.crew_ppe_warnings:
+        status.blockers.append(
+            GateBlocker(
+                code="CREW_PPE_WARN",
+                message="PPE attention needed: " + " | ".join(status.crew_ppe_warnings),
+                severity="WARN",
+            )
+        )
+
+    # ─── 5. Isolations verified ────────────────────────────────────────
     status.isolations_total = len(permit.isolations)
     pending = [i for i in permit.isolations if i.isolationVerifiedAt is None]
     status.isolations_pending = len(pending)

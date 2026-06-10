@@ -227,6 +227,7 @@ async def create_permit(
         # Capture validity-at-issuance flags so the activation gate
         # (Commit 4 — PTW) has the snapshot it needs.
         from app.services.competency import check_competency_for_permit_type
+        from app.services.ppe_gate import check_ppe_for_crew
 
         for c in payload.workCrew:
             crew_comp = await check_competency_for_permit_type(
@@ -242,11 +243,27 @@ async def create_permit(
                         f"to this {payload.type.value} permit:\n• " + "\n• ".join(msgs)
                     ),
                 )
+
+        # PPE snapshot at crew add (PPE-01 Pass 2). Unlike competency this is
+        # NOT blocking here — PPE can still be issued between permit creation
+        # and activation; the activation gate enforces it live.
+        ppe_results = await check_ppe_for_crew(
+            db,
+            plant_id=payload.plantId,
+            user_ids=[c.userId for c in payload.workCrew],
+            permit_type_code=payload.type.value,
+        )
+        for c in payload.workCrew:
+            ppe_res = ppe_results.get(c.userId)
             db.add(PermitCrewMember(
                 permitId=permit.id,
                 userId=c.userId,
                 role=c.role,
                 trainingValidAtIssuance=True,  # passed competency check
+                ppeValidAtIssuance=ppe_res.ok if ppe_res else None,
+                ppeValidationNotes=(
+                    ppe_res.summary() if ppe_res and not ppe_res.ok else None
+                ),
             ))
     if payload.isolations:
         for iso in payload.isolations:
@@ -399,6 +416,8 @@ async def get_activation_gate(
         if gate.flra_id
         else None,
         "crewValidityIssues": gate.crew_validity_issues,
+        "crewPpeIssues": gate.crew_ppe_issues,
+        "crewPpeWarnings": gate.crew_ppe_warnings,
         "isolations": {
             "pending": gate.isolations_pending,
             "total": gate.isolations_total,
