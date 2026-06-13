@@ -27,11 +27,12 @@ from app.models.capa import (
     CapaSubCategory,
     CapaVerificationMethod,
 )
-from app.models.audit_mgmt import Audit, AuditFinding
-from app.models.deviation import Deviation
-from app.models.document_control import ControlledDocument, DocumentVersion
-from app.models.oos import OosInvestigation
-from app.models.part11 import ElectronicSignature, GmpAuditEntry
+from app.models.audit_compliance import (
+    AuditCheckpointLibrary,
+    AuditCheckpointResponse,
+    AuditTemplate,
+    ComplianceAudit,
+)
 from app.models.competency_matrix import (
     Competency,
     CompetencyAssessment,
@@ -177,20 +178,16 @@ __all__ = [
     "AgentInvocation",
     "AgentPrompt",
     "AgentToolCall",
-    "Audit",
-    "AuditFinding",
+    "AuditCheckpointLibrary",
+    "AuditCheckpointResponse",
+    "AuditTemplate",
+    "ComplianceAudit",
     "Anomaly",
     "Area",
     "Capa",
     "CapaAction",
     "Competency",
     "CompetencyAssessment",
-    "ControlledDocument",
-    "Deviation",
-    "DocumentVersion",
-    "ElectronicSignature",
-    "GmpAuditEntry",
-    "OosInvestigation",
     "CompetencyRecord",
     "CompetencyRecordVersion",
     "CompetencyValidationAttempt",

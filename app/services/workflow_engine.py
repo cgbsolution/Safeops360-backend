@@ -85,24 +85,68 @@ async def _find_user_by_roles(
     return rows[0][1].id
 
 
+# Statuses in which the assigned user can still act on a task. PENDING is the
+# normal case; OVERDUE / ESCALATED are SLA states the escalation layer stamps
+# ON TOP of an unfinished task — the original assignee can (and must) still
+# complete the work. These are stored as free strings on WorkflowTask.status
+# (only PENDING/COMPLETED/SKIPPED/EXPIRED exist on the TaskStatus enum), so we
+# compare against literals here. Treating only PENDING as actionable made
+# overdue/escalated tasks impossible to complete from the UI or the API.
+OPEN_TASK_STATUSES = (TaskStatus.PENDING.value, "OVERDUE", "ESCALATED")
+
+
 async def _close_pending_tasks(
     db: AsyncSession, *, instance_id: str, except_task_id: str | None = None
 ) -> int:
-    """Mark all PENDING tasks on an instance as SKIPPED (except optionally
-    the one currently being processed). Used when the workflow reaches a
-    terminal state — leftover pending tasks from old bugs or duplicates
-    would otherwise keep showing as 'Awaiting Action'."""
+    """Mark all still-open (PENDING / OVERDUE / ESCALATED) tasks on an instance
+    as SKIPPED (except optionally the one currently being processed). Used when
+    the workflow reaches a terminal state — leftover open tasks from old bugs,
+    duplicates, or SLA-escalation siblings would otherwise keep showing as
+    'Awaiting Action'."""
     rows = (
         await db.execute(
             select(WorkflowTask)
             .where(WorkflowTask.instanceId == instance_id)
-            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.status.in_(OPEN_TASK_STATUSES))
         )
     ).scalars().all()
     closed = 0
     now = datetime.now(timezone.utc)
     for t in rows:
         if except_task_id and t.id == except_task_id:
+            continue
+        t.status = TaskStatus.SKIPPED.value
+        t.completedAt = now
+        closed += 1
+    return closed
+
+
+async def _close_escalation_siblings(
+    db: AsyncSession, *, instance_id: str, step_id: str, except_task_id: str
+) -> int:
+    """After a step advances, close the leftover SLA-escalation 'nudge' tasks
+    on the step we just left. When a task breaches its SLA, the escalation
+    layer raises a parallel task (stepName prefixed '[Escalation] …') for the
+    escalationRole holder. Once the primary assignee completes the work and the
+    parallel gate clears, that nudge is moot — but it isn't PENDING, so the
+    gate never counted it and it would otherwise dangle in the manager's inbox.
+
+    Scoped tightly to escalation siblings (the '[Escalation] ' stepName prefix)
+    so genuine parallel-approver tasks (e.g. Joint Review's two reviewers) are
+    never touched — those are real PENDING tasks the gate already waits on."""
+    rows = (
+        await db.execute(
+            select(WorkflowTask)
+            .where(WorkflowTask.instanceId == instance_id)
+            .where(WorkflowTask.stepId == step_id)
+            .where(WorkflowTask.status.in_(OPEN_TASK_STATUSES))
+            .where(WorkflowTask.stepName.like("[Escalation]%"))
+        )
+    ).scalars().all()
+    closed = 0
+    now = datetime.now(timezone.utc)
+    for t in rows:
+        if t.id == except_task_id:
             continue
         t.status = TaskStatus.SKIPPED.value
         t.completedAt = now
@@ -885,6 +929,13 @@ async def _advance(
             "advancedTo": None,
         }
 
+    # Gate cleared — no PENDING work remains on this step. Retire any leftover
+    # SLA-escalation nudge tasks raised against this step so they don't linger
+    # in the escalation-role holder's inbox after the work is finished.
+    await _close_escalation_siblings(
+        db, instance_id=instance.id, step_id=current_step.id, except_task_id=task.id
+    )
+
     # All tasks on this step are done — advance the instance to the next
     # applicable step.
     next_step = _find_next_applicable_step(steps, current_step.sequence, record_data)
@@ -978,8 +1029,8 @@ async def approve(
     plant_id: str | None = None,
 ) -> dict[str, Any]:
     task, instance, steps = await _load_task_with_definition(db, task_id)
-    if task.status != TaskStatus.PENDING.value:
-        raise WorkflowError("Task is not pending")
+    if task.status not in OPEN_TASK_STATUSES:
+        raise WorkflowError("Task is not open")
     current_step = next((s for s in steps if s.id == task.stepId), None)
     if current_step is None:
         raise WorkflowError("Step missing")
@@ -1035,8 +1086,8 @@ async def reject(
     comments: str | None = None,
 ) -> dict[str, Any]:
     task, instance, steps = await _load_task_with_definition(db, task_id)
-    if task.status != TaskStatus.PENDING.value:
-        raise WorkflowError("Task is not pending")
+    if task.status not in OPEN_TASK_STATUSES:
+        raise WorkflowError("Task is not open")
     current_step = next((s for s in steps if s.id == task.stepId), None)
     if current_step is None:
         raise WorkflowError("Step missing")
@@ -1075,8 +1126,8 @@ async def submit_execution(
     plant_id: str | None = None,
 ) -> dict[str, Any]:
     task, instance, steps = await _load_task_with_definition(db, task_id)
-    if task.status != TaskStatus.PENDING.value:
-        raise WorkflowError("Task is not pending")
+    if task.status not in OPEN_TASK_STATUSES:
+        raise WorkflowError("Task is not open")
     current_step = next((s for s in steps if s.id == task.stepId), None)
     if current_step is None:
         raise WorkflowError("Step missing")
@@ -1124,8 +1175,8 @@ async def verify(
     plant_id: str | None = None,
 ) -> dict[str, Any]:
     task, instance, steps = await _load_task_with_definition(db, task_id)
-    if task.status != TaskStatus.PENDING.value:
-        raise WorkflowError("Task is not pending")
+    if task.status not in OPEN_TASK_STATUSES:
+        raise WorkflowError("Task is not open")
     current_step = next((s for s in steps if s.id == task.stepId), None)
     if current_step is None:
         raise WorkflowError("Step missing")

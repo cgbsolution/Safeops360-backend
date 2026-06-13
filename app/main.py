@@ -17,14 +17,12 @@ from app.routers import (
     agents,
     agents_config,
     anomalies,
-    audit_mgmt,
+    audit_compliance,
     auth,
     capa,
     competency,
     dashboard,
-    deviations,
     devices,
-    document_control,
     eai,
     epc_contractors,
     epc_dashboard,
@@ -33,8 +31,6 @@ from app.routers import (
     epc_mobilization,
     epc_sites,
     epc_workers,
-    oos,
-    part11,
     plants,
     flra,
     hira,
@@ -129,11 +125,7 @@ def create_app() -> FastAPI:
     app.include_router(epc_gate.router)
     app.include_router(epc_induction.router)
     app.include_router(epc_dashboard.router)
-    app.include_router(part11.router)
-    app.include_router(deviations.router)
-    app.include_router(document_control.router)
-    app.include_router(oos.router)
-    app.include_router(audit_mgmt.router)
+    app.include_router(audit_compliance.router)
     app.include_router(devices.router)
     app.include_router(plants.router)
     app.include_router(dashboard.router)

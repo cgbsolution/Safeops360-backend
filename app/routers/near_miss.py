@@ -1104,6 +1104,116 @@ async def update_capa(
     return _capa_to_dict(capa)
 
 
+# ─── AI assist: draft a CAPA-execution narrative ──────────────────────
+
+_CAPA_EXECUTION_DRAFT_PROMPT = """You are SafeOps360's CAPA Execution assistant. \
+A near-miss has been reviewed and a corrective/preventive action (CAPA) has been \
+assigned to a frontline owner to carry out. Your job is to draft, in the FIRST \
+PERSON, the "action narrative" that the action owner records when they submit \
+their completed task — i.e. a concise, concrete account of what corrective action \
+was taken to close out this near-miss, the result observed, and any follow-up.
+
+You are given the near-miss facts as JSON (description, the activity, immediate \
+action already taken, the reporter's recommended actions, which controls failed / \
+worked, severity/risk, hazard, and any specific CAPAs assigned). Ground the draft \
+in those facts. If the owner has typed something in "userTypedSoFar", build on it \
+rather than discarding it.
+
+Output JSON ONLY with EXACTLY these keys:
+{
+  "narrative": "<3-6 sentences, first person, past tense, specific and practical>",
+  "evidenceDescription": "<one short line naming the evidence the owner should attach, e.g. 'Photo of installed guard + signed toolbox-talk register'>"
+}
+
+Rules:
+  • Be specific and operational — name the actual control installed/changed, not generic safety platitudes.
+  • Do NOT invent fabricated measurements, dates, names, or sign-offs. Describe the action, leave specifics for the owner to confirm.
+  • This is a DRAFT for a human to review and edit before submitting. Keep it realistic and conservative.
+  • Output JSON only. No prose around it."""
+
+
+@router.post("/{nm_id}/capa-execution-draft")
+async def ai_capa_execution_draft(
+    nm_id: str,
+    payload: dict[str, Any] | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """AI assist for the CAPA Execution step. Drafts a first-person action
+    narrative (plus a one-line evidence suggestion) from the near-miss facts so
+    the assignee starts from a reviewable draft instead of a blank box. Advisory
+    only — the user edits before submitting. Fails SOFT: returns
+    {"ok": False, "reason": ...} when AI is unconfigured or the call fails, so
+    the UI just falls back to the manual flow (never a 500)."""
+    import json as _json
+
+    from app.core.config import get_settings
+    from app.models.near_miss_children import NearMissCapa
+    from app.services.ai.anthropic_client import complete_json, is_configured
+
+    nm = await db.get(NearMiss, nm_id)
+    if nm is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Near miss not found")
+    record = {"reporterId": nm.reporterId, "actionOwnerId": nm.actionOwnerId}
+    result = await can(
+        db, user.id, "NEAR_MISS.READ",
+        PermissionContext(record_id=nm.id, plant_id=nm.plantId, record=record),
+    )
+    if not result.allowed and not await _is_workflow_actor(db, user.id, nm_id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    if not is_configured():
+        return {"ok": False, "reason": "AI assist is not configured on this server."}
+
+    hint = ""
+    if payload:
+        hint = str(payload.get("hint") or payload.get("draft") or "").strip()
+
+    capas = (
+        await db.execute(
+            select(NearMissCapa)
+            .where(NearMissCapa.nearMissId == nm_id)
+            .order_by(NearMissCapa.createdAt)
+        )
+    ).scalars().all()
+
+    context = {
+        "location": nm.specificLocation or nm.location,
+        "description": nm.description,
+        "activity": nm.activity or nm.activityBeingPerformed,
+        "immediateActionTaken": nm.immediateAction,
+        "reporterRecommendedActions": nm.recommendedActions,
+        "controlsThatFailed": nm.controlsThatFailed,
+        "controlsThatWorked": nm.controlsThatWorked,
+        "potentialSeverity": getattr(nm.potentialSeverity, "value", nm.potentialSeverity),
+        "riskLevel": nm.riskLevel,
+        "hazardCategory": nm.hazardCategory,
+        "energySource": nm.energySource,
+        "assignedCapas": [{"description": c.description, "type": c.type} for c in capas],
+        "userTypedSoFar": hint or None,
+    }
+
+    drafted = await complete_json(
+        system=_CAPA_EXECUTION_DRAFT_PROMPT,
+        user=_json.dumps(context, default=str, indent=2),
+        max_tokens=600,
+        temperature=0.3,
+    )
+    if drafted is None:
+        return {"ok": False, "reason": "The AI draft could not be generated — please write the narrative manually."}
+
+    narrative = str(drafted.get("narrative") or "").strip()
+    evidence = str(drafted.get("evidenceDescription") or "").strip()
+    if not narrative:
+        return {"ok": False, "reason": "The AI returned an empty draft — please write the narrative manually."}
+    return {
+        "ok": True,
+        "narrative": narrative,
+        "evidenceDescription": evidence or None,
+        "model": get_settings().anthropic_model,
+    }
+
+
 # ─── Comments ─────────────────────────────────────────────────────────
 
 
