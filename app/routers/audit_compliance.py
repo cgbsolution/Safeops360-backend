@@ -30,6 +30,7 @@ from app.services.permissions import (
 from app.services.storage import (
     create_signed_download_url,
     create_signed_upload_url,
+    delete_storage_object,
     is_storage_configured,
 )
 
@@ -243,6 +244,25 @@ async def view_url(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Could not sign photo: {e}") from e
     return {"url": url}
+
+
+@router.post("/delete-photo")
+async def delete_photo(
+    body: ViewUrlBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Remove a photo object from storage (so a removed/replaced photo isn't
+    left orphaned). Best-effort — the caller also drops it from the response."""
+    await _require(db, user, "AUDIT_COMPLIANCE.READ")
+    if not body.storagePath or not body.storagePath.startswith("audit-compliance/"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid storage path")
+    try:
+        delete_storage_object(body.storagePath)
+    except Exception as e:  # noqa: BLE001
+        # Non-fatal — the record-level removal still succeeds.
+        return {"ok": False, "warning": str(e)[:140]}
+    return {"ok": True}
 
 
 @router.get("/{audit_id}")

@@ -62,6 +62,20 @@ async def _is_workflow_actor(db: AsyncSession, user_id: str, observation_id: str
     return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 
+async def _has_uploaded_attachment(db: AsyncSession, user_id: str, observation_id: str) -> bool:
+    """True if the caller uploaded at least one (non-deleted) attachment to
+    this observation. Whoever contributes evidence must always be able to see
+    it back in the gallery, even without an OBSERVATION.READ grant."""
+    stmt = (
+        select(ObservationAttachment.id)
+        .where(ObservationAttachment.observationId == observation_id)
+        .where(ObservationAttachment.uploadedById == user_id)
+        .where(ObservationAttachment.deletedAt.is_(None))
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
 @router.get("", response_model=ObservationListResponse)
 async def list_observations(
     status_filter: str | None = None,
@@ -405,7 +419,15 @@ async def list_attachments(
         db, user.id, "OBSERVATION.READ",
         PermissionContext(record_id=obs.id, plant_id=obs.plantId, record=record),
     )
-    if not result.allowed and not await _is_workflow_actor(db, user.id, observation_id):
+    # The observer and anyone who uploaded evidence here can always see the
+    # gallery, even without an OBSERVATION.READ grant — so an uploader never
+    # loses sight of their own contribution.
+    if (
+        not result.allowed
+        and obs.observerId != user.id
+        and not await _is_workflow_actor(db, user.id, observation_id)
+        and not await _has_uploaded_attachment(db, user.id, observation_id)
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
 
     rows = (
@@ -557,15 +579,20 @@ async def download_attachment(
     if att is None or att.observationId != observation_id or att.deletedAt is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
     obs = await db.get(Observation, observation_id)
+    # The uploader can always view their own file — mirrors delete_attachment's
+    # is_uploader bypass so the person who uploaded a photo can preview it even
+    # without an OBSERVATION.READ grant.
+    is_uploader = att.uploadedById == user.id
     record = {
         "observerId": obs.observerId if obs else None,
         "responsiblePersonId": obs.responsiblePersonId if obs else None,
+        "uploadedById": att.uploadedById,
     }
     result = await can(
         db, user.id, "OBSERVATION.READ",
         PermissionContext(record_id=obs.id if obs else None, plant_id=obs.plantId if obs else None, record=record),
     )
-    if not result.allowed and not await _is_workflow_actor(db, user.id, observation_id):
+    if not result.allowed and not is_uploader and not await _is_workflow_actor(db, user.id, observation_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     url = create_signed_download_url(
         att.storagePath,

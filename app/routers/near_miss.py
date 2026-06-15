@@ -753,6 +753,21 @@ async def _is_workflow_actor(db: AsyncSession, user_id: str, near_miss_id: str) 
     return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 
+async def _has_uploaded_attachment(db: AsyncSession, user_id: str, near_miss_id: str) -> bool:
+    """True if the caller uploaded at least one (non-deleted) attachment to
+    this near miss. Whoever contributes evidence must always be able to see
+    it back in the gallery — even a reporter who only holds NEAR_MISS.CREATE
+    (no READ grant) and is no longer the pending workflow actor."""
+    stmt = (
+        select(NearMissAttachment.id)
+        .where(NearMissAttachment.nearMissId == near_miss_id)
+        .where(NearMissAttachment.uploadedById == user_id)
+        .where(NearMissAttachment.deletedAt.is_(None))
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
 @router.get("/{nm_id}/attachments")
 async def list_attachments(
     nm_id: str,
@@ -767,7 +782,15 @@ async def list_attachments(
         db, user.id, "NEAR_MISS.READ",
         PermissionContext(record_id=nm.id, plant_id=nm.plantId, record=record),
     )
-    if not result.allowed and not await _is_workflow_actor(db, user.id, nm_id):
+    # The reporter and anyone who uploaded evidence here can always see the
+    # gallery, even without a NEAR_MISS.READ grant — mirrors the upload-side
+    # bypass so an uploader never loses sight of their own contribution.
+    if (
+        not result.allowed
+        and nm.reporterId != user.id
+        and not await _is_workflow_actor(db, user.id, nm_id)
+        and not await _has_uploaded_attachment(db, user.id, nm_id)
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
 
     rows = (
@@ -914,15 +937,20 @@ async def download_attachment(
     if att is None or att.nearMissId != nm_id or att.deletedAt is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
     nm = await db.get(NearMiss, nm_id)
+    # The uploader can always view their own file — they put it there. This
+    # mirrors delete_attachment's is_uploader bypass and guarantees the person
+    # who uploaded a photo can preview it even without a NEAR_MISS.READ grant.
+    is_uploader = att.uploadedById == user.id
     record = {
         "reporterId": nm.reporterId if nm else None,
         "actionOwnerId": nm.actionOwnerId if nm else None,
+        "uploadedById": att.uploadedById,
     }
     result = await can(
         db, user.id, "NEAR_MISS.READ",
         PermissionContext(record_id=nm.id if nm else None, plant_id=nm.plantId if nm else None, record=record),
     )
-    if not result.allowed and not await _is_workflow_actor(db, user.id, nm_id):
+    if not result.allowed and not is_uploader and not await _is_workflow_actor(db, user.id, nm_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     url = create_signed_download_url(
         att.storagePath,
@@ -934,10 +962,35 @@ async def download_attachment(
 
 # ─── CAPAs ─────────────────────────────────────────────────────────────
 # Read-list is open to anyone who can read the parent near miss.
-# Create: HSE Manager during step 3 (Review Meeting & CAPA Definition).
+# Create: ONLY the actor assigned the step-3 "Review Meeting & CAPA Definition"
+#         task — not every HSE Manager. The workflow assignment is the rule.
 # PATCH: owner submits completion / verifier approves-or-rejects.
 
 from app.models.near_miss_children import NearMissCapa, NearMissComment
+
+# Step name (from the seeded workflow definition) at which CAPAs are defined.
+# Kept in sync with the frontend gate in near-miss/[id]/page.tsx.
+CAPA_DEFINITION_STEP = "Review Meeting & CAPA Definition"
+_OPEN_TASK_STATUSES = ("PENDING", "OVERDUE", "ESCALATED")
+
+
+async def _is_capa_definition_actor(db: AsyncSession, user_id: str, near_miss_id: str) -> bool:
+    """True only if the caller currently holds the OPEN
+    "Review Meeting & CAPA Definition" task for this near miss. That assignee
+    is the single person allowed to define CAPAs — being an HSE Manager or
+    having taken some earlier step in the workflow is not enough."""
+    from app.models.workflow import WorkflowTask
+
+    stmt = (
+        select(WorkflowTask.id)
+        .where(WorkflowTask.module == "NEAR_MISS")
+        .where(WorkflowTask.recordId == near_miss_id)
+        .where(WorkflowTask.assignedToId == user_id)
+        .where(WorkflowTask.stepName == CAPA_DEFINITION_STEP)
+        .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 
 def _capa_to_dict(c: NearMissCapa) -> dict[str, Any]:
@@ -996,19 +1049,18 @@ async def create_capa(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """HSE Manager (or anyone with NEAR_MISS.APPROVE) defines a CAPA
-    during the Review Meeting & CAPA Definition step. Multiple CAPAs
+    """The actor assigned the step-3 "Review Meeting & CAPA Definition" task
+    defines the CAPAs. Restricted to that assignee — not every HSE Manager and
+    not the reporter — so it follows the workflow assignment. Multiple CAPAs
     fan out into parallel execution tasks at the next step."""
     nm = await db.get(NearMiss, nm_id)
     if nm is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Near miss not found")
-    record = {"reporterId": nm.reporterId, "actionOwnerId": nm.actionOwnerId}
-    result = await can(
-        db, user.id, "NEAR_MISS.APPROVE",
-        PermissionContext(record_id=nm.id, plant_id=nm.plantId, record=record),
-    )
-    if not result.allowed and not await _is_workflow_actor(db, user.id, nm_id):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    if not await _is_capa_definition_actor(db, user.id, nm_id):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the reviewer assigned the Review Meeting & CAPA Definition step can define CAPAs.",
+        )
 
     description = str(payload.get("description") or "").strip()
     capa_type = str(payload.get("type") or "CORRECTIVE").upper()

@@ -1328,6 +1328,20 @@ async def reclassify_incident(
 # ─── Attachments ─────────────────────────────────────────────────────────
 
 
+async def _has_uploaded_attachment(db: AsyncSession, user_id: str, incident_id: str) -> bool:
+    """True if the caller uploaded at least one (non-deleted) attachment to
+    this incident. Whoever contributes evidence must always be able to see it
+    back in the gallery, even without an INCIDENT.READ grant."""
+    stmt = (
+        select(IncidentAttachment.id)
+        .where(IncidentAttachment.incidentId == incident_id)
+        .where(IncidentAttachment.uploadedById == user_id)
+        .where(IncidentAttachment.deletedAt.is_(None))
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
 @router.get("/{incident_id}/attachments")
 async def list_attachments(
     incident_id: str,
@@ -1342,7 +1356,14 @@ async def list_attachments(
         db, user.id, "INCIDENT.READ",
         PermissionContext(record_id=incident.id, plant_id=incident.plantId, record=record),
     )
-    if not result.allowed:
+    # The reporter and anyone who uploaded evidence here can always see the
+    # gallery, even without an INCIDENT.READ grant — so an uploader never loses
+    # sight of their own contribution.
+    if (
+        not result.allowed
+        and incident.reporterId != user.id
+        and not await _has_uploaded_attachment(db, user.id, incident_id)
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
 
     rows = (
@@ -1472,12 +1493,15 @@ async def download_attachment(
     if att is None or att.incidentId != incident_id or att.deletedAt is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
     incident = await db.get(Incident, incident_id)
-    record = {"reporterId": incident.reporterId if incident else None}
+    # The uploader can always view their own file — guarantees the person who
+    # uploaded a photo can preview it even without an INCIDENT.READ grant.
+    is_uploader = att.uploadedById == user.id
+    record = {"reporterId": incident.reporterId if incident else None, "uploadedById": att.uploadedById}
     result = await can(
         db, user.id, "INCIDENT.READ",
         PermissionContext(record_id=incident.id if incident else None, plant_id=incident.plantId if incident else None, record=record),
     )
-    if not result.allowed:
+    if not result.allowed and not is_uploader:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     url = create_signed_download_url(
         att.storagePath,

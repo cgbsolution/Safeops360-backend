@@ -19,11 +19,16 @@ from app.routers import (
     anomalies,
     audit_compliance,
     auth,
+    cams,
     capa,
     competency,
     dashboard,
     devices,
     eai,
+    erm,
+    erm_p2,
+    erm_p3,
+    erm_t3,
     epc_contractors,
     epc_dashboard,
     epc_gate,
@@ -109,6 +114,10 @@ def create_app() -> FastAPI:
     app.include_router(hira.router)
     app.include_router(capa.router)
     app.include_router(eai.router)
+    app.include_router(erm.router)
+    app.include_router(erm_p2.router)
+    app.include_router(erm_p3.router)
+    app.include_router(erm_t3.router)
     app.include_router(competency.router)
     app.include_router(moc.router)
     app.include_router(risk_register.router)
@@ -126,6 +135,7 @@ def create_app() -> FastAPI:
     app.include_router(epc_induction.router)
     app.include_router(epc_dashboard.router)
     app.include_router(audit_compliance.router)
+    app.include_router(cams.router)
     app.include_router(devices.router)
     app.include_router(plants.router)
     app.include_router(dashboard.router)
