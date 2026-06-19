@@ -110,6 +110,14 @@ from app.models.erm_t3 import (
     VendorProfile,
     VendorScoringConfig,
 )
+from app.models.factory import (
+    Building,
+    FactoryCertification,
+    FactoryContact,
+    FactoryProfile,
+    ProductionProcess,
+    WorkforceComposition,
+)
 from app.models.flra import FLRA, FLRACrewSignature, FLRAStatus, FLRATeamMember
 from app.models.eai import (
     EaiAspect,
@@ -282,6 +290,12 @@ __all__ = [
     "CamsTemplateQuestion",
     "CamsTemplateSection",
     "Equipment",
+    "Building",
+    "FactoryProfile",
+    "FactoryCertification",
+    "FactoryContact",
+    "ProductionProcess",
+    "WorkforceComposition",
     "BcExercise",
     "BusinessProcess",
     "CallTree",

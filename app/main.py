@@ -36,6 +36,7 @@ from app.routers import (
     epc_mobilization,
     epc_sites,
     epc_workers,
+    factory,
     plants,
     flra,
     hira,
@@ -136,6 +137,7 @@ def create_app() -> FastAPI:
     app.include_router(epc_dashboard.router)
     app.include_router(audit_compliance.router)
     app.include_router(cams.router)
+    app.include_router(factory.router)
     app.include_router(devices.router)
     app.include_router(plants.router)
     app.include_router(dashboard.router)
