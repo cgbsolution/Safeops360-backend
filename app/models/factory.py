@@ -83,6 +83,8 @@ class FactoryProfile(Base, IdMixin):
     certifications: Mapped[list["FactoryCertification"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
     contacts: Mapped[list["FactoryContact"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
     complianceSnapshots: Mapped[list["FactoryComplianceSnapshot"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
+    envPeriods: Mapped[list["FactoryEnvPeriod"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
+    socialCompliance: Mapped["SocialComplianceProfile | None"] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan", uselist=False)
 
     createdAt: Mapped[datetime] = _created()
     createdBy: Mapped[str | None] = mapped_column(String)
@@ -147,6 +149,14 @@ class WorkforceComposition(Base, IdMixin):
     migrantWorkerCount: Mapped[int | None] = mapped_column(Integer)
     differentlyAbledCount: Mapped[int | None] = mapped_column(Integer)
     totalCount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # child-labour evidence (SA8000 Element 1)
+    youngestWorkerAge: Mapped[int | None] = mapped_column(Integer)
+    workersUnder18Count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    minHiringAgePolicy: Mapped[int | None] = mapped_column(Integer)
+    # derived (persisted for fast export)
+    contractPct: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    femalePct: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    migrantPct: Mapped[float | None] = mapped_column(Float)
     notes: Mapped[str | None] = mapped_column(Text)
 
     factoryProfile: Mapped["FactoryProfile"] = relationship(back_populates="workforceCompositions")
@@ -279,4 +289,114 @@ class FactoryComplianceSnapshot(Base, IdMixin):
     __table_args__ = (
         Index("ix_FactoryComplianceSnapshot_profile_period", "factoryProfileId", "periodLabel", unique=True),
         Index("ix_FactoryComplianceSnapshot_siteId", "siteId"),
+    )
+
+
+# ── Factory Environmental Period (ESG operational source — one row/site/period) ─
+class FactoryEnvPeriod(Base, IdMixin):
+    """Minimal environmental-data source for the facility ESG rollup. This is a
+    genuine source-of-truth table (the "ESG module" the facility tab reads from),
+    NOT a rollup cache: one row per (site, period) holds the energy / water /
+    effluent / waste / emissions totals + targets the Environmental Operational
+    rollup surfaces. A site with no rows ⇒ the tab renders the neutral
+    "Environmental data — module not enabled" tile (graceful absence). A fuller
+    ESG capture UI is roadmap; for now rows are seeded / API-managed."""
+
+    __tablename__ = "FactoryEnvPeriod"
+
+    factoryProfileId: Mapped[str] = mapped_column(ForeignKey("FactoryProfile.id", ondelete="CASCADE"), nullable=False)
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+    periodLabel: Mapped[str] = mapped_column(String, nullable=False)  # e.g. "2026-Q2"
+
+    # Energy
+    energyKwh: Mapped[float | None] = mapped_column(Float)
+    energyIntensity: Mapped[float | None] = mapped_column(Float)  # kWh / unit output
+    energyTargetKwh: Mapped[float | None] = mapped_column(Float)
+    # Water + effluent (garment-critical)
+    waterWithdrawnKl: Mapped[float | None] = mapped_column(Float)
+    effluentDischargedKl: Mapped[float | None] = mapped_column(Float)
+    etpStatus: Mapped[str | None] = mapped_column(String)  # COMPLIANT | NON_COMPLIANT | NOT_MONITORED
+    consentStatus: Mapped[str | None] = mapped_column(String)  # free-text mirror of SPCB consent standing
+    # Waste
+    wasteGeneratedT: Mapped[float | None] = mapped_column(Float)
+    wasteDivertedPct: Mapped[float | None] = mapped_column(Float)
+    wasteDivertedTargetPct: Mapped[float | None] = mapped_column(Float)
+    # Emissions
+    scope1TCo2e: Mapped[float | None] = mapped_column(Float)
+    scope2TCo2e: Mapped[float | None] = mapped_column(Float)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    factoryProfile: Mapped["FactoryProfile"] = relationship(back_populates="envPeriods")
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_FactoryEnvPeriod_profile_period", "factoryProfileId", "periodLabel", unique=True),
+        Index("ix_FactoryEnvPeriod_siteId", "siteId"),
+    )
+
+
+# ── Social-Compliance Profile (SA8000 policy/standing; 1:1 with factory) ─────
+class SocialComplianceProfile(Base, IdMixin):
+    """The less-volatile attributes a buyer social-compliance audit (SA8000 /
+    WRAP / BSCI / SMETA) checks — wages, working hours, freedom of association,
+    forced labour, grievance, training — separate from the dated headcount.
+    ComplianceFlag columns hold COMPLIANT | ATTENTION | NON_COMPLIANT |
+    NOT_ASSESSED; `overallSocialComplianceFlag` is the persisted worst-of
+    (computed on write)."""
+
+    __tablename__ = "SocialComplianceProfile"
+
+    factoryProfileId: Mapped[str] = mapped_column(
+        ForeignKey("FactoryProfile.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+    asOfDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Remuneration (Element 8)
+    minimumWageCompliant: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+    lowestMonthlyWageInr: Mapped[int | None] = mapped_column(Integer)
+    statutoryMinimumWageInr: Mapped[int | None] = mapped_column(Integer)
+    wagesPaidOnTime: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+
+    # Working Hours (Element 7)
+    standardWeeklyHours: Mapped[int | None] = mapped_column(Integer)
+    maxWeeklyOvertimeHours: Mapped[int | None] = mapped_column(Integer)
+    overtimeVoluntary: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+    weeklyRestDayProvided: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+
+    # Freedom of Association (Element 4)
+    unionOrWorkerCommitteePresent: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+    collectiveBargainingAgreement: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Forced Labour (Element 2)
+    noDepositOrDocumentRetention: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+
+    # Disciplinary & Grievance (Elements 5, 6, 9)
+    grievanceMechanismPresent: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+    antiDiscriminationPolicy: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+
+    # Management System / Training (Element 9)
+    sa8000AwarenessTrainingPct: Mapped[float | None] = mapped_column(Float)
+    socialComplianceOwnerId: Mapped[str | None] = mapped_column(String)
+    lastSocialAuditDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    nextReviewDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    overallSocialComplianceFlag: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+
+    factoryProfile: Mapped["FactoryProfile"] = relationship(back_populates="socialCompliance")
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_SocialComplianceProfile_factoryProfileId", "factoryProfileId", unique=True),
+        Index("ix_SocialComplianceProfile_siteId", "siteId"),
     )

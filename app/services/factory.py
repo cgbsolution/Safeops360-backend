@@ -127,6 +127,100 @@ def cert_is_expiring(status: str) -> bool:
     return status in ("EXPIRING_SOON", "EXPIRED")
 
 
+def workforce_derived_pcts(
+    *, total: int, contract: int, female: int, gender_total: int, migrant: int | None
+) -> tuple[float, float, float | None]:
+    """Persisted register percentages. contract% / migrant% are a share of total
+    headcount; female% is a share of the gender split (matches the SA8000 welfare
+    lens on the Workforce tab)."""
+    contract_pct = round(contract / total * 100, 1) if total else 0.0
+    female_pct = round(female / gender_total * 100, 1) if gender_total else 0.0
+    migrant_pct = round(migrant / total * 100, 1) if (migrant is not None and total) else None
+    return contract_pct, female_pct, migrant_pct
+
+
+def apply_workforce_derived(comp: WorkforceComposition) -> None:
+    """Recompute + persist contractPct / femalePct / migrantPct on a composition
+    from its counts (call after the counts are set)."""
+    gender_total = comp.maleCount + comp.femaleCount + comp.otherGenderCount
+    comp.contractPct, comp.femalePct, comp.migrantPct = workforce_derived_pcts(
+        total=comp.totalCount, contract=comp.contractCount, female=comp.femaleCount,
+        gender_total=gender_total, migrant=comp.migrantWorkerCount,
+    )
+
+
+def child_labour_flag(
+    youngest_worker_age: int | None, workers_under_18_count: int | None, min_hiring_age_policy: int | None
+) -> bool:
+    """SA8000 Element 1. Raised when legally-young workers are present AND the
+    youngest is below the factory's own minimum hiring-age policy — the single
+    most scrutinised SA8000 item. Missing age/policy with under-18 present is
+    flagged conservatively (an exception worth checking)."""
+    if not workers_under_18_count or workers_under_18_count <= 0:
+        return False
+    if youngest_worker_age is None or min_hiring_age_policy is None:
+        return True
+    return youngest_worker_age < min_hiring_age_policy
+
+
+# ── social-compliance flag engine (SA8000) ───────────────────────────────────
+# Element ComplianceFlag fields that feed the overall worst-of computation.
+SOCIAL_ELEMENT_FIELDS = (
+    "minimumWageCompliant",
+    "wagesPaidOnTime",
+    "overtimeVoluntary",
+    "weeklyRestDayProvided",
+    "unionOrWorkerCommitteePresent",
+    "noDepositOrDocumentRetention",
+    "grievanceMechanismPresent",
+    "antiDiscriminationPolicy",
+)
+_FLAG_RANK = {"NON_COMPLIANT": 3, "ATTENTION": 2, "COMPLIANT": 1, "NOT_ASSESSED": 0}
+SA8000_OVERTIME_CAP = 12  # SA8000 guidance — max 12 OT hours/week
+
+
+def worst_flag(flags) -> str:
+    """Worst-of across element flags. NON_COMPLIANT > ATTENTION > COMPLIANT.
+    NOT_ASSESSED contributes only when EVERY element is unassessed (so a single
+    assessed COMPLIANT element doesn't get masked by unassessed siblings)."""
+    assessed = [f for f in flags if f and f != "NOT_ASSESSED"]
+    if not assessed:
+        return "NOT_ASSESSED"
+    return max(assessed, key=lambda f: _FLAG_RANK.get(f, 0))
+
+
+def overtime_exceeds_cap(max_weekly_overtime_hours: int | None) -> bool:
+    return max_weekly_overtime_hours is not None and max_weekly_overtime_hours > SA8000_OVERTIME_CAP
+
+
+def compute_overall_social_flag(*, element_flags, max_weekly_overtime_hours: int | None) -> str:
+    """Persisted overall flag = worst-of the element flags, with an OT-cap breach
+    (>12h/week) folding in a Working-Hours ATTENTION. Child-labour is a
+    workforce-driven signal layered on at the register/export level, not here."""
+    flags = list(element_flags)
+    if overtime_exceeds_cap(max_weekly_overtime_hours):
+        flags.append("ATTENTION")
+    return worst_flag(flags)
+
+
+def overall_social_flag_for(profile) -> str:
+    """Convenience: compute the overall flag from a SocialComplianceProfile row."""
+    return compute_overall_social_flag(
+        element_flags=[getattr(profile, f) for f in SOCIAL_ELEMENT_FIELDS],
+        max_weekly_overtime_hours=profile.maxWeeklyOvertimeHours,
+    )
+
+
+def effective_social_flag(overall: str, child_labour: bool) -> str:
+    """The chip shown on the register/export — escalates the persisted overall
+    flag with the workforce-derived child-labour signal. Without child labour the
+    overall flag passes through unchanged (so a factory with no social profile
+    stays NOT_ASSESSED rather than being promoted to COMPLIANT)."""
+    if child_labour:
+        return worst_flag([overall, "ATTENTION"])
+    return overall
+
+
 async def make_workforce_current(db: AsyncSession, profile: FactoryProfile, comp: WorkforceComposition) -> None:
     """Flip every other composition for this profile to historical, mark `comp`
     current, and write the denormalised headcount onto the profile."""

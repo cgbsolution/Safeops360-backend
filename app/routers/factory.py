@@ -30,6 +30,7 @@ from app.models.factory import (
     FactoryContact,
     FactoryProfile,
     ProductionProcess,
+    SocialComplianceProfile,
     WorkforceComposition,
 )
 from app.models.user import User
@@ -74,7 +75,12 @@ def _workforce_out(w: WorkforceComposition) -> S.WorkforceCompositionOut:
     o = S.WorkforceCompositionOut.model_validate(w)
     o.genderTotal = w.maleCount + w.femaleCount + w.otherGenderCount
     o.genderMismatch = o.genderTotal != w.totalCount
+    o.childLabourFlag = svc.child_labour_flag(w.youngestWorkerAge, w.workersUnder18Count, w.minHiringAgePolicy)
     return o
+
+
+def _social_out(s: SocialComplianceProfile) -> S.SocialComplianceProfileOut:
+    return S.SocialComplianceProfileOut.model_validate(s)
 
 
 def _cert_out(c: FactoryCertification) -> S.FactoryCertificationOut:
@@ -126,6 +132,13 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
             .order_by(FactoryContact.isPrimary.desc(), FactoryContact.name.asc())
         )
     ).scalars().all()
+    social = (
+        await db.execute(
+            select(SocialComplianceProfile)
+            .where(SocialComplianceProfile.factoryProfileId == p.id)
+            .where(SocialComplianceProfile.isDeleted.is_(False))
+        )
+    ).scalars().first()
     # Validate the scalar base first (avoids Pydantic touching lazy
     # relationships → async lazy-load outside the greenlet), then attach the
     # explicitly-queried children.
@@ -142,6 +155,7 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
         processes=[S.ProductionProcessOut.model_validate(pr) for pr in processes],
         certifications=cert_outs,
         contacts=[S.FactoryContactOut.model_validate(ct) for ct in contacts],
+        socialCompliance=_social_out(social) if social else None,
     )
 
 
@@ -327,8 +341,11 @@ async def create_profile(body: S.FactoryProfileCreate, user: User = Depends(get_
             permanentCount=w.permanentCount, contractCount=w.contractCount, apprenticeTraineeCount=w.apprenticeTraineeCount,
             maleCount=w.maleCount, femaleCount=w.femaleCount, otherGenderCount=w.otherGenderCount,
             migrantWorkerCount=w.migrantWorkerCount, differentlyAbledCount=w.differentlyAbledCount,
+            youngestWorkerAge=w.youngestWorkerAge, workersUnder18Count=w.workersUnder18Count,
+            minHiringAgePolicy=w.minHiringAgePolicy,
             totalCount=total, notes=w.notes, createdBy=user.id,
         )
+        svc.apply_workforce_derived(comp)
         db.add(comp)
         await db.flush()
         await svc.make_workforce_current(db, p, comp)
@@ -391,7 +408,7 @@ async def delete_profile(profile_id: str, user: User = Depends(get_current_user)
     p.updatedBy = user.id
     # Cascade the soft-delete to children (the DB FK cascade only fires on a
     # HARD delete, so a soft-deleted profile would otherwise leave active orphans).
-    for model in (Building, WorkforceComposition, ProductionProcess, FactoryCertification, FactoryContact):
+    for model in (Building, WorkforceComposition, ProductionProcess, FactoryCertification, FactoryContact, SocialComplianceProfile):
         await db.execute(
             update(model)
             .where(model.factoryProfileId == p.id)
@@ -500,8 +517,11 @@ async def add_workforce(profile_id: str, body: S.WorkforceCompositionCreate, use
         permanentCount=body.permanentCount, contractCount=body.contractCount, apprenticeTraineeCount=body.apprenticeTraineeCount,
         maleCount=body.maleCount, femaleCount=body.femaleCount, otherGenderCount=body.otherGenderCount,
         migrantWorkerCount=body.migrantWorkerCount, differentlyAbledCount=body.differentlyAbledCount,
+        youngestWorkerAge=body.youngestWorkerAge, workersUnder18Count=body.workersUnder18Count,
+        minHiringAgePolicy=body.minHiringAgePolicy,
         totalCount=total, notes=body.notes, createdBy=user.id,
     )
+    svc.apply_workforce_derived(comp)
     db.add(comp)
     await db.flush()
     await svc.make_workforce_current(db, p, comp)  # flip prior → historical + write totalEmployees
@@ -693,6 +713,275 @@ async def delete_contact(contact_id: str, user: User = Depends(get_current_user)
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Social-Compliance Profile (SA8000) — 1:1 with the factory; flag engine on write
+# ════════════════════════════════════════════════════════════════════════════
+@router.get("/profiles/{profile_id}/social-compliance", response_model=S.SocialComplianceProfileOut | None)
+async def get_social_compliance(profile_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await _read_profile(db, user, profile_id)
+    s = (
+        await db.execute(
+            select(SocialComplianceProfile)
+            .where(SocialComplianceProfile.factoryProfileId == profile_id)
+            .where(SocialComplianceProfile.isDeleted.is_(False))
+        )
+    ).scalars().first()
+    return _social_out(s) if s else None
+
+
+@router.post("/profiles/{profile_id}/social-compliance", response_model=S.SocialComplianceProfileOut)
+async def upsert_social_compliance(profile_id: str, body: S.SocialComplianceProfileUpsert, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Create-or-update the (1:1) social-compliance profile. Only supplied fields
+    are written; the overall flag is recomputed (worst-of elements + OT cap)."""
+    p = await db.get(FactoryProfile, profile_id)
+    if not p or p.isDeleted:
+        raise HTTPException(404, "Factory profile not found")
+    await _require(db, user, "FACILITY.SOCIAL_UPDATE", plant_id=p.siteId)
+    s = (
+        await db.execute(
+            select(SocialComplianceProfile)
+            .where(SocialComplianceProfile.factoryProfileId == profile_id)
+            .where(SocialComplianceProfile.isDeleted.is_(False))
+        )
+    ).scalars().first()
+    data = body.model_dump(exclude_unset=True)
+    if s is None:
+        s = SocialComplianceProfile(
+            factoryProfileId=p.id, siteId=p.siteId, asOfDate=data.get("asOfDate") or _now(), createdBy=user.id,
+        )
+        db.add(s)
+    for k, v in data.items():
+        if k == "asOfDate" and v is None:
+            continue
+        setattr(s, k, v)
+    if s.asOfDate is None:
+        s.asOfDate = _now()
+    s.overallSocialComplianceFlag = svc.overall_social_flag_for(s)
+    s.updatedBy = user.id
+    await db.commit()
+    await db.refresh(s)
+    return _social_out(s)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Group registers (W-01 register view + the three Reports-tile CSV exports)
+# ════════════════════════════════════════════════════════════════════════════
+async def _scoped_profiles(db: AsyncSession, user: User, state: str | None):
+    """Tenant-scoped, optionally state-filtered factory list (mirrors list_profiles
+    scoping). Returns None when the user has no plant access (caller returns empty)."""
+    accessible = await get_accessible_plants(db, user.id)
+    if accessible is not None and not accessible:
+        return None
+    stmt = select(FactoryProfile).where(FactoryProfile.isDeleted.is_(False))
+    if accessible is not None:
+        stmt = stmt.where(FactoryProfile.siteId.in_(accessible))
+    if state:
+        stmt = stmt.where(FactoryProfile.state == state)
+    return (await db.execute(stmt.order_by(FactoryProfile.factoryName.asc()))).scalars().all()
+
+
+def _social_register_row(
+    p: FactoryProfile, w: WorkforceComposition | None, s: SocialComplianceProfile | None
+) -> S.SocialComplianceRegisterRow:
+    total = w.totalCount if w else 0
+    gender_total = (w.maleCount + w.femaleCount + w.otherGenderCount) if w else 0
+    child_labour = (
+        svc.child_labour_flag(w.youngestWorkerAge, w.workersUnder18Count, w.minHiringAgePolicy) if w else False
+    )
+    overall = svc.overall_social_flag_for(s) if s else "NOT_ASSESSED"
+    wage_flag = bool(s) and (
+        s.minimumWageCompliant in ("ATTENTION", "NON_COMPLIANT") or s.wagesPaidOnTime in ("ATTENTION", "NON_COMPLIANT")
+    )
+    foa_flag = bool(s) and s.unionOrWorkerCommitteePresent in ("ATTENTION", "NON_COMPLIANT")
+    overtime_flag = bool(s) and svc.overtime_exceeds_cap(s.maxWeeklyOvertimeHours)
+    return S.SocialComplianceRegisterRow(
+        factoryProfileId=p.id, factoryCode=p.factoryCode, factoryName=p.factoryName, state=p.state, city=p.city,
+        asOfDate=w.asOfDate if w else None,
+        totalWorkforce=total,
+        permanentCount=w.permanentCount if w else 0,
+        permanentPct=round(w.permanentCount / total * 100, 1) if (w and total) else 0,
+        contractCount=w.contractCount if w else 0,
+        contractPct=w.contractPct if w else 0,
+        apprenticeTraineeCount=w.apprenticeTraineeCount if w else 0,
+        maleCount=w.maleCount if w else 0,
+        femaleCount=w.femaleCount if w else 0,
+        femalePct=w.femalePct if w else 0,
+        otherGenderCount=w.otherGenderCount if w else 0,
+        migrantWorkerCount=w.migrantWorkerCount if w else None,
+        migrantPct=w.migrantPct if w else None,
+        differentlyAbledCount=w.differentlyAbledCount if w else None,
+        youngestWorkerAge=w.youngestWorkerAge if w else None,
+        workersUnder18Count=w.workersUnder18Count if w else 0,
+        minHiringAgePolicy=w.minHiringAgePolicy if w else None,
+        childLabourFlag=child_labour,
+        hasSocialProfile=bool(s),
+        minimumWageCompliant=s.minimumWageCompliant if s else "NOT_ASSESSED",
+        lowestMonthlyWageInr=s.lowestMonthlyWageInr if s else None,
+        statutoryMinimumWageInr=s.statutoryMinimumWageInr if s else None,
+        wagesPaidOnTime=s.wagesPaidOnTime if s else "NOT_ASSESSED",
+        standardWeeklyHours=s.standardWeeklyHours if s else None,
+        maxWeeklyOvertimeHours=s.maxWeeklyOvertimeHours if s else None,
+        overtimeVoluntary=s.overtimeVoluntary if s else "NOT_ASSESSED",
+        weeklyRestDayProvided=s.weeklyRestDayProvided if s else "NOT_ASSESSED",
+        unionOrWorkerCommitteePresent=s.unionOrWorkerCommitteePresent if s else "NOT_ASSESSED",
+        collectiveBargainingAgreement=s.collectiveBargainingAgreement if s else False,
+        noDepositOrDocumentRetention=s.noDepositOrDocumentRetention if s else "NOT_ASSESSED",
+        grievanceMechanismPresent=s.grievanceMechanismPresent if s else "NOT_ASSESSED",
+        antiDiscriminationPolicy=s.antiDiscriminationPolicy if s else "NOT_ASSESSED",
+        sa8000AwarenessTrainingPct=s.sa8000AwarenessTrainingPct if s else None,
+        lastSocialAuditDate=s.lastSocialAuditDate if s else None,
+        overallSocialComplianceFlag=overall,
+        wageFlag=wage_flag,
+        overtimeFlag=overtime_flag,
+        foaFlag=foa_flag,
+        effectiveFlag=svc.effective_social_flag(overall, child_labour),
+    )
+
+
+@router.get("/social-compliance/register", response_model=S.SocialComplianceRegisterResponse)
+async def social_compliance_register(state: str | None = Query(None), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """W-01 — group workforce & social-compliance register + roll-ups. Powers the
+    register view AND the Workforce/SA8000 CSV. Tenant-scoped; Factory Managers
+    auto-scoped to their own site."""
+    await _require(db, user, "FACILITY.READ")
+    rows = await _scoped_profiles(db, user, state)
+    if rows is None:
+        return S.SocialComplianceRegisterResponse()
+    profile_ids = [p.id for p in rows]
+    wf_by_profile: dict[str, WorkforceComposition] = {}
+    soc_by_profile: dict[str, SocialComplianceProfile] = {}
+    if profile_ids:
+        wf_rows = (
+            await db.execute(
+                select(WorkforceComposition)
+                .where(WorkforceComposition.factoryProfileId.in_(profile_ids))
+                .where(WorkforceComposition.isCurrent.is_(True))
+                .where(WorkforceComposition.isDeleted.is_(False))
+            )
+        ).scalars().all()
+        wf_by_profile = {w.factoryProfileId: w for w in wf_rows}
+        soc_rows = (
+            await db.execute(
+                select(SocialComplianceProfile)
+                .where(SocialComplianceProfile.factoryProfileId.in_(profile_ids))
+                .where(SocialComplianceProfile.isDeleted.is_(False))
+            )
+        ).scalars().all()
+        soc_by_profile = {s.factoryProfileId: s for s in soc_rows}
+
+    items = [_social_register_row(p, wf_by_profile.get(p.id), soc_by_profile.get(p.id)) for p in rows]
+
+    roll = S.SocialComplianceRollup(factoryCount=len(items))
+    flag_counts: dict[str, int] = {}
+    g_perm = g_contract = g_app = g_male = g_female = g_other = g_migrant = g_dab = 0
+    g_gender_total = 0
+    for r in items:
+        roll.totalWorkforce += r.totalWorkforce
+        g_perm += r.permanentCount
+        g_contract += r.contractCount
+        g_app += r.apprenticeTraineeCount
+        g_male += r.maleCount
+        g_female += r.femaleCount
+        g_other += r.otherGenderCount
+        g_gender_total += r.maleCount + r.femaleCount + r.otherGenderCount
+        g_migrant += r.migrantWorkerCount or 0
+        g_dab += r.differentlyAbledCount or 0
+        flag_counts[r.effectiveFlag] = flag_counts.get(r.effectiveFlag, 0) + 1
+        if r.childLabourFlag:
+            roll.childLabourFlagCount += 1
+        if r.overtimeFlag:
+            roll.overtimeFlagCount += 1
+        if r.wageFlag:
+            roll.wageFlagCount += 1
+        if r.foaFlag:
+            roll.foaFlagCount += 1
+    roll.permanentCount, roll.contractCount, roll.apprenticeTraineeCount = g_perm, g_contract, g_app
+    roll.maleCount, roll.femaleCount, roll.otherGenderCount = g_male, g_female, g_other
+    roll.migrantWorkerCount, roll.differentlyAbledCount = g_migrant, g_dab
+    roll.contractPct = round(g_contract / roll.totalWorkforce * 100, 1) if roll.totalWorkforce else 0
+    roll.femalePct = round(g_female / g_gender_total * 100, 1) if g_gender_total else 0
+    roll.migrantPct = round(g_migrant / roll.totalWorkforce * 100, 1) if roll.totalWorkforce else 0
+    roll.flagCounts = flag_counts
+    return S.SocialComplianceRegisterResponse(items=items, rollup=roll)
+
+
+@router.get("/buildings/register", response_model=S.BuildingRegisterResponse)
+async def buildings_register(state: str | None = Query(None), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Group building register — every building across the (scoped) estate."""
+    await _require(db, user, "FACILITY.READ")
+    rows = await _scoped_profiles(db, user, state)
+    if rows is None:
+        return S.BuildingRegisterResponse()
+    by_id = {p.id: p for p in rows}
+    profile_ids = list(by_id.keys())
+    items: list[S.BuildingRegisterRow] = []
+    total_area = 0.0
+    if profile_ids:
+        b_rows = (
+            await db.execute(
+                select(Building)
+                .where(Building.factoryProfileId.in_(profile_ids))
+                .where(Building.isDeleted.is_(False))
+                .order_by(Building.buildingName.asc())
+            )
+        ).scalars().all()
+        # group by factory then building name for a readable register
+        b_rows = sorted(b_rows, key=lambda b: (by_id[b.factoryProfileId].factoryCode, b.buildingName))
+        for b in b_rows:
+            p = by_id[b.factoryProfileId]
+            total_area += b.areaSqm or 0
+            items.append(S.BuildingRegisterRow(
+                factoryCode=p.factoryCode, factoryName=p.factoryName, state=p.state,
+                buildingName=b.buildingName, buildingType=b.buildingType, floors=b.floors,
+                areaSqm=b.areaSqm, maxOccupancy=b.maxOccupancy, currentOccupancy=b.currentOccupancy,
+                assemblyPoint=b.assemblyPoint, emergencyExits=b.emergencyExits, yearBuilt=b.yearBuilt,
+                occupancyCertificateNo=b.occupancyCertificateNo,
+            ))
+    return S.BuildingRegisterResponse(items=items, buildingCount=len(items), totalAreaSqm=round(total_area, 1))
+
+
+@router.get("/certifications/register", response_model=S.CertificationRegisterResponse)
+async def certifications_register(state: str | None = Query(None), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Group certification register — sorted by expiry ascending so
+    expiring/expired surface at the top; summary counts on the response."""
+    await _require(db, user, "FACILITY.READ")
+    rows = await _scoped_profiles(db, user, state)
+    if rows is None:
+        return S.CertificationRegisterResponse()
+    by_id = {p.id: p for p in rows}
+    profile_ids = list(by_id.keys())
+    items: list[S.CertificationRegisterRow] = []
+    expiring_90 = expired = 0
+    if profile_ids:
+        c_rows = (
+            await db.execute(
+                select(FactoryCertification)
+                .where(FactoryCertification.factoryProfileId.in_(profile_ids))
+                .where(FactoryCertification.isDeleted.is_(False))
+            )
+        ).scalars().all()
+        built = []
+        for c in c_rows:
+            p = by_id[c.factoryProfileId]
+            status = svc.compute_cert_status(c.expiryDate, c.renewalLeadDays, c.status)
+            days = svc.cert_days_to_expiry(c.expiryDate)
+            built.append((c, p, status, days))
+            if status == "EXPIRED":
+                expired += 1
+            elif days is not None and 0 <= days <= 90:
+                expiring_90 += 1
+        # days-to-expiry ascending → expired (negative) then expiring then valid;
+        # certs without an expiry date sort last.
+        built.sort(key=lambda t: (t[3] is None, t[3] if t[3] is not None else 0))
+        for c, p, status, days in built:
+            items.append(S.CertificationRegisterRow(
+                factoryCode=p.factoryCode, factoryName=p.factoryName, state=p.state,
+                certificationType=c.certificationType, certificateNo=c.certificateNo, issuingBody=c.issuingBody,
+                issueDate=c.issueDate, expiryDate=c.expiryDate, status=status, daysToExpiry=days, scopeNotes=c.scopeNotes,
+            ))
+    return S.CertificationRegisterResponse(items=items, certCount=len(items), expiringWithin90Days=expiring_90, expiredCount=expired)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Compliance snapshot (precompute) + live Compliance & Audit tab (Phase D)
 # ════════════════════════════════════════════════════════════════════════════
 @router.post("/snapshots/recompute")
@@ -714,10 +1003,20 @@ async def recompute_snapshots(user: User = Depends(get_current_user), db: AsyncS
 
 
 @router.get("/profiles/{profile_id}/compliance", response_model=S.ComplianceTabResponse)
-async def profile_compliance(profile_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def profile_compliance(
+    profile_id: str,
+    periodRef: str | None = Query(None, description="Quarter ref, e.g. 2026-Q2; defaults to current quarter"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """F-02 Compliance & Audit tab — live read from the existing engines (no
-    duplicate store), each row drillable into its module."""
+    duplicate store), each row drillable into its module. Extended with QoQ deltas
+    (vs the prior-quarter snapshot) and the Environment / Training / Certifications
+    rollup blocks. One slow/failing block degrades only itself (degraded=true)."""
     p = await _read_profile(db, user, profile_id)
+    period_ref = periodRef or snap_svc.quarter_label(_now())
+    prior_ref = snap_svc.prior_quarter_label(period_ref)
+
     m = await snap_svc.compute_site_metrics(db, p.siteId)
     certs_expiring = await snap_svc._certs_expiring(db, p.id)
     detail = await snap_svc.compliance_detail(db, p.siteId)
@@ -727,4 +1026,28 @@ async def profile_compliance(profile_id: str, user: User = Depends(get_current_u
         openObligations=m["openObligations"], overdueObligations=m["overdueObligations"],
         certsExpiringCount=certs_expiring, incidentCount12m=m["incidentCount12m"], lastAuditDate=m["lastAuditDate"],
     )
-    return S.ComplianceTabResponse(metrics=metrics, **detail)
+
+    degraded = False
+
+    async def _safe(coro):
+        nonlocal degraded
+        try:
+            return await coro
+        except Exception:
+            degraded = True
+            return None
+
+    prior = await _safe(snap_svc.prior_metrics(db, p.id, prior_ref))
+    environment = await _safe(snap_svc.env_block(db, p.id, p.siteId, period_ref, prior_ref))
+    training = await _safe(snap_svc.training_block(db, p.siteId))
+    certifications = await _safe(snap_svc.certifications_block(db, p.id, p.siteId))
+    # P2 — social-compliance is garment-gated (None ⇒ omitted); op-risk is live.
+    social = await _safe(snap_svc.social_block(db, p, p.siteId))
+    operational_risk = await _safe(snap_svc.operational_risk_block(db, p.siteId))
+
+    return S.ComplianceTabResponse(
+        metrics=metrics, priorMetrics=prior, periodRef=period_ref, priorPeriodRef=prior_ref,
+        environment=environment, training=training, certifications=certifications,
+        socialCompliance=social, operationalRisk=operational_risk, degraded=degraded,
+        **detail,
+    )

@@ -28,6 +28,7 @@ CertStatusLit = Literal["VALID", "EXPIRING_SOON", "EXPIRED", "UNDER_RENEWAL", "S
 ContactRoleLit = Literal[
     "FACTORY_MANAGER", "SAFETY_OFFICER", "COMPLIANCE_OFFICER", "HR_HEAD", "ENVIRONMENT_OFFICER", "OTHER",
 ]
+ComplianceFlagLit = Literal["COMPLIANT", "ATTENTION", "NON_COMPLIANT", "NOT_ASSESSED"]
 
 
 class RegistrationNo(BaseModel):
@@ -98,6 +99,10 @@ class WorkforceCompositionCreate(BaseModel):
     otherGenderCount: int = Field(0, ge=0)
     migrantWorkerCount: int | None = Field(None, ge=0)
     differentlyAbledCount: int | None = Field(None, ge=0)
+    # child-labour evidence (SA8000 Element 1)
+    youngestWorkerAge: int | None = Field(None, ge=0)
+    workersUnder18Count: int = Field(0, ge=0)
+    minHiringAgePolicy: int | None = Field(None, ge=0)
     notes: str | None = None
 
 
@@ -117,9 +122,18 @@ class WorkforceCompositionOut(BaseModel):
     migrantWorkerCount: int | None = None
     differentlyAbledCount: int | None = None
     totalCount: int
+    # child-labour evidence (SA8000 Element 1)
+    youngestWorkerAge: int | None = None
+    workersUnder18Count: int = 0
+    minHiringAgePolicy: int | None = None
+    # derived (persisted)
+    contractPct: float = 0
+    femalePct: float = 0
+    migrantPct: float | None = None
     # computed enrichment (set in the router)
     genderTotal: int = 0
     genderMismatch: bool = False
+    childLabourFlag: bool = False  # under-18 present AND youngest < min hiring age
     notes: str | None = None
     updatedAt: datetime | None = None
 
@@ -245,6 +259,61 @@ class FactoryContactOut(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Social-Compliance Profile (SA8000 policy/standing — 1:1 with factory)
+# ════════════════════════════════════════════════════════════════════════════
+class SocialComplianceProfileUpsert(BaseModel):
+    """Create-or-update payload. All fields optional so a partial PATCH-style
+    submit only touches the supplied fields; on create, missing flags default to
+    NOT_ASSESSED (handled in the router)."""
+
+    asOfDate: datetime | None = None
+    minimumWageCompliant: ComplianceFlagLit | None = None
+    lowestMonthlyWageInr: int | None = Field(None, ge=0)
+    statutoryMinimumWageInr: int | None = Field(None, ge=0)
+    wagesPaidOnTime: ComplianceFlagLit | None = None
+    standardWeeklyHours: int | None = Field(None, ge=0)
+    maxWeeklyOvertimeHours: int | None = Field(None, ge=0)
+    overtimeVoluntary: ComplianceFlagLit | None = None
+    weeklyRestDayProvided: ComplianceFlagLit | None = None
+    unionOrWorkerCommitteePresent: ComplianceFlagLit | None = None
+    collectiveBargainingAgreement: bool | None = None
+    noDepositOrDocumentRetention: ComplianceFlagLit | None = None
+    grievanceMechanismPresent: ComplianceFlagLit | None = None
+    antiDiscriminationPolicy: ComplianceFlagLit | None = None
+    sa8000AwarenessTrainingPct: float | None = Field(None, ge=0, le=100)
+    socialComplianceOwnerId: str | None = None
+    lastSocialAuditDate: datetime | None = None
+    nextReviewDate: datetime | None = None
+
+
+class SocialComplianceProfileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    factoryProfileId: str
+    siteId: str
+    asOfDate: datetime
+    minimumWageCompliant: str
+    lowestMonthlyWageInr: int | None = None
+    statutoryMinimumWageInr: int | None = None
+    wagesPaidOnTime: str
+    standardWeeklyHours: int | None = None
+    maxWeeklyOvertimeHours: int | None = None
+    overtimeVoluntary: str
+    weeklyRestDayProvided: str
+    unionOrWorkerCommitteePresent: str
+    collectiveBargainingAgreement: bool
+    noDepositOrDocumentRetention: str
+    grievanceMechanismPresent: str
+    antiDiscriminationPolicy: str
+    sa8000AwarenessTrainingPct: float | None = None
+    socialComplianceOwnerId: str | None = None
+    lastSocialAuditDate: datetime | None = None
+    nextReviewDate: datetime | None = None
+    overallSocialComplianceFlag: str
+    updatedAt: datetime | None = None
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Compliance snapshot (live metrics read from existing engines — Phase D)
 # ════════════════════════════════════════════════════════════════════════════
 class SnapshotMetrics(BaseModel):
@@ -261,13 +330,84 @@ class SnapshotMetrics(BaseModel):
     computedAt: datetime | None = None
 
 
+# ── Facility rollup blocks (read-model projection — Compliance & Audit tab) ──
+# Every new block is a LIVE, site-scoped read from an existing engine. The
+# contract below mirrors the build-prompt FacilityMetricProvider shape, kept
+# pragmatic: tiles + drill rows + a neutral/degraded path. `state` drives the RAG
+# colour; `neutral` = not-enabled / no-data (never a zero that reads as a pass).
+TileStateLit = Literal["good", "watch", "breach", "neutral"]
+DeltaDirectionLit = Literal["up", "down", "flat"]
+RowToneLit = Literal["positive", "warning", "critical", "muted"]
+
+
+class ModuleDeepLink(BaseModel):
+    module: str
+    route: str
+    query: dict[str, str] = {}
+
+
+class KpiDelta(BaseModel):
+    priorValue: float | str | None = None
+    direction: DeltaDirectionLit = "flat"
+    # None ⇒ neutral metric (e.g. obligations) — render no RAG tint on the delta.
+    isImprovement: bool | None = None
+    displayPct: float | None = None  # signed % change where meaningful
+
+
+class FacilityTile(BaseModel):
+    id: str
+    label: str
+    value: float | int | str | None = None
+    unit: str | None = None
+    state: TileStateLit = "neutral"
+    delta: KpiDelta | None = None
+    drillTo: ModuleDeepLink | None = None
+
+
+class FacilityRollupRow(BaseModel):
+    id: str
+    primaryText: str
+    secondaryText: str | None = None
+    statusLabel: str | None = None
+    statusTone: RowToneLit = "muted"
+    trailingText: str | None = None
+    drillTo: ModuleDeepLink | None = None
+
+
+class FacilityMetricBlock(BaseModel):
+    domainKey: str                       # 'environment' | 'training' | 'certifications' | ...
+    enabled: bool = True                 # false ⇒ render the neutral "not enabled" card
+    degraded: bool = False               # provider failed ⇒ "data refreshing" badge, not an error
+    title: str
+    caption: str                         # "Live from the … engine — site-scoped."
+    tiles: list[FacilityTile] = []
+    rows: list[FacilityRollupRow] = []
+    emptyText: str | None = None         # enabled but no rows in period
+    notEnabledText: str | None = None    # shown when enabled = false
+    lastRefreshedAt: datetime | None = None
+    drillTo: ModuleDeepLink | None = None
+
+
 class ComplianceTabResponse(BaseModel):
     metrics: SnapshotMetrics
+    # Time dimension — prior-period snapshot the frontend diffs the strip against.
+    priorMetrics: SnapshotMetrics | None = None
+    periodRef: str | None = None         # e.g. "2026-Q2"
+    priorPeriodRef: str | None = None    # e.g. "2026-Q1"
     audits: list[dict] = []
     findings: list[dict] = []
     capas: list[dict] = []
     obligations: list[dict] = []
     incidents: list[dict] = []
+    # New live rollup blocks. Null ⇒ not assembled this request (social is also
+    # null when omitted on non-garment sites).
+    environment: FacilityMetricBlock | None = None       # P1
+    training: FacilityMetricBlock | None = None          # P1
+    certifications: FacilityMetricBlock | None = None     # P1
+    socialCompliance: FacilityMetricBlock | None = None   # P2 — garment-gated
+    operationalRisk: FacilityMetricBlock | None = None    # P2 — live / point-in-time
+    # True if any provider degraded — frontend shows a stale badge, never an error.
+    degraded: bool = False
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -371,6 +511,7 @@ class FactoryProfileDetail(FactoryProfileOut):
     processes: list[ProductionProcessOut] = []
     certifications: list[FactoryCertificationOut] = []
     contacts: list[FactoryContactOut] = []
+    socialCompliance: SocialComplianceProfileOut | None = None
 
 
 class FactoryProfileListResponse(BaseModel):
@@ -385,3 +526,129 @@ class FactoryProfileListResponse(BaseModel):
     groupOverdueCapas: int = 0
     statusCounts: dict[str, int] = {}
     stateCounts: dict[str, int] = {}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Group registers (W-01 register view + the three Reports-tile CSV exports)
+# ════════════════════════════════════════════════════════════════════════════
+class SocialComplianceRegisterRow(BaseModel):
+    """One factory: current workforce + social-compliance profile, flattened with
+    the computed flags. Powers the W-01 table and the Workforce/SA8000 CSV."""
+
+    factoryProfileId: str
+    factoryCode: str
+    factoryName: str
+    state: str
+    city: str
+    asOfDate: datetime | None = None
+    # workforce
+    totalWorkforce: int = 0
+    permanentCount: int = 0
+    permanentPct: float = 0
+    contractCount: int = 0
+    contractPct: float = 0
+    apprenticeTraineeCount: int = 0
+    maleCount: int = 0
+    femaleCount: int = 0
+    femalePct: float = 0
+    otherGenderCount: int = 0
+    migrantWorkerCount: int | None = None
+    migrantPct: float | None = None
+    differentlyAbledCount: int | None = None
+    youngestWorkerAge: int | None = None
+    workersUnder18Count: int = 0
+    minHiringAgePolicy: int | None = None
+    childLabourFlag: bool = False
+    # social-compliance
+    hasSocialProfile: bool = False
+    minimumWageCompliant: str = "NOT_ASSESSED"
+    lowestMonthlyWageInr: int | None = None
+    statutoryMinimumWageInr: int | None = None
+    wagesPaidOnTime: str = "NOT_ASSESSED"
+    standardWeeklyHours: int | None = None
+    maxWeeklyOvertimeHours: int | None = None
+    overtimeVoluntary: str = "NOT_ASSESSED"
+    weeklyRestDayProvided: str = "NOT_ASSESSED"
+    unionOrWorkerCommitteePresent: str = "NOT_ASSESSED"
+    collectiveBargainingAgreement: bool = False
+    noDepositOrDocumentRetention: str = "NOT_ASSESSED"
+    grievanceMechanismPresent: str = "NOT_ASSESSED"
+    antiDiscriminationPolicy: str = "NOT_ASSESSED"
+    sa8000AwarenessTrainingPct: float | None = None
+    lastSocialAuditDate: datetime | None = None
+    overallSocialComplianceFlag: str = "NOT_ASSESSED"
+    # derived element-level signals for the mini-indicators + exception lens
+    wageFlag: bool = False  # wage element ATTENTION/NON_COMPLIANT
+    overtimeFlag: bool = False  # max OT > 12 (SA8000 cap)
+    foaFlag: bool = False  # freedom-of-association element flagged
+    effectiveFlag: str = "NOT_ASSESSED"  # worst-of(overall, child-labour) — the chip
+
+
+class SocialComplianceRollup(BaseModel):
+    factoryCount: int = 0
+    totalWorkforce: int = 0
+    permanentCount: int = 0
+    contractCount: int = 0
+    apprenticeTraineeCount: int = 0
+    maleCount: int = 0
+    femaleCount: int = 0
+    otherGenderCount: int = 0
+    migrantWorkerCount: int = 0
+    differentlyAbledCount: int = 0
+    contractPct: float = 0
+    femalePct: float = 0
+    migrantPct: float = 0
+    # effective-flag → factory count (COMPLIANT / ATTENTION / NON_COMPLIANT / NOT_ASSESSED)
+    flagCounts: dict[str, int] = {}
+    childLabourFlagCount: int = 0
+    overtimeFlagCount: int = 0
+    wageFlagCount: int = 0
+    foaFlagCount: int = 0
+
+
+class SocialComplianceRegisterResponse(BaseModel):
+    items: list[SocialComplianceRegisterRow] = []
+    rollup: SocialComplianceRollup = SocialComplianceRollup()
+
+
+class BuildingRegisterRow(BaseModel):
+    factoryCode: str
+    factoryName: str
+    state: str
+    buildingName: str
+    buildingType: str
+    floors: int
+    areaSqm: float | None = None
+    maxOccupancy: int | None = None
+    currentOccupancy: int | None = None
+    assemblyPoint: str | None = None
+    emergencyExits: int | None = None
+    yearBuilt: int | None = None
+    occupancyCertificateNo: str | None = None
+
+
+class BuildingRegisterResponse(BaseModel):
+    items: list[BuildingRegisterRow] = []
+    buildingCount: int = 0
+    totalAreaSqm: float = 0
+
+
+class CertificationRegisterRow(BaseModel):
+    factoryCode: str
+    factoryName: str
+    state: str
+    certificationType: str
+    certificateNo: str | None = None
+    issuingBody: str | None = None
+    issueDate: datetime | None = None
+    expiryDate: datetime | None = None
+    status: str
+    daysToExpiry: int | None = None
+    scopeNotes: str | None = None
+
+
+class CertificationRegisterResponse(BaseModel):
+    items: list[CertificationRegisterRow] = []
+    certCount: int = 0
+    expiringWithin90Days: int = 0
+    expiredCount: int = 0
