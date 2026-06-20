@@ -26,6 +26,7 @@ from app.core.deps import get_current_user
 from app.models.factory import (
     Building,
     FactoryCertification,
+    FactoryComplianceSnapshot,
     FactoryContact,
     FactoryProfile,
     ProductionProcess,
@@ -34,6 +35,7 @@ from app.models.factory import (
 from app.models.user import User
 from app.schemas import factory as S
 from app.services import factory as svc
+from app.services import factory_snapshot as snap_svc
 from app.services.permissions import PermissionContext, can, get_accessible_plants
 
 router = APIRouter(prefix="/api/factory", tags=["factory"])
@@ -194,8 +196,30 @@ async def list_profiles(
         for c in cert_rows:
             cert_by_profile.setdefault(c.factoryProfileId, []).append(c)
 
+    # Batch-load the LIVE compliance snapshot per profile (precompute cache).
+    snap_by_profile: dict[str, FactoryComplianceSnapshot] = {}
+    if profile_ids:
+        snap_rows = (
+            await db.execute(
+                select(FactoryComplianceSnapshot)
+                .where(FactoryComplianceSnapshot.factoryProfileId.in_(profile_ids))
+                .where(FactoryComplianceSnapshot.periodLabel == "LIVE")
+                .where(FactoryComplianceSnapshot.isDeleted.is_(False))
+            )
+        ).scalars().all()
+        snap_by_profile = {s.factoryProfileId: s for s in snap_rows}
+
+    # Lazy-populate: any factory without a LIVE snapshot gets one computed now
+    # (self-healing for newly-created factories; existing rows use the cache).
+    missing = [p for p in rows if p.id not in snap_by_profile]
+    if missing:
+        for p in missing:
+            snap_by_profile[p.id] = await snap_svc.recompute_snapshot(db, p, user.id)
+        await db.commit()
+
     items: list[S.FactoryProfileOut] = []
     group_expiring = 0
+    score_sum, score_n, group_open_capas, group_overdue_capas = 0.0, 0, 0, 0
     status_counts: dict[str, int] = {}
     state_counts: dict[str, int] = {}
     for p in rows:
@@ -206,6 +230,20 @@ async def list_profiles(
             1 for c in certs if svc.cert_is_expiring(svc.compute_cert_status(c.expiryDate, c.renewalLeadDays, c.status))
         )
         group_expiring += o.certsExpiringCount
+        sn = snap_by_profile.get(p.id)
+        if sn is not None:
+            o.metrics = S.SnapshotMetrics(
+                auditComplianceScorePct=sn.auditComplianceScorePct, openFindings=sn.openFindings,
+                criticalFindings=sn.criticalFindings, openCapas=sn.openCapas, overdueCapas=sn.overdueCapas,
+                openObligations=sn.openObligations, overdueObligations=sn.overdueObligations,
+                certsExpiringCount=sn.certsExpiringCount, incidentCount12m=sn.incidentCount12m,
+                lastAuditDate=sn.lastAuditDate, computedAt=sn.computedAt,
+            )
+            if sn.auditComplianceScorePct is not None:
+                score_sum += sn.auditComplianceScorePct
+                score_n += 1
+            group_open_capas += sn.openCapas
+            group_overdue_capas += sn.overdueCapas
         items.append(o)
         status_counts[p.status] = status_counts.get(p.status, 0) + 1
         if p.state:
@@ -217,6 +255,9 @@ async def list_profiles(
         totalBuildings=sum(p.buildingCount for p in rows),
         totalEmployees=sum(p.totalEmployees for p in rows),
         certsExpiring=group_expiring,
+        groupComplianceScore=round(score_sum / score_n, 1) if score_n else None,
+        groupOpenCapas=group_open_capas,
+        groupOverdueCapas=group_overdue_capas,
         statusCounts=status_counts,
         stateCounts=state_counts,
     )
@@ -649,3 +690,41 @@ async def delete_contact(contact_id: str, user: User = Depends(get_current_user)
     ct.isDeleted = True
     ct.updatedBy = user.id
     await db.commit()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Compliance snapshot (precompute) + live Compliance & Audit tab (Phase D)
+# ════════════════════════════════════════════════════════════════════════════
+@router.post("/snapshots/recompute")
+async def recompute_snapshots(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Refresh the LIVE compliance snapshot for every accessible factory by
+    reading the existing engines. Cheap at demo scale; powers F-01 fast at 100+."""
+    await _require(db, user, "FACILITY.READ")
+    accessible = await get_accessible_plants(db, user.id)
+    stmt = select(FactoryProfile).where(FactoryProfile.isDeleted.is_(False))
+    if accessible is not None:
+        if not accessible:
+            return {"recomputed": 0}
+        stmt = stmt.where(FactoryProfile.siteId.in_(accessible))
+    profiles = (await db.execute(stmt)).scalars().all()
+    for p in profiles:
+        await snap_svc.recompute_snapshot(db, p, user.id)
+    await db.commit()
+    return {"recomputed": len(profiles)}
+
+
+@router.get("/profiles/{profile_id}/compliance", response_model=S.ComplianceTabResponse)
+async def profile_compliance(profile_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """F-02 Compliance & Audit tab — live read from the existing engines (no
+    duplicate store), each row drillable into its module."""
+    p = await _read_profile(db, user, profile_id)
+    m = await snap_svc.compute_site_metrics(db, p.siteId)
+    certs_expiring = await snap_svc._certs_expiring(db, p.id)
+    detail = await snap_svc.compliance_detail(db, p.siteId)
+    metrics = S.SnapshotMetrics(
+        auditComplianceScorePct=m["auditComplianceScorePct"], openFindings=m["openFindings"],
+        criticalFindings=m["criticalFindings"], openCapas=m["openCapas"], overdueCapas=m["overdueCapas"],
+        openObligations=m["openObligations"], overdueObligations=m["overdueObligations"],
+        certsExpiringCount=certs_expiring, incidentCount12m=m["incidentCount12m"], lastAuditDate=m["lastAuditDate"],
+    )
+    return S.ComplianceTabResponse(metrics=metrics, **detail)

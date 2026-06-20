@@ -82,6 +82,7 @@ class FactoryProfile(Base, IdMixin):
     productionProcesses: Mapped[list["ProductionProcess"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
     certifications: Mapped[list["FactoryCertification"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
     contacts: Mapped[list["FactoryContact"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
+    complianceSnapshots: Mapped[list["FactoryComplianceSnapshot"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
 
     createdAt: Mapped[datetime] = _created()
     createdBy: Mapped[str | None] = mapped_column(String)
@@ -245,4 +246,37 @@ class FactoryContact(Base, IdMixin):
     __table_args__ = (
         Index("ix_FactoryContact_factoryProfileId", "factoryProfileId"),
         Index("ix_FactoryContact_siteId", "siteId"),
+    )
+
+
+# ── Factory Compliance Snapshot (dashboard precompute) ───────────────────────
+class FactoryComplianceSnapshot(Base, IdMixin):
+    __tablename__ = "FactoryComplianceSnapshot"
+
+    factoryProfileId: Mapped[str] = mapped_column(ForeignKey("FactoryProfile.id", ondelete="CASCADE"), nullable=False)
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+    periodLabel: Mapped[str] = mapped_column(String, nullable=False, default="LIVE")
+    auditComplianceScorePct: Mapped[float | None] = mapped_column(Float)
+    openFindings: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    criticalFindings: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    openCapas: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    overdueCapas: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    openObligations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    overdueObligations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    certsExpiringCount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lastAuditDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    incidentCount12m: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    computedAt: Mapped[datetime] = _created()
+
+    factoryProfile: Mapped["FactoryProfile"] = relationship(back_populates="complianceSnapshots")
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_FactoryComplianceSnapshot_profile_period", "factoryProfileId", "periodLabel", unique=True),
+        Index("ix_FactoryComplianceSnapshot_siteId", "siteId"),
     )

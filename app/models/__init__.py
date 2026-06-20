@@ -113,6 +113,7 @@ from app.models.erm_t3 import (
 from app.models.factory import (
     Building,
     FactoryCertification,
+    FactoryComplianceSnapshot,
     FactoryContact,
     FactoryProfile,
     ProductionProcess,
@@ -293,6 +294,7 @@ __all__ = [
     "Building",
     "FactoryProfile",
     "FactoryCertification",
+    "FactoryComplianceSnapshot",
     "FactoryContact",
     "ProductionProcess",
     "WorkforceComposition",

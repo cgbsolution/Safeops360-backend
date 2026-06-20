@@ -245,6 +245,32 @@ class FactoryContactOut(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Compliance snapshot (live metrics read from existing engines — Phase D)
+# ════════════════════════════════════════════════════════════════════════════
+class SnapshotMetrics(BaseModel):
+    auditComplianceScorePct: float | None = None
+    openFindings: int = 0
+    criticalFindings: int = 0
+    openCapas: int = 0
+    overdueCapas: int = 0
+    openObligations: int = 0
+    overdueObligations: int = 0
+    certsExpiringCount: int = 0
+    incidentCount12m: int = 0
+    lastAuditDate: datetime | None = None
+    computedAt: datetime | None = None
+
+
+class ComplianceTabResponse(BaseModel):
+    metrics: SnapshotMetrics
+    audits: list[dict] = []
+    findings: list[dict] = []
+    capas: list[dict] = []
+    obligations: list[dict] = []
+    incidents: list[dict] = []
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Factory Profile
 # ════════════════════════════════════════════════════════════════════════════
 class FactoryProfileCreate(BaseModel):
@@ -330,6 +356,8 @@ class FactoryProfileOut(BaseModel):
     # cert roll-up (computed in the list endpoint)
     certCount: int = 0
     certsExpiringCount: int = 0  # EXPIRING_SOON + EXPIRED
+    # live compliance metrics (from the LIVE snapshot; null until first recompute)
+    metrics: SnapshotMetrics | None = None
     updatedAt: datetime | None = None
 
 
@@ -352,5 +380,8 @@ class FactoryProfileListResponse(BaseModel):
     totalBuildings: int = 0
     totalEmployees: int = 0
     certsExpiring: int = 0  # group-wide EXPIRING_SOON + EXPIRED
+    groupComplianceScore: float | None = None  # avg of factories with a score
+    groupOpenCapas: int = 0
+    groupOverdueCapas: int = 0
     statusCounts: dict[str, int] = {}
     stateCounts: dict[str, int] = {}
