@@ -62,6 +62,9 @@ class AuditTemplate(Base, IdMixin):
     auditType: Mapped[str] = mapped_column(String, nullable=False)
     baseIndustry: Mapped[str] = mapped_column(String, nullable=False, index=True)
     checkpointConfiguration: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Custom checkpoints added to this template (forks a version). See Prisma.
+    customCheckpoints: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    parentTemplateId: Mapped[str | None] = mapped_column(String)
     scoring: Mapped[dict | None] = mapped_column(JSON)
     workflow: Mapped[dict | None] = mapped_column(JSON)
     isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -91,6 +94,12 @@ class ComplianceAudit(Base, IdMixin):
     scopeDepartments: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     scopeAreas: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     scopeDescription: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Discipline scope (audit-lifecycle v2). Empty list = full library.
+    selectedDisciplineIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    scopePresetUsed: Mapped[str | None] = mapped_column(String)
+    materializedCheckpointCount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    adHocCount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     scheduledDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     scheduledStartTime: Mapped[str] = mapped_column(String, nullable=False, default="09:00")
@@ -131,6 +140,9 @@ class ComplianceAudit(Base, IdMixin):
     responses: Mapped[list["AuditCheckpointResponse"]] = relationship(
         back_populates="audit", cascade="all, delete-orphan"
     )
+    reports: Mapped[list["AuditReport"]] = relationship(
+        back_populates="audit", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_ComplianceAudit_plant_status", "plantId", "status"),
@@ -169,6 +181,31 @@ class AuditCheckpointResponse(Base, IdMixin):
 
     routedToUserId: Mapped[str | None] = mapped_column(String)
 
+    # Per-checkpoint owner allocation (audit-lifecycle v2).
+    assignedOwnerId: Mapped[str | None] = mapped_column(String)
+    assignedById: Mapped[str | None] = mapped_column(String)
+    assignedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Ad-hoc (custom) checkpoint added to this audit only.
+    isAdHoc: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    addedById: Mapped[str | None] = mapped_column(String)
+
+    # Two-axis state (additive to overallStatus).
+    assessmentStatus: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
+    workflowState: Mapped[str] = mapped_column(String, nullable=False, default="OPEN")
+    currentRound: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Carousel capture (first-class).
+    observation: Mapped[str | None] = mapped_column(Text)
+    auditorNote: Mapped[str | None] = mapped_column(Text)
+    orderIndex: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    auditorEvidenceIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    auditeeEvidenceIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    capaId: Mapped[str | None] = mapped_column(String)
+    finalizedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     # Lifecycle sub-documents.
     auditorResponse: Mapped[dict | None] = mapped_column(JSON)
     auditeeResponse: Mapped[dict | None] = mapped_column(JSON)
@@ -183,10 +220,68 @@ class AuditCheckpointResponse(Base, IdMixin):
         DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    interactions: Mapped[list["CheckpointInteraction"]] = relationship(
+        back_populates="checkpointInstance", cascade="all, delete-orphan"
+    )
+
     __table_args__ = (
         UniqueConstraint("auditId", "checkpointCode", name="uq_AuditCheckpointResponse_audit_code"),
         Index("ix_AuditCheckpointResponse_audit_category", "auditId", "categoryId"),
         Index("ix_AuditCheckpointResponse_audit_routed", "auditId", "routedToUserId"),
+        Index("ix_AuditCheckpointResponse_audit_owner", "auditId", "assignedOwnerId"),
+        Index("ix_AuditCheckpointResponse_audit_wfstate", "auditId", "workflowState"),
+    )
+
+
+class CheckpointInteraction(Base, IdMixin):
+    """Append-only multi-round thread. One row per checkpoint state transition.
+    Never updated or deleted; `timestamp` is server-set and immutable."""
+
+    __tablename__ = "CheckpointInteraction"
+
+    checkpointInstanceId: Mapped[str] = mapped_column(
+        ForeignKey("AuditCheckpointResponse.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    checkpointInstance: Mapped[AuditCheckpointResponse] = relationship(back_populates="interactions")
+    auditId: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    actorId: Mapped[str] = mapped_column(String, nullable=False)
+    actorRole: Mapped[str] = mapped_column(String, nullable=False)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    comment: Mapped[str | None] = mapped_column(Text)
+    evidenceIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    resultingState: Mapped[str] = mapped_column(String, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AuditReport(Base, IdMixin):
+    """Immutable Interim / Final report snapshot."""
+
+    __tablename__ = "AuditReport"
+
+    auditId: Mapped[str] = mapped_column(
+        ForeignKey("ComplianceAudit.id", ondelete="CASCADE"), nullable=False
+    )
+    audit: Mapped[ComplianceAudit] = relationship(back_populates="reports")
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+    reportType: Mapped[str] = mapped_column(String, nullable=False)  # INTERIM | FINAL
+    reportCode: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    generatedById: Mapped[str] = mapped_column(String, nullable=False)
+    generatedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    signOffs: Mapped[list | None] = mapped_column(JSON)
+    pdfAttachmentId: Mapped[str | None] = mapped_column(String)
+    isSuperseded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updatedAt: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_AuditReport_audit_type", "auditId", "reportType"),
     )
 
 
@@ -195,4 +290,6 @@ __all__ = [
     "AuditTemplate",
     "ComplianceAudit",
     "AuditCheckpointResponse",
+    "CheckpointInteraction",
+    "AuditReport",
 ]

@@ -172,6 +172,8 @@ _OWNER_FIELDS = (
     "employeeId",
     "uploadedById",
     "createdById",
+    "routedToUserId",
+    "assignedOwnerId",
 )
 
 

@@ -30,7 +30,9 @@ from app.models.capa import (
 from app.models.audit_compliance import (
     AuditCheckpointLibrary,
     AuditCheckpointResponse,
+    AuditReport,
     AuditTemplate,
+    CheckpointInteraction,
     ComplianceAudit,
 )
 from app.models.cams import (
@@ -252,7 +254,9 @@ __all__ = [
     "AgentToolCall",
     "AuditCheckpointLibrary",
     "AuditCheckpointResponse",
+    "AuditReport",
     "AuditTemplate",
+    "CheckpointInteraction",
     "ComplianceAudit",
     "Anomaly",
     "Area",

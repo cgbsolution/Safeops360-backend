@@ -111,6 +111,9 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "FLRA", "actions": ["CREATE", "READ", "EXECUTE"], "scope": "OWN_DEPARTMENT"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        # Auditee (audits are plant-scoped): view + respond to own findings.
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "PERMIT_ISSUER": [
         {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
@@ -128,6 +131,10 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": ["READ", "VERIFY"], "scope": "OWN_PLANT"},
         {"module": "PPE", "actions": ["READ", "CREATE", "UPDATE", "EXPORT", "ISSUE", "INSPECT", "VERIFY", "RETIRE_APPROVE"], "scope": "OWN_PLANT"},
+        # Auditee: view plant audits + respond to findings routed to them (the
+        # service owner-guard restricts UPDATE to their own checkpoints).
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "HSE_MANAGER": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
@@ -181,6 +188,9 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        # Auditee: view plant audits + respond to own findings.
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "MAINTENANCE_HEAD": [
         {"module": "INSPECTION", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},

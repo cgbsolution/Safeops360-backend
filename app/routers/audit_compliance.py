@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import secrets
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -91,9 +91,12 @@ class CreateAuditBody(BaseModel):
     scopeDepartments: list[str] = []
     scopeAreas: list[str] = []
     scopeDescription: str = ""
+    # Discipline scope (audit-lifecycle v2). Empty = full library.
+    selectedDisciplineIds: list[str] = []
+    scopePresetUsed: str | None = None  # FULL | FIRE_FOCUSED | SA8000_ISO45001 | WORKER_WELFARE | CUSTOM
     scheduledDate: datetime
     scheduledStartTime: str = "09:00"
-    estimatedDurationHours: float = 2
+    estimatedDurationHours: float = Field(2, gt=0, le=24)
     leadAuditorUserId: str | None = None
     coAuditors: list[str] = []
     auditees: list[AuditeeAssignment] = []
@@ -101,9 +104,68 @@ class CreateAuditBody(BaseModel):
     openingRemarks: str = ""
 
 
+class AddDisciplinesBody(BaseModel):
+    disciplineIds: list[str] = Field(min_length=1)
+
+
+class AddCheckpointBody(BaseModel):
+    disciplineId: str
+    disciplineName: str = ""
+    question: str = Field(min_length=4)
+    severity: str = "major"  # critical | major | minor | observation
+    guidance: str = ""
+    standardClauseRef: str = ""
+    requirementReference: str = ""
+    evidenceRequiredOnFail: bool = False
+    assignedOwnerId: str | None = None
+    promoteToTemplate: bool = False
+
+
+class TemplateCustomCheckpointBody(BaseModel):
+    disciplineId: str
+    disciplineName: str = ""
+    question: str = Field(min_length=4)
+    severity: str = "major"
+    guidance: str = ""
+    standardClauseRef: str = ""
+    requirementReference: str = ""
+    evidenceRequiredOnFail: bool = False
+
+
+class AllocateBody(BaseModel):
+    ownerId: str | None = None  # null = unassign
+    checkpointIds: list[str] = []  # specific instances (per-row / bulk)
+    disciplineId: str | None = None  # whole-discipline assign
+
+
+class TransitionBody(BaseModel):
+    action: str  # AUDITEE_RESPOND | ACCEPT | REQUEST_MORE_INFO | RAISE_CAPA | ESCALATE | PM_ACCEPT | PM_RAISE_CAPA | PM_SEND_BACK | REOPEN
+    comment: str = ""
+    evidenceIds: list[str] = []
+    photos: list[dict[str, Any]] = []
+    actionTaken: str = ""
+    actionDate: str | None = None
+    estimatedClosureDate: str | None = None
+
+
+# action -> required permission. The router also sets the record context per role
+# so OWN_RECORDS scoping can apply.
+_TRANSITION_PERM = {
+    "AUDITEE_RESPOND": "AUDIT_COMPLIANCE.UPDATE",
+    "ACCEPT": "AUDIT_COMPLIANCE.EXECUTE",
+    "REQUEST_MORE_INFO": "AUDIT_COMPLIANCE.EXECUTE",
+    "RAISE_CAPA": "AUDIT_COMPLIANCE.EXECUTE",
+    "ESCALATE": "AUDIT_COMPLIANCE.EXECUTE",
+    "REOPEN": "AUDIT_COMPLIANCE.EXECUTE",
+    "PM_ACCEPT": "AUDIT_COMPLIANCE.APPROVE",
+    "PM_RAISE_CAPA": "AUDIT_COMPLIANCE.APPROVE",
+    "PM_SEND_BACK": "AUDIT_COMPLIANCE.APPROVE",
+}
+
+
 class SaveResponseBody(BaseModel):
     checkpointCode: str
-    value: str | None = None  # pass | partial | fail | na | yes | no | null
+    value: Literal["pass", "partial", "fail", "na", "yes", "no"] | None = None
     numericValue: float | None = None
     selectedOptions: list[str] | None = None
     textObservation: str = ""
@@ -129,6 +191,16 @@ class PmReviewBody(BaseModel):
 
 class CloseBody(BaseModel):
     closingRemarks: str = ""
+
+
+class SignOff(BaseModel):
+    role: str
+    userId: str
+
+
+class GenerateReportBody(BaseModel):
+    reportType: str  # INTERIM | FINAL
+    signOffs: list[SignOff] = []
 
 
 class UploadUrlBody(BaseModel):
@@ -176,6 +248,22 @@ async def list_library(
     return {"libraries": await svc.list_libraries(db)}
 
 
+@router.post("/templates/{template_id}/custom-checkpoints", status_code=status.HTTP_201_CREATED)
+async def add_template_custom_checkpoint(
+    template_id: str,
+    body: TemplateCustomCheckpointBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Template-level custom checkpoint (A-08a) — forks a new template version.
+    Lead-Auditor-class action (AUDIT_COMPLIANCE.CREATE)."""
+    await _require(db, user, "AUDIT_COMPLIANCE.CREATE")
+    try:
+        return await svc.add_template_custom_checkpoint(db, user=user, template_id=template_id, payload=body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
 @router.get("/dashboard/programme")
 async def programme_dashboard(
     user: User = Depends(get_current_user),
@@ -184,6 +272,17 @@ async def programme_dashboard(
     await _require(db, user, "AUDIT_COMPLIANCE.READ")
     plants = await get_accessible_plants(db, user.id)
     return await svc.programme_dashboard(db, accessible_plants=plants)
+
+
+@router.get("/my-checkpoints")
+async def my_checkpoints(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditee transparency (A-06) — every checkpoint assigned to me, all states."""
+    await _require(db, user, "AUDIT_COMPLIANCE.READ")
+    plants = await get_accessible_plants(db, user.id)
+    return await svc.my_assigned_checkpoints(db, user=user, accessible_plants=plants)
 
 
 @router.get("/users")
@@ -271,7 +370,8 @@ async def get_audit(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await _require(db, user, "AUDIT_COMPLIANCE.READ")
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId, record_id=audit.id)
     data = await svc.get_audit(db, audit_id)
     if data is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Audit not found")
@@ -284,10 +384,75 @@ async def get_audit_dashboard(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await _require(db, user, "AUDIT_COMPLIANCE.READ")
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId, record_id=audit.id)
     data = await svc.audit_dashboard(db, audit_id)
     if data is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Audit not found")
+    return data
+
+
+@router.get("/{audit_id}/finalizability")
+async def get_finalizability(
+    audit_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Whether the audit can be finalized (every checkpoint terminal) + blockers."""
+    audit = await svc._load_audit(db, audit_id, with_responses=True)
+    if audit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Audit not found")
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId, record_id=audit.id)
+    return svc._finalizability(audit)
+
+
+@router.get("/{audit_id}/reports")
+async def list_reports(
+    audit_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId, record_id=audit.id)
+    return {"reports": await svc.list_reports(db, audit_id)}
+
+
+@router.post("/{audit_id}/reports", status_code=status.HTTP_201_CREATED)
+async def generate_report(
+    audit_id: str,
+    body: GenerateReportBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Generate an Interim (EXPORT) or Final (CLOSE) report — immutable snapshot."""
+    audit = await _load_or_404(db, audit_id)
+    perm = "AUDIT_COMPLIANCE.CLOSE" if (body.reportType or "").upper() == "FINAL" else "AUDIT_COMPLIANCE.EXPORT"
+    await _require(db, user, perm, plant_id=audit.plantId,
+                   record={"leadAuditorUserId": audit.leadAuditorUserId,
+                           "plantManagerUserId": audit.plantManagerUserId,
+                           "createdByUserId": audit.createdByUserId},
+                   record_id=audit.id)
+    try:
+        return await svc.generate_report(
+            db, user=user, audit_id=audit_id, report_type=body.reportType,
+            sign_offs=[s.model_dump() for s in body.signOffs] or None,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.get("/reports/{report_id}")
+async def get_report(
+    report_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    data = await svc.get_report(db, report_id)
+    if data is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
+    # Scope to the report's plant (siteId == audit.plantId) so a report isn't
+    # readable cross-plant.
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=data["siteId"], record_id=data["auditId"])
     return data
 
 
@@ -311,6 +476,65 @@ async def create_audit(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     await db.refresh(audit)
     return {"id": audit.id, "auditNumber": audit.auditNumber, "totalCheckpoints": audit.totalCheckpoints}
+
+
+@router.post("/{audit_id}/disciplines")
+async def add_disciplines(
+    audit_id: str,
+    body: AddDisciplinesBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Materialize additional disciplines into a running audit (before finalization)."""
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+                   record={"leadAuditorUserId": audit.leadAuditorUserId, "createdByUserId": audit.createdByUserId},
+                   record_id=audit.id)
+    try:
+        return await svc.add_disciplines(db, user=user, audit_id=audit_id, discipline_ids=body.disciplineIds)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/{audit_id}/allocate")
+async def allocate_checkpoints(
+    audit_id: str,
+    body: AllocateBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Plant Head / Lead Auditor allocates checkpoints to owners (A-04)."""
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+                   record={"leadAuditorUserId": audit.leadAuditorUserId,
+                           "plantManagerUserId": audit.plantManagerUserId,
+                           "createdByUserId": audit.createdByUserId},
+                   record_id=audit.id)
+    try:
+        return await svc.allocate_checkpoints(
+            db, user=user, audit_id=audit_id, owner_id=body.ownerId,
+            checkpoint_ids=body.checkpointIds, discipline_id=body.disciplineId,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/{audit_id}/checkpoints", status_code=status.HTTP_201_CREATED)
+async def add_adhoc_checkpoint(
+    audit_id: str,
+    body: AddCheckpointBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditor adds an ad-hoc custom checkpoint to this audit (carousel "+")."""
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record={"leadAuditorUserId": audit.leadAuditorUserId, "createdByUserId": audit.createdByUserId},
+                   record_id=audit.id)
+    try:
+        return await svc.add_adhoc_checkpoint(db, user=user, audit_id=audit_id, payload=body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
 
 @router.post("/{audit_id}/responses")
@@ -376,6 +600,34 @@ async def pm_review(
                    record={"plantManagerUserId": audit.plantManagerUserId}, record_id=audit.id)
     try:
         return await svc.pm_review(db, user=user, audit_id=audit_id, payload=body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.post("/{audit_id}/checkpoints/{checkpoint_id}/transition")
+async def transition_checkpoint(
+    audit_id: str,
+    checkpoint_id: str,
+    body: TransitionBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Iteration state-machine action (A-05). RBAC is action-dependent."""
+    audit = await _load_or_404(db, audit_id)
+    perm = _TRANSITION_PERM.get(body.action)
+    if perm is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown action '{body.action}'")
+    if perm == "AUDIT_COMPLIANCE.UPDATE":  # auditee responding
+        record = {"routedToUserId": user.id}
+    elif perm == "AUDIT_COMPLIANCE.APPROVE":  # plant manager deciding
+        record = {"plantManagerUserId": audit.plantManagerUserId}
+    else:  # auditor actions
+        record = {"leadAuditorUserId": audit.leadAuditorUserId, "createdByUserId": audit.createdByUserId}
+    await _require(db, user, perm, plant_id=audit.plantId, record=record, record_id=audit.id)
+    try:
+        return await svc.transition_checkpoint(
+            db, user=user, audit_id=audit_id, checkpoint_id=checkpoint_id, action=body.action, payload=body.model_dump(),
+        )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
