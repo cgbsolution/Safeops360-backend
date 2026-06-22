@@ -1319,6 +1319,15 @@ async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload:
         elif val in ("fail", "partial"):
             if resp.workflowState in ("OPEN", "PASSED"):
                 if post_submit:
+                    # Post-submit reassess routes a finding straight into the
+                    # thread with no second submit gate — so enforce the SAME
+                    # evidence rule submit_audit applies (an observation, plus a
+                    # photo where the checkpoint demands one). Without this the
+                    # reopen→fail path would mint an evidence-free finding/CAPA.
+                    if not (resp.observation or "").strip():
+                        raise ValueError("An observation is required before routing a fail/partial finding.")
+                    if resp.requiresPhotoOnFail and not (resp.auditorEvidenceIds or []):
+                        raise ValueError("An evidence photo is required for this checkpoint before routing the finding.")
                     owner = resp.assignedOwnerId or resp.routedToUserId or audit.plantManagerUserId or audit.leadAuditorUserId
                     resp.routedToUserId = owner
                     resp.workflowState = "AWAITING_AUDITEE"
@@ -1338,6 +1347,17 @@ async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload:
             # already in-flight and still fail/partial → leave the thread untouched
         elif resp.workflowState in ("OPEN", "PASSED"):  # verdict cleared
             resp.workflowState = "OPEN"
+
+    # Coherence guard: the unconditional overallStatus rewrite above reflects the
+    # raw verdict (answered_fail, …) — but an in-flight finding's overallStatus is
+    # owned by the auditee workflow, not the verdict. Re-snap it so a verdict edit
+    # on a routed finding can never strand it out of pending_auditee /
+    # response_submitted (which would break auditee_respond + the needs-response
+    # inbox count). Re-pass already moved it to PASSED, so it's excluded here.
+    if resp.workflowState in ("AWAITING_AUDITEE", "MORE_INFO_REQUESTED"):
+        resp.overallStatus = "pending_auditee"
+    elif resp.workflowState == "AUDITEE_RESPONDED":
+        resp.overallStatus = "response_submitted"
 
     # Flip the audit into conduct on first save.
     if audit.status == "scheduled":

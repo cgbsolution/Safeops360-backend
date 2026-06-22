@@ -70,6 +70,7 @@ from app.services.permissions import (
     PermissionContext,
     can,
     get_accessible_plants,
+    get_accessible_plants_for,
 )
 
 router = APIRouter(prefix="/api/capa", tags=["capa"])
@@ -195,7 +196,14 @@ async def list_capas(
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
 
-    accessible_plants = await get_accessible_plants(db, user.id)
+    # Scope the list to the CAPA.READ permission specifically — NOT the
+    # module-agnostic get_accessible_plants(), which would return "all plants"
+    # for anyone holding an ALL_PLANTS grant on an unrelated module (e.g. an
+    # HSE Manager with FACILITY=ALL_PLANTS but CAPA.READ=OWN_PLANT). Using the
+    # generic helper here surfaced cross-plant CAPAs in the list that the detail
+    # endpoint then denied with a 403 — so we keep the list consistent with the
+    # per-record can("CAPA.READ", …) check.
+    accessible_plants = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(Capa)
@@ -278,21 +286,27 @@ async def list_capas(
             d["daysOverdue"] = max(0, (now - ctd).days)
         items.append(CapaListItem(**d))
 
-    # Aggregate counts across the user's scope (not just filtered slice)
-    scope_q = select(Capa).where(Capa.plantId.in_(accessible_plants)) if accessible_plants else select(Capa)
+    # Aggregate counts across the user's scope (not just the filtered slice).
+    # These must honour the same plant scope as the row list above, otherwise
+    # the analytics strip leaks counts for plants the user cannot read.
+    # accessible_plants: None == unrestricted; [] == nothing (handled earlier).
+    def _scoped(stmt):
+        return stmt.where(Capa.plantId.in_(accessible_plants)) if accessible_plants else stmt
+
     cat_counts_rows = (
         await db.execute(
-            select(CapaSourceCategory.code, func.count(Capa.id))
-            .select_from(Capa)
-            .join(CapaSourceCategory, Capa.sourceCategoryId == CapaSourceCategory.id)
-            .group_by(CapaSourceCategory.code)
+            _scoped(
+                select(CapaSourceCategory.code, func.count(Capa.id))
+                .select_from(Capa)
+                .join(CapaSourceCategory, Capa.sourceCategoryId == CapaSourceCategory.id)
+            ).group_by(CapaSourceCategory.code)
         )
     ).all()
     state_counts_rows = (
-        await db.execute(select(Capa.state, func.count(Capa.id)).group_by(Capa.state))
+        await db.execute(_scoped(select(Capa.state, func.count(Capa.id))).group_by(Capa.state))
     ).all()
     sev_counts_rows = (
-        await db.execute(select(Capa.severity, func.count(Capa.id)).group_by(Capa.severity))
+        await db.execute(_scoped(select(Capa.severity, func.count(Capa.id))).group_by(Capa.severity))
     ).all()
 
     return CapaListResponse(
