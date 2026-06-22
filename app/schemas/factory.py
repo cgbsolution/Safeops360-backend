@@ -634,6 +634,7 @@ class BuildingRegisterResponse(BaseModel):
 
 
 class CertificationRegisterRow(BaseModel):
+    certId: str
     factoryProfileId: str
     factoryCode: str
     factoryName: str

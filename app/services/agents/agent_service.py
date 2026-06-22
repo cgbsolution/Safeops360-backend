@@ -549,6 +549,42 @@ async def _build_context(
     }
 
 
+def _coerce_suggestion_json(raw: str) -> Any:
+    """Best-effort parse of the JSON inside a <suggestion> block.
+
+    Models very often wrap the JSON in a markdown code fence
+    (```json ... ```) or add a stray sentence around it. A bare
+    json.loads() then fails and the whole draft was being stored as an
+    unrenderable "_unparsed" blob. We strip fences and, as a last resort,
+    extract the outermost {...}/[...] span before giving up.
+    """
+    s = raw.strip()
+
+    # 1) Strip a surrounding markdown fence: ```json\n...\n``` or ```...```
+    fence = re.match(r"^```(?:json|JSON)?\s*([\s\S]*?)\s*```$", s)
+    if fence:
+        s = fence.group(1).strip()
+
+    # 2) Direct parse.
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # 3) Last resort: the outermost object/array span, ignoring any prose
+    #    the model wrote before or after it.
+    starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
+    end = max(s.rfind("}"), s.rfind("]"))
+    if starts and end > min(starts):
+        try:
+            return json.loads(s[min(starts) : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Genuinely unparseable — keep the raw text so the UI can still show it.
+    return {"_unparsed": raw}
+
+
 def _parse_final_response(text: str) -> dict[str, Any]:
     """Extract <reasoning>, <suggestion>, and <confidence> blocks from
     the agent's final assistant turn. Missing blocks return None — the
@@ -561,14 +597,16 @@ def _parse_final_response(text: str) -> dict[str, Any]:
 
     suggestion_match = re.search(r"<suggestion>([\s\S]*?)</suggestion>", text)
     if suggestion_match:
-        raw = suggestion_match.group(1).strip()
-        try:
-            out["suggestion"] = json.loads(raw)
-        except json.JSONDecodeError:
-            # The agent emitted a suggestion block that wasn't valid JSON.
-            # Store the raw text under an "_unparsed" key so the UI can
-            # still surface it and the prompt engineer can investigate.
-            out["suggestion"] = {"_unparsed": raw}
+        out["suggestion"] = _coerce_suggestion_json(suggestion_match.group(1))
+    else:
+        # Model skipped the <suggestion> tags but may have emitted a fenced
+        # JSON block (or a bare object) anyway — recover it rather than
+        # reporting a null draft.
+        fenced = re.search(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", text)
+        if fenced:
+            recovered = _coerce_suggestion_json(fenced.group(1))
+            if "_unparsed" not in recovered:
+                out["suggestion"] = recovered
 
     confidence_match = re.search(r"<confidence>([\d.]+)</confidence>", text)
     if confidence_match:

@@ -974,6 +974,7 @@ async def certifications_register(state: str | None = Query(None), user: User = 
         built.sort(key=lambda t: (t[3] is None, t[3] if t[3] is not None else 0))
         for c, p, status, days in built:
             items.append(S.CertificationRegisterRow(
+                certId=c.id,
                 factoryProfileId=p.id,
                 factoryCode=p.factoryCode, factoryName=p.factoryName, state=p.state,
                 certificationType=c.certificationType, certificateNo=c.certificateNo, issuingBody=c.issuingBody,
