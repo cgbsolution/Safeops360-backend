@@ -69,9 +69,9 @@ from app.schemas.capa import (
 from app.services.permissions import (
     PermissionContext,
     can,
-    get_accessible_plants,
     get_accessible_plants_for,
 )
+from app.services.user_directory import resolve_user_directory
 
 router = APIRouter(prefix="/api/capa", tags=["capa"])
 
@@ -355,7 +355,35 @@ async def get_capa(
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
 
-    return CapaOut.model_validate(capa)
+    out = CapaOut.model_validate(capa)
+
+    # Resolve every user id this payload carries into a name + plant + role so
+    # the UI never renders a raw cuid (audit trail, ownership, action owners,
+    # contributors, comment authors, …).
+    user_ids: set[str | None] = {
+        capa.raisedByUserId,
+        capa.primaryOwnerUserId,
+        capa.createdByUserId,
+        capa.updatedByUserId,
+        capa.closedByUserId,
+        capa.detectedByUserId,
+        capa.rcaCompletedByUserId,
+        capa.verificationCompletedByUserId,
+        capa.stateChangedByUserId,
+        capa.departmentOwnerId,
+    }
+    for a in capa.actions:
+        user_ids.add(a.ownerUserId)
+        user_ids.add(a.approverUserId)
+    for c in capa.contributors:
+        user_ids.add(c.userId)
+    for at in capa.attachments:
+        user_ids.add(at.uploadedByUserId)
+    for cm in capa.comments:
+        user_ids.add(cm.authorUserId)
+
+    out.userDirectory = await resolve_user_directory(db, user_ids)
+    return out
 
 
 @router.post("", response_model=CapaOut, status_code=status.HTTP_201_CREATED)
@@ -537,7 +565,7 @@ async def dashboard_volume_by_source(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(CapaSourceCategory.code, CapaSourceCategory.name, func.count(Capa.id))
@@ -562,7 +590,7 @@ async def dashboard_state_distribution(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = select(Capa.state, func.count(Capa.id)).group_by(Capa.state)
     if accessible is not None:
@@ -582,7 +610,7 @@ async def dashboard_overdue(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     now = datetime.now(timezone.utc)
     base = (
@@ -621,7 +649,7 @@ async def dashboard_effectiveness(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     ago90 = datetime.now(timezone.utc) - timedelta(days=90)
     base = (
@@ -653,7 +681,7 @@ async def dashboard_top_root_causes(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(CapaRootCause.category, func.count(CapaRootCause.id))
@@ -696,7 +724,7 @@ async def list_patterns(
         if not check.allowed:
             raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
 
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
     ago180 = datetime.now(timezone.utc) - timedelta(days=180)
 
     # Already-confirmed groups
@@ -769,7 +797,7 @@ async def export_csv(
     check = await can(db, user.id, "CAPA.EXPORT", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(Capa)

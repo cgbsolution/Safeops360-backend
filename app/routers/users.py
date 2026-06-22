@@ -17,8 +17,25 @@ from sqlalchemy.orm import selectinload
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.models.user import Permission, Role, RolePermission, User, UserRole
+from app.schemas.common import UserRefOut
+from app.services.user_directory import resolve_user_directory
 
 router = APIRouter(prefix="/api/users", tags=["users"])
+
+
+@router.get("/by-ids", response_model=dict[str, UserRefOut])
+async def resolve_users_by_ids(
+    ids: str = Query(..., description="Comma-separated user ids to resolve."),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, UserRefOut]:
+    """Resolve a batch of user ids into display-ready refs (name + plant +
+    role). Returns a map keyed by id; ids that don't match a user are omitted
+    so callers can fall back to the raw id. Any authenticated user may resolve
+    names — this exposes no more than the user picker already does.
+    """
+    id_list = [s.strip() for s in ids.split(",") if s.strip()]
+    return await resolve_user_directory(db, id_list)
 
 
 @router.get("")
