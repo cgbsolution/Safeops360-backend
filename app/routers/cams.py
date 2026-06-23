@@ -499,7 +499,17 @@ async def unified_engagements(
         d["href"] = f"/cams/engagements/{e.id}"
         cams_items.append(d)
     items = (await svc.audit_engagements(db)) + cams_items
-    items.sort(key=lambda x: x.get("plannedDate") or "", reverse=True)
+    # The two sources type `plannedDate` differently — audit_engagements emits an
+    # ISO string (`.isoformat()`), while the Cams `model_dump()` keeps a datetime.
+    # Normalise to an ISO string in the key so a mixed list sorts without a
+    # str-vs-datetime TypeError (ISO 8601 sorts lexically == chronologically).
+    def _planned_key(x: dict[str, Any]) -> str:
+        v = x.get("plannedDate")
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v or ""
+
+    items.sort(key=_planned_key, reverse=True)
     status_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
     for it in items:
