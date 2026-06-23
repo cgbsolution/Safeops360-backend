@@ -20,7 +20,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -132,8 +132,9 @@ def _response_to_dict(r: AuditCheckpointResponse, *, include_interactions: bool 
         "capaSeverity": r.capaSeverity,
         "linkedSafeopsModule": r.linkedSafeopsModule,
         "routedToUserId": r.routedToUserId,
-        # Ownership (audit-lifecycle v2).
+        # Ownership (audit-lifecycle v2). owner = auditee; auditor = conductor.
         "assignedOwnerId": r.assignedOwnerId,
+        "assignedAuditorId": r.assignedAuditorId,
         "assignedById": r.assignedById,
         "assignedAt": _iso(r.assignedAt),
         # Ad-hoc / custom flag.
@@ -249,6 +250,69 @@ async def list_libraries(db: AsyncSession) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+async def get_library(db: AsyncSession, industry_code: str) -> dict[str, Any] | None:
+    """Full library (categories + checkpoints) for the authoring view."""
+    lib = (
+        await db.execute(select(AuditCheckpointLibrary).where(AuditCheckpointLibrary.industryCode == industry_code))
+    ).scalar_one_or_none()
+    if lib is None:
+        return None
+    return {
+        "id": lib.id, "industryCode": lib.industryCode, "industryName": lib.industryName,
+        "version": lib.version, "checkpointCount": lib.checkpointCount, "isActive": lib.isActive,
+        "categories": lib.categories or [],
+    }
+
+
+async def import_library(db: AsyncSession, *, user: User, payload: dict[str, Any]) -> dict[str, Any]:
+    """Create or replace a per-industry checkpoint library — the source the audit
+    flow materializes from. The bulk-import path for large (≈1500-checkpoint)
+    libraries: an admin pastes/uploads the discipline→checkpoint structure once.
+    Upsert by industryCode; recomputes checkpointCount."""
+    code = (payload.get("industryCode") or "").strip()
+    if not code:
+        raise ValueError("industryCode is required")
+    cats = payload.get("categories") or []
+    if not isinstance(cats, list) or not cats:
+        raise ValueError("At least one discipline (category) with checkpoints is required")
+    # Light validation: each category needs a code + at least one checkpoint with a code+question.
+    seen_codes: set[str] = set()
+    cp_count = 0
+    for c in cats:
+        if not c.get("category_code"):
+            raise ValueError("Every discipline needs a category_code")
+        for cp in c.get("checkpoints") or []:
+            if not cp.get("code") or not cp.get("question"):
+                raise ValueError(f"Checkpoint in {c['category_code']} needs a code and a question")
+            if cp["code"] in seen_codes:
+                raise ValueError(f"Duplicate checkpoint code: {cp['code']}")
+            seen_codes.add(cp["code"])
+            cp_count += 1
+    if cp_count == 0:
+        raise ValueError("The library has no checkpoints")
+
+    lib = (
+        await db.execute(select(AuditCheckpointLibrary).where(AuditCheckpointLibrary.industryCode == code))
+    ).scalar_one_or_none()
+    if lib is None:
+        lib = AuditCheckpointLibrary(
+            industryCode=code, industryName=payload.get("industryName") or code,
+            version=payload.get("version") or "2026.1", categories=cats,
+            checkpointCount=cp_count, isActive=True,
+        )
+        db.add(lib)
+        created = True
+    else:
+        lib.industryName = payload.get("industryName") or lib.industryName
+        lib.version = payload.get("version") or lib.version
+        lib.categories = cats
+        lib.checkpointCount = cp_count
+        lib.isActive = True
+        created = False
+    await db.flush()
+    return {"ok": True, "created": created, "industryCode": code, "checkpointCount": cp_count, "disciplines": len(cats)}
 
 
 async def list_templates(db: AsyncSession) -> list[dict[str, Any]]:
@@ -392,25 +456,371 @@ def _finalizability(audit: ComplianceAudit) -> dict[str, Any]:
     }
 
 
+# ── Scale helpers (1500-checkpoint support) ──────────────────────────────────
+# These compute via grouped/aggregate queries so the detail page, conduct
+# navigator, and finalize gate never materialize the full response set.
+
+
+def _terminal_clause():
+    """SQL twin of `_is_terminal` — true for a checkpoint that is terminal for
+    finalization. Kept in lockstep with `_is_terminal` above."""
+    R = AuditCheckpointResponse
+    return or_(
+        R.workflowState.in_(["RESOLVED", "ACCEPTED_WITH_CAPA", "FINALIZED"]),
+        and_(R.workflowState == "PASSED", R.assessmentStatus.in_(["PASS", "NA", "NOT_ASSESSED"])),
+        and_(R.workflowState == "OPEN", R.assessmentStatus.in_(["PASS", "NA"])),
+        R.overallStatus == "response_accepted",
+    )
+
+
+async def _finalizability_db(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any]:
+    """Count-based finalizability — same shape as `_finalizability` but never
+    loads the response rows (only a count + the first 50 blockers)."""
+    R = AuditCheckpointResponse
+    aid = audit.id
+    total = (await db.execute(select(func.count(R.id)).where(R.auditId == aid))).scalar_one() or 0
+    nonterm = (
+        await db.execute(select(func.count(R.id)).where(R.auditId == aid, not_(_terminal_clause())))
+    ).scalar_one() or 0
+    blocker_rows = (
+        await db.execute(
+            select(R.checkpointCode, R.categoryName, R.workflowState, R.assessmentStatus)
+            .where(R.auditId == aid, not_(_terminal_clause()))
+            .order_by(R.sequence)
+            .limit(50)
+        )
+    ).all()
+    submitted = audit.status in ("submitted_pending_response", "response_in_progress", "under_review", "closed")
+    return {
+        "finalizable": submitted and total > 0 and nonterm == 0,
+        "submitted": submitted,
+        "total": total,
+        "terminal": total - nonterm,
+        "blockerCount": nonterm,
+        "blockers": [
+            {"checkpointCode": b.checkpointCode, "categoryName": b.categoryName,
+             "workflowState": b.workflowState, "assessmentStatus": b.assessmentStatus}
+            for b in blocker_rows
+        ],
+    }
+
+
+async def _discipline_rollup(db: AsyncSession, audit_id: str) -> list[dict[str, Any]]:
+    """Per-discipline counts via ONE grouped query (uses assessmentStatus, the
+    first-class verdict column). Drives the conduct navigator + detail RAG
+    without loading any checkpoint rows."""
+    R = AuditCheckpointResponse
+    A = R.assessmentStatus
+    rows = (
+        await db.execute(
+            select(
+                R.categoryId, R.categoryName, R.categoryColor,
+                func.count(R.id).label("total"),
+                func.count(R.id).filter(A != "NOT_ASSESSED").label("answered"),
+                func.count(R.id).filter(A == "PASS").label("passed"),
+                func.count(R.id).filter(A == "PARTIAL").label("partial"),
+                func.count(R.id).filter(A == "FAIL").label("failed"),
+                func.count(R.id).filter(A == "NA").label("na"),
+                func.count(R.id).filter(and_(A == "FAIL", R.criticality == "critical")).label("criticalFailed"),
+                func.count(R.id).filter(and_(A == "FAIL", R.criticality == "major")).label("majorFailed"),
+                func.count(R.id).filter(
+                    and_(A == "FAIL", R.criticality.notin_(["critical", "major"]))
+                ).label("minorFailed"),
+            )
+            .where(R.auditId == audit_id)
+            .group_by(R.categoryId, R.categoryName, R.categoryColor)
+        )
+    ).all()
+    out = [
+        {
+            "categoryId": r.categoryId, "categoryName": r.categoryName,
+            "categoryColor": r.categoryColor or "", "total": r.total,
+            "answered": r.answered, "passed": r.passed, "partial": r.partial,
+            "failed": r.failed, "na": r.na, "criticalFailed": r.criticalFailed,
+            "majorFailed": r.majorFailed, "minorFailed": r.minorFailed,
+        }
+        for r in rows
+    ]
+    out.sort(key=lambda c: c["categoryName"])
+    return out
+
+
+def _score_from_rollup(rollup: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the AuditScore shape (same as `_compute_score`) from the discipline
+    rollup — the read-path score with no full row load."""
+    passed = sum(c["passed"] for c in rollup)
+    partial = sum(c["partial"] for c in rollup)
+    failed = sum(c["failed"] for c in rollup)
+    na = sum(c["na"] for c in rollup)
+    total = sum(c["total"] for c in rollup)
+    crit = sum(c["criticalFailed"] for c in rollup)
+    major = sum(c["majorFailed"] for c in rollup)
+    minor = sum(c["minorFailed"] for c in rollup)
+    answered = passed + partial + failed + na
+    assessable = passed + partial + failed
+    overall = round((passed + 0.5 * partial) / assessable * 100, 1) if assessable else 0.0
+    category_scores = []
+    for c in rollup:
+        c_assess = c["passed"] + c["partial"] + c["failed"]
+        category_scores.append({
+            "category_id": c["categoryId"], "category_name": c["categoryName"],
+            "total": c["total"], "passed": c["passed"], "partial": c["partial"],
+            "failed": c["failed"], "na": c["na"],
+            "score_pct": round((c["passed"] + 0.5 * c["partial"]) / c_assess * 100, 1) if c_assess else 0.0,
+        })
+    return {
+        "total_checkpoints": total, "answered": answered, "passed": passed,
+        "partially_passed": partial, "failed": failed, "not_applicable": na,
+        "overall_score_pct": overall,
+        "category_scores": sorted(category_scores, key=lambda c: c["category_name"]),
+        "critical_failures": crit, "major_failures": major, "minor_failures": minor,
+        "audit_passed": crit == 0 and overall >= MINIMUM_PASS_SCORE,
+    }
+
+
+async def _allocation_summary(db: AsyncSession, audit_id: str) -> dict[str, int]:
+    """assigned / unassigned counts via aggregate (assigned = an effective owner
+    by explicit allocation OR discipline routing)."""
+    R = AuditCheckpointResponse
+    total = (await db.execute(select(func.count(R.id)).where(R.auditId == audit_id))).scalar_one() or 0
+    assigned = (
+        await db.execute(
+            select(func.count(R.id)).where(
+                R.auditId == audit_id,
+                or_(R.assignedOwnerId.isnot(None), R.routedToUserId.isnot(None)),
+            )
+        )
+    ).scalar_one() or 0
+    return {"assigned": assigned, "unassigned": total - assigned, "total": total}
+
+
+def _review_clause():
+    """Rows the detail page's review surface needs: any adverse verdict
+    (fail/partial = a finding) OR any non-quiescent workflow state."""
+    R = AuditCheckpointResponse
+    return or_(
+        R.assessmentStatus.in_(["FAIL", "PARTIAL"]),
+        R.workflowState.notin_(["OPEN", "PASSED"]),
+    )
+
+
+# Cap the detail page's embedded review set; beyond this the conduct worklist
+# (paginated, filterable) is the way to reach every finding.
+_REVIEW_CAP = 500
+
+
+def _coauditor_ids(co_auditors: list | None) -> list[str]:
+    """Extract user ids from coAuditors, tolerating BOTH the legacy flat shape
+    (list[str]) and the structured shape (list[{userId, disciplineIds}], Phase 3)."""
+    out: list[str] = []
+    for c in co_auditors or []:
+        if isinstance(c, dict):
+            uid = c.get("userId")
+            if uid:
+                out.append(uid)
+        elif c:
+            out.append(c)
+    return out
+
+
+def _progress_from_rollup(rollup: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the `progress` block (same shape as `_live_progress`) from the
+    discipline rollup, so the detail page needs no full row load."""
+    total = sum(c["total"] for c in rollup)
+    answered = sum(c["answered"] for c in rollup)
+    return {
+        "total": total,
+        "answered": answered,
+        "completionPct": round(answered / total * 100, 1) if total else 0,
+        "categories": [
+            {"categoryId": c["categoryId"], "categoryName": c["categoryName"],
+             "categoryColor": c["categoryColor"], "total": c["total"],
+             "answered": c["answered"], "failed": c["failed"], "partial": c["partial"]}
+            for c in rollup
+        ],
+    }
+
+
+# value filter token -> assessmentStatus column value (list_checkpoints).
+_VALUE_TO_ASSESS = {"pass": "PASS", "partial": "PARTIAL", "fail": "FAIL", "na": "NA", "unanswered": "NOT_ASSESSED"}
+
+
+async def list_checkpoints(
+    db: AsyncSession, *, audit_id: str, discipline_id: str | None = None,
+    workflow_state: str | None = None, assessment_status: str | None = None,
+    value: str | None = None, criticality: str | None = None, q: str | None = None,
+    assigned_auditor_id: str | None = None, cursor: str | None = None, limit: int = 50,
+) -> dict[str, Any]:
+    """Paginated, filterable checkpoint slice for an audit. Cursor =
+    "{sequence}:{id}", ordered by (sequence, id) for stable paging. Never loads
+    interactions (fetch those per-row on demand)."""
+    R = AuditCheckpointResponse
+    conds = [R.auditId == audit_id]
+    if discipline_id:
+        conds.append(R.categoryId == discipline_id)
+    if assigned_auditor_id:
+        conds.append(R.assignedAuditorId == assigned_auditor_id)
+    if workflow_state:
+        conds.append(R.workflowState == workflow_state)
+    if assessment_status:
+        conds.append(R.assessmentStatus == assessment_status)
+    if value:
+        mapped = _VALUE_TO_ASSESS.get(value)
+        if mapped is None:
+            raise ValueError(f"Invalid value filter '{value}'")
+        conds.append(R.assessmentStatus == mapped)
+    if criticality:
+        conds.append(R.criticality == criticality)
+    if q:
+        like = f"%{q.strip()}%"
+        conds.append(or_(R.checkpointCode.ilike(like), R.checkpointQuestion.ilike(like)))
+
+    total = (await db.execute(select(func.count(R.id)).where(*conds))).scalar_one() or 0
+
+    paged = select(R).where(*conds).order_by(R.sequence, R.id)
+    if cursor:
+        try:
+            c_seq_s, c_id = cursor.split(":", 1)
+            c_seq = int(c_seq_s)
+        except (ValueError, AttributeError) as e:
+            raise ValueError("Invalid cursor") from e
+        paged = paged.where(or_(R.sequence > c_seq, and_(R.sequence == c_seq, R.id > c_id)))
+    limit = max(1, min(limit, 200))
+    rows = (await db.execute(paged.limit(limit + 1))).scalars().all()
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = f"{items[-1].sequence}:{items[-1].id}" if has_more and items else None
+    return {
+        "items": [_response_to_dict(r) for r in items],
+        "nextCursor": next_cursor,
+        "total": total,
+        "returned": len(items),
+    }
+
+
+async def get_checkpoint_interactions(db: AsyncSession, *, audit_id: str, checkpoint_id: str) -> dict[str, Any]:
+    """The append-only iteration thread for ONE checkpoint (lazy-loaded by the
+    detail drill-in / conduct expand)."""
+    R = AuditCheckpointResponse
+    resp = (
+        await db.execute(
+            select(R).where(R.id == checkpoint_id, R.auditId == audit_id)
+            .options(selectinload(R.interactions))
+        )
+    ).scalar_one_or_none()
+    if resp is None:
+        raise ValueError("Checkpoint not found on this audit")
+    return {
+        "checkpointCode": resp.checkpointCode,
+        "interactions": [
+            _interaction_to_dict(i) for i in sorted(resp.interactions, key=lambda x: (x.timestamp, x.round))
+        ],
+    }
+
+
+async def bulk_save_response(
+    db: AsyncSession, *, user: User, audit_id: str, value: str,
+    checkpoint_ids: list[str] | None = None, discipline_id: str | None = None,
+    only_unanswered: bool = True,
+) -> dict[str, Any]:
+    """Mark a set of checkpoints (explicit ids OR a whole discipline) as pass/na
+    in one call — the "mark discipline compliant" fast path for large audits.
+
+    Safety rails: only `pass`/`na` are allowed; FAIL/PARTIAL rows and in-flight
+    findings (workflowState not OPEN/PASSED) are NEVER touched, so a deliberate
+    finding/observation can't be clobbered; `only_unanswered` (default) further
+    restricts to NOT_ASSESSED rows. Mirrors the pass/na branch of save_response."""
+    if value not in ("pass", "na"):
+        raise ValueError("Bulk save supports only 'pass' or 'na'")
+    audit = await _load_audit(db, audit_id)
+    if audit is None:
+        raise ValueError("Audit not found")
+    if audit.status in ("closed", "cancelled"):
+        raise ValueError(f"Audit is {audit.status}; checkpoint responses are locked")
+
+    R = AuditCheckpointResponse
+    conds = [R.auditId == audit_id]
+    ids = set(checkpoint_ids or [])
+    if ids:
+        conds.append(R.id.in_(ids))
+    elif discipline_id:
+        conds.append(R.categoryId == discipline_id)
+    else:
+        raise ValueError("Provide checkpointIds or disciplineId")
+    # Never overwrite a deliberate adverse verdict or an in-flight finding.
+    conds.append(~R.assessmentStatus.in_(["FAIL", "PARTIAL"]))
+    conds.append(R.workflowState.in_(["OPEN", "PASSED"]))
+    if only_unanswered:
+        conds.append(R.assessmentStatus == "NOT_ASSESSED")
+
+    rows = (await db.execute(select(R).where(*conds))).scalars().all()
+    now = _utcnow()
+    for resp in rows:
+        merged = dict(resp.auditorResponse or {})
+        merged["value"] = value
+        merged["responded_at"] = now.isoformat()
+        merged["is_saved"] = True
+        resp.auditorResponse = merged
+        resp.assessmentStatus = _ASSESS_STATUS[value]
+        resp.overallStatus = f"answered_{value}"
+        resp.answeredAt = now
+        resp.workflowState = "PASSED"
+
+    if audit.status == "scheduled" and rows:
+        audit.status = "in_progress"
+        if audit.actualStartAt is None:
+            audit.actualStartAt = now
+    await db.flush()
+
+    answered = (
+        await db.execute(
+            select(func.count(R.id)).where(R.auditId == audit_id)
+            .where(R.overallStatus.notlike("not_answered"))
+        )
+    ).scalar_one() or 0
+    audit.answeredCheckpoints = answered
+    await db.flush()
+    return {"ok": True, "updated": len(rows), "answered": answered, "value": value}
+
+
 async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
-    audit = await _load_audit(db, audit_id, with_responses=True, with_interactions=True)
+    """Slim detail payload (1500-checkpoint safe). Returns the audit header +
+    discipline rollup + a BOUNDED review set (findings / in-flight rows with
+    their threads) — NOT the full response array. The conduct worklist + the
+    paginated /checkpoints endpoint reach every checkpoint."""
+    audit = await _load_audit(db, audit_id)
     if audit is None:
         return None
-    d = _audit_to_dict(audit, include_responses=True, include_interactions=True)
-    d["progress"] = _live_progress(audit.responses)
-    d["finalizability"] = _finalizability(audit)
+    d = _audit_to_dict(audit)
 
-    # A-03 overview enrichment: factory name + profile link, template name/version,
-    # standards in scope, owner count.
+    rollup = await _discipline_rollup(db, audit_id)
+    d["disciplineRollup"] = rollup
+    d["progress"] = _progress_from_rollup(rollup)
+    d["finalizability"] = await _finalizability_db(db, audit)
+    d["allocationSummary"] = await _allocation_summary(db, audit_id)
+
+    # Bounded review set: adverse / in-flight rows (the only ones the detail page
+    # acts on) WITH their interaction threads. Pass/NA/OPEN rows are reached via
+    # the conduct worklist. Capped — beyond the cap the worklist is the path.
+    R = AuditCheckpointResponse
+    findings = (
+        await db.execute(
+            select(R).where(R.auditId == audit_id, _review_clause())
+            .order_by(R.sequence).limit(_REVIEW_CAP)
+            .options(selectinload(R.interactions))
+        )
+    ).scalars().all()
+    d["responses"] = [_response_to_dict(r, include_interactions=True) for r in findings]
+    d["responsesTruncated"] = len(findings) >= _REVIEW_CAP
+
+    # A-03 overview enrichment: factory name + profile link, template, standards,
+    # owner count — all via light aggregates (no full row load).
     plant = await db.get(Plant, audit.plantId)
     d["plantName"] = plant.name if plant else audit.plantId
     d["plantCode"] = plant.code if plant else None
-    fp = (
-        await db.execute(
-            select(FactoryProfile.id).where(FactoryProfile.siteId == audit.plantId)
-        )
+    d["factoryProfileId"] = (
+        await db.execute(select(FactoryProfile.id).where(FactoryProfile.siteId == audit.plantId))
     ).scalar_one_or_none()
-    d["factoryProfileId"] = fp
     if audit.templateId:
         tmpl = await db.get(AuditTemplate, audit.templateId)
         d["templateName"] = tmpl.name if tmpl else None
@@ -418,16 +828,28 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     else:
         d["templateName"] = None
         d["templateVersion"] = None
-    d["standards"] = sorted({(r.standard or "").strip() for r in audit.responses if (r.standard or "").strip()})
-    d["ownerCount"] = len({r.assignedOwnerId or r.routedToUserId for r in audit.responses if (r.assignedOwnerId or r.routedToUserId)})
+    std_rows = (
+        await db.execute(select(R.standard).where(R.auditId == audit_id, R.standard != "").distinct())
+    ).scalars().all()
+    d["standards"] = sorted({(s or "").strip() for s in std_rows if (s or "").strip()})
+    owner_rows = (
+        await db.execute(
+            select(func.coalesce(R.assignedOwnerId, R.routedToUserId)).where(
+                R.auditId == audit_id,
+                or_(R.assignedOwnerId.isnot(None), R.routedToUserId.isnot(None)),
+            ).distinct()
+        )
+    ).scalars().all()
+    owners = {o for o in owner_rows if o}
+    d["ownerCount"] = len(owners)
 
-    # Resolve names for EVERY referenced actor (incl. cross-plant ALL_PLANTS
-    # users the plant-scoped /users picker can't return) so the meta strip,
-    # iteration thread and owner chips always show a name, not "—".
+    # Resolve names for every referenced actor (header + the review rows' owners
+    # and thread actors) so the meta strip + owner chips never show "—".
     uid_set: set[str] = {audit.leadAuditorUserId, audit.plantManagerUserId}
-    uid_set.update(audit.coAuditors or [])
+    uid_set.update(_coauditor_ids(audit.coAuditors))
     uid_set.update((a.get("userId") if isinstance(a, dict) else a) for a in (audit.auditees or []))
-    for r in audit.responses:
+    uid_set.update(owners)
+    for r in findings:
         uid_set.update((r.assignedOwnerId, r.routedToUserId, r.addedById, r.assignedById))
         for i in r.interactions:
             uid_set.add(i.actorId)
@@ -529,11 +951,15 @@ def _compute_score(audit: ComplianceAudit, responses: list[AuditCheckpointRespon
 
 
 async def audit_dashboard(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
-    audit = await _load_audit(db, audit_id, with_responses=True)
+    audit = await _load_audit(db, audit_id)  # header only — score via aggregate
     if audit is None:
         return None
-    score = _compute_score(audit, audit.responses)
-    crit_total = sum(1 for r in audit.responses if r.criticality == "critical")
+    rollup = await _discipline_rollup(db, audit_id)
+    score = _score_from_rollup(rollup)
+    R = AuditCheckpointResponse
+    crit_total = (
+        await db.execute(select(func.count(R.id)).where(R.auditId == audit_id, R.criticality == "critical"))
+    ).scalar_one() or 0
     crit_compliant = crit_total - score["critical_failures"]
     return {
         "auditId": audit.id,
@@ -576,6 +1002,17 @@ def _route_for_category(category_code: str, auditees: list[dict[str, Any]]) -> s
         if category_code in cats:
             return a.get("userId")
     return None
+
+
+def _route_auditor_for_category(category_code: str, co_auditors: list | None, lead_id: str) -> str:
+    """Which auditor conducts this discipline. coAuditors may be the structured
+    shape [{userId, disciplineIds}] (a discipline match wins) or the legacy flat
+    [userId] (no per-discipline scope → lead conducts). Falls back to the lead."""
+    for c in co_auditors or []:
+        if isinstance(c, dict):
+            if category_code in (c.get("disciplineIds") or []) and c.get("userId"):
+                return c["userId"]
+    return lead_id
 
 
 async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) -> ComplianceAudit:
@@ -668,6 +1105,7 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
             seq += 1
             order_in_disc += 1
             owner = _route_for_category(cat_code, auditees)
+            auditor = _route_auditor_for_category(cat_code, audit.coAuditors, audit.leadAuditorUserId)
             rows.append(
                 AuditCheckpointResponse(
                     auditId=audit.id,
@@ -690,6 +1128,7 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
                     linkedSafeopsModule=cp.get("linked_safeops_module"),
                     routedToUserId=owner,
                     assignedOwnerId=owner,
+                    assignedAuditorId=auditor,
                     assessmentStatus="NOT_ASSESSED",
                     workflowState="OPEN",
                     currentRound=0,
@@ -725,6 +1164,7 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
             seq += 1
             order_max[dcode] = order_max.get(dcode, 0) + 1
             owner = _route_for_category(dcode, auditees)
+            auditor = _route_auditor_for_category(dcode, audit.coAuditors, audit.leadAuditorUserId)
             rows.append(
                 _new_checkpoint_row(
                     audit=audit, cat_code=dcode, cat_name=cname, cat_color=ccolor,
@@ -734,7 +1174,7 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
                     requirement_reference=ccp.get("requirement_reference", ""),
                     standard=ccp.get("standard", ""),
                     requires_photo=bool(ccp.get("evidence_required_on_fail")),
-                    sequence=seq, order_index=order_max[dcode], owner=owner,
+                    sequence=seq, order_index=order_max[dcode], owner=owner, auditor=auditor,
                     is_adhoc=True, added_by=ccp.get("added_by_id"),
                 )
             )
@@ -803,6 +1243,7 @@ async def add_disciplines(
             seq += 1
             order_in_disc += 1
             owner = _route_for_category(cat_code, auditees)
+            auditor = _route_auditor_for_category(cat_code, audit.coAuditors, audit.leadAuditorUserId)
             new_rows.append(
                 AuditCheckpointResponse(
                     auditId=audit.id,
@@ -825,6 +1266,7 @@ async def add_disciplines(
                     linkedSafeopsModule=cp.get("linked_safeops_module"),
                     routedToUserId=owner,
                     assignedOwnerId=owner,
+                    assignedAuditorId=auditor,
                     assessmentStatus="NOT_ASSESSED",
                     workflowState="OPEN",
                     currentRound=0,
@@ -861,8 +1303,8 @@ def _new_checkpoint_row(
     question: str, criticality: str, guidance: str = "", requirement_reference: str = "",
     standard: str = "", response_type: str = "pass_partial_fail", requires_photo: bool = False,
     auto_capa: bool = False, capa_severity: str | None = None, linked_module: str | None = None,
-    sequence: int, order_index: int, owner: str | None = None, is_adhoc: bool = False,
-    added_by: str | None = None,
+    sequence: int, order_index: int, owner: str | None = None, auditor: str | None = None,
+    is_adhoc: bool = False, added_by: str | None = None,
 ) -> AuditCheckpointResponse:
     return AuditCheckpointResponse(
         auditId=audit.id, plantId=audit.plantId,
@@ -874,6 +1316,7 @@ def _new_checkpoint_row(
         requiresPhotoOnFail=bool(requires_photo), autoTriggerCapaOnFail=bool(auto_capa),
         capaSeverity=capa_severity, linkedSafeopsModule=linked_module,
         routedToUserId=owner, assignedOwnerId=owner,
+        assignedAuditorId=auditor or audit.leadAuditorUserId,
         assessmentStatus="NOT_ASSESSED", workflowState="OPEN", currentRound=0,
         isAdHoc=is_adhoc, addedById=added_by, overallStatus="not_answered",
     )
@@ -924,7 +1367,11 @@ async def _log_interaction(
 
 
 def _actor_role_for(user: User, audit: ComplianceAudit) -> str:
-    return "LEAD_AUDITOR" if user.id == audit.leadAuditorUserId else "AUDITOR"
+    if user.id == audit.leadAuditorUserId:
+        return "LEAD_AUDITOR"
+    if user.id in _coauditor_ids(audit.coAuditors):
+        return "CO_AUDITOR"
+    return "AUDITOR"
 
 
 async def add_adhoc_checkpoint(
@@ -979,6 +1426,7 @@ async def add_adhoc_checkpoint(
     order_index = max((r.orderIndex for r in audit.responses if r.categoryId == disc_code), default=0) + 1
     seq = max((r.sequence for r in audit.responses), default=0) + 1
     owner = payload.get("assignedOwnerId") or _route_for_category(disc_code, audit.auditees or [])
+    auditor = _route_auditor_for_category(disc_code, audit.coAuditors, audit.leadAuditorUserId)
 
     row = _new_checkpoint_row(
         audit=audit, cat_code=disc_code, cat_name=name, cat_color=color, code=code, question=question,
@@ -987,7 +1435,7 @@ async def add_adhoc_checkpoint(
         requirement_reference=payload.get("requirementReference", ""),
         standard=payload.get("standardClauseRef") or payload.get("standard", ""),
         requires_photo=bool(payload.get("evidenceRequiredOnFail")),
-        sequence=seq, order_index=order_index, owner=owner, is_adhoc=True, added_by=user.id,
+        sequence=seq, order_index=order_index, owner=owner, auditor=auditor, is_adhoc=True, added_by=user.id,
     )
     db.add(row)
     await db.flush()
@@ -1482,7 +1930,7 @@ async def _spawn_capa(
                 plantId=audit.plantId,
                 sourceTypeCode="AUDIT_INTERNAL",
                 sourceReferenceId=response.id,
-                sourceReferenceUrl=f"/audit-compliance/{audit.id}",
+                sourceReferenceUrl=f"/cams/audits/{audit.id}",
                 sourceReferenceSummary=f"Audit {audit.auditNumber} — {response.checkpointCode} failed",
                 sourceMetadata={
                     "auditNumber": audit.auditNumber,
@@ -1881,7 +2329,6 @@ def _build_report_snapshot(audit: ComplianceAudit, report_type: str) -> dict[str
     open_iters: list[dict[str, Any]] = []
     crit_open = 0
     capa_total = capa_open = capa_overdue = 0
-    register: list[dict[str, Any]] = []
     now = _naive(_utcnow())
 
     for r in responses:
@@ -1916,16 +2363,6 @@ def _build_report_snapshot(audit: ComplianceAudit, report_type: str) -> dict[str
             })
             if r.criticality == "critical" and val == "fail":
                 crit_open += 1
-        if report_type == "FINAL":
-            register.append({
-                "checkpointCode": r.checkpointCode, "discipline": r.categoryName, "question": r.checkpointQuestion,
-                "severity": r.criticality, "assessmentStatus": r.assessmentStatus, "workflowState": r.workflowState,
-                "standard": r.standard, "requirementReference": r.requirementReference,
-                "observation": r.observation, "isAdHoc": r.isAdHoc, "ownerId": owner,
-                "capaNumber": capa.get("capa_number"),
-                "auditorEvidenceIds": r.auditorEvidenceIds or [], "auditeeEvidenceIds": r.auditeeEvidenceIds or [],
-                "interactions": [_interaction_to_dict(i) for i in sorted(r.interactions, key=lambda x: (x.timestamp, x.round))],
-            })
 
     # Zero-assessable (e.g. all-NA / nothing assessed) audit: a 0% next to
     # "Conforming" is contradictory, so report a neutral NOT_ASSESSED result +
@@ -1933,6 +2370,18 @@ def _build_report_snapshot(audit: ComplianceAudit, report_type: str) -> dict[str
     assessable = score["passed"] + score["partially_passed"] + score["failed"]
     overall_pct = None if assessable == 0 else score["overall_score_pct"]
     overall_result = "NOT_ASSESSED" if assessable == 0 else _result_label(score)
+
+    # Per-discipline RAG summary — the structured spine of the report (so 1500
+    # checkpoints read as a discipline breakdown, not a flat dump). all-NA /
+    # not-assessed disciplines → null pct (neutral, not a misleading 0%; M1).
+    discipline_rag = []
+    for c in score["category_scores"]:
+        d_assess = c["passed"] + c["partial"] + c["failed"]
+        discipline_rag.append({
+            "categoryId": c["category_id"], "categoryName": c["category_name"], "total": c["total"],
+            "passed": c["passed"], "partial": c["partial"], "failed": c["failed"], "na": c["na"],
+            "pct": None if d_assess == 0 else round((c["passed"] + 0.5 * c["partial"]) / d_assess * 100, 1),
+        })
 
     snapshot: dict[str, Any] = {
         "reportType": report_type,
@@ -1954,9 +2403,14 @@ def _build_report_snapshot(audit: ComplianceAudit, report_type: str) -> dict[str
         "adHocCount": audit.adHocCount or 0,
         "capaSummary": {"total": capa_total, "open": capa_open, "overdue": capa_overdue},
         "findings": findings, "openIterations": open_iters,
+        "disciplineRag": discipline_rag,
     }
     if report_type == "FINAL":
-        snapshot["checkpointRegister"] = register
+        # The full checkpoint register (every row + its thread) is NOT inlined
+        # into the immutable snapshot — at 1500 checkpoints that is unbounded
+        # JSON. It is served lazily/paginated from GET /reports/{id}/register
+        # (the audit is read-only post-close, so the register is stable).
+        snapshot["hasFullRegister"] = True
         snapshot["standardsRollup"] = _standards_rollup(responses)
         snapshot["finalizability"] = _finalizability(audit)
     return snapshot
@@ -1981,7 +2435,9 @@ async def generate_report(
     if report_type not in ("INTERIM", "FINAL"):
         raise ValueError("reportType must be INTERIM or FINAL")
 
-    audit = await _load_audit(db, audit_id, with_responses=True, with_interactions=(report_type == "FINAL"))
+    # Interactions are no longer inlined into the snapshot (FINAL register is
+    # served lazily), so a plain responses load suffices for both report types.
+    audit = await _load_audit(db, audit_id, with_responses=True)
     if audit is None:
         raise ValueError("Audit not found")
 
@@ -2005,9 +2461,6 @@ async def generate_report(
     uid_set: set[str] = {audit.leadAuditorUserId, audit.plantManagerUserId}
     for r in audit.responses:
         uid_set.update((r.assignedOwnerId, r.routedToUserId))
-        if report_type == "FINAL":
-            for i in r.interactions:
-                uid_set.add(i.actorId)
     uid_set.update((so or {}).get("userId") for so in (sign_offs or []))
     uid_set = {u for u in uid_set if u}
     snapshot["userNames"] = {}
@@ -2072,3 +2525,49 @@ async def list_reports(db: AsyncSession, audit_id: str) -> list[dict[str, Any]]:
 async def get_report(db: AsyncSession, report_id: str) -> dict[str, Any] | None:
     rep = await db.get(AuditReport, report_id)
     return _report_to_dict(rep) if rep else None
+
+
+async def list_report_register(
+    db: AsyncSession, *, report_id: str, discipline_id: str | None = None,
+    cursor: str | None = None, limit: int = 50,
+) -> dict[str, Any] | None:
+    """The FINAL report's full checkpoint register, paginated + lazy (not stored
+    in the snapshot). The audit is read-only post-close so the register is
+    stable. Each entry carries its full iteration thread."""
+    rep = await db.get(AuditReport, report_id)
+    if rep is None:
+        return None
+    R = AuditCheckpointResponse
+    conds = [R.auditId == rep.auditId]
+    if discipline_id:
+        conds.append(R.categoryId == discipline_id)
+    total = (await db.execute(select(func.count(R.id)).where(*conds))).scalar_one() or 0
+    paged = select(R).where(*conds).order_by(R.sequence, R.id).options(selectinload(R.interactions))
+    if cursor:
+        try:
+            c_seq_s, c_id = cursor.split(":", 1)
+            c_seq = int(c_seq_s)
+        except (ValueError, AttributeError) as e:
+            raise ValueError("Invalid cursor") from e
+        paged = paged.where(or_(R.sequence > c_seq, and_(R.sequence == c_seq, R.id > c_id)))
+    limit = max(1, min(limit, 200))
+    rows = (await db.execute(paged.limit(limit + 1))).scalars().all()
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    register = [
+        {
+            "checkpointCode": r.checkpointCode, "discipline": r.categoryName, "question": r.checkpointQuestion,
+            "severity": r.criticality, "assessmentStatus": r.assessmentStatus, "workflowState": r.workflowState,
+            "standard": r.standard, "requirementReference": r.requirementReference,
+            "observation": r.observation, "isAdHoc": r.isAdHoc,
+            "ownerId": r.assignedOwnerId or r.routedToUserId, "capaNumber": (r.capa or {}).get("capa_number"),
+            "auditorEvidenceIds": r.auditorEvidenceIds or [], "auditeeEvidenceIds": r.auditeeEvidenceIds or [],
+            "interactions": [_interaction_to_dict(i) for i in sorted(r.interactions, key=lambda x: (x.timestamp, x.round))],
+        }
+        for r in items
+    ]
+    return {
+        "auditId": rep.auditId, "siteId": rep.siteId, "register": register,
+        "nextCursor": f"{items[-1].sequence}:{items[-1].id}" if has_more and items else None,
+        "total": total, "returned": len(items),
+    }

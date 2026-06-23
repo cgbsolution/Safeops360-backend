@@ -181,8 +181,11 @@ class AuditCheckpointResponse(Base, IdMixin):
 
     routedToUserId: Mapped[str | None] = mapped_column(String)
 
-    # Per-checkpoint owner allocation (audit-lifecycle v2).
+    # Per-checkpoint owner allocation (audit-lifecycle v2). assignedOwnerId is
+    # the AUDITEE (responds to a finding); assignedAuditorId is the AUDITOR who
+    # conducts the checkpoint (per-discipline auditor assignment).
     assignedOwnerId: Mapped[str | None] = mapped_column(String)
+    assignedAuditorId: Mapped[str | None] = mapped_column(String)
     assignedById: Mapped[str | None] = mapped_column(String)
     assignedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

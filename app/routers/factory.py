@@ -33,9 +33,16 @@ from app.models.factory import (
     SocialComplianceProfile,
     WorkforceComposition,
 )
+from app.models.factory_ext import (
+    FactoryEquipment,
+    FactoryLifecycleEvent,
+    HazardousMaterial,
+    RegulatoryRegistration,
+)
 from app.models.user import User
 from app.schemas import factory as S
 from app.services import factory as svc
+from app.services import factory_ext as svc_ext
 from app.services import factory_snapshot as snap_svc
 from app.services.permissions import PermissionContext, can, get_accessible_plants
 
@@ -147,6 +154,7 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
     base.certCount = len(cert_outs)
     base.certsExpiringCount = sum(1 for c in cert_outs if svc.cert_is_expiring(c.status))
     current = next((w for w in workforce if w.isCurrent), None)
+    extras = await svc_ext.load_profile_extras(db, p.id)
     return S.FactoryProfileDetail(
         **base.model_dump(),
         buildings=[S.BuildingOut.model_validate(b) for b in buildings],
@@ -156,6 +164,10 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
         certifications=cert_outs,
         contacts=[S.FactoryContactOut.model_validate(ct) for ct in contacts],
         socialCompliance=_social_out(social) if social else None,
+        equipment=extras["equipment"],
+        hazardousMaterials=extras["hazardousMaterials"],
+        regulatoryRegistrations=extras["regulatoryRegistrations"],
+        lifecycleEvents=extras["lifecycleEvents"],
     )
 
 
@@ -361,6 +373,15 @@ async def create_profile(body: S.FactoryProfileCreate, user: User = Depends(get_
     await db.flush()
     p.profileStatus = await svc.compute_profile_status(db, p)
 
+    # Seed the lifecycle workflow at INITIATED with an opening event.
+    p.lifecycleStageOwnerRole = svc_ext.stage_owner_role(p.lifecycleStage)
+    p.lifecycleUpdatedAt = _now()
+    db.add(FactoryLifecycleEvent(
+        factoryProfileId=p.id, siteId=p.siteId, fromStage=None, toStage=p.lifecycleStage,
+        action="INITIATE", performedBy=user.id, performedByRole=getattr(user, "role", None),
+        comment="Factory profile created.", createdBy=user.id,
+    ))
+
     try:
         await db.commit()
     except IntegrityError:
@@ -408,13 +429,18 @@ async def delete_profile(profile_id: str, user: User = Depends(get_current_user)
     p.updatedBy = user.id
     # Cascade the soft-delete to children (the DB FK cascade only fires on a
     # HARD delete, so a soft-deleted profile would otherwise leave active orphans).
-    for model in (Building, WorkforceComposition, ProductionProcess, FactoryCertification, FactoryContact, SocialComplianceProfile):
+    for model in (
+        Building, WorkforceComposition, ProductionProcess, FactoryCertification, FactoryContact,
+        SocialComplianceProfile, FactoryEquipment, HazardousMaterial, RegulatoryRegistration,
+        FactoryLifecycleEvent,
+    ):
         await db.execute(
             update(model)
             .where(model.factoryProfileId == p.id)
             .where(model.isDeleted.is_(False))
             .values(isDeleted=True, updatedBy=user.id)
         )
+    p.lifecycleStage = "ARCHIVED"
     await db.commit()
 
 

@@ -117,9 +117,17 @@ from app.models.factory import (
     FactoryCertification,
     FactoryComplianceSnapshot,
     FactoryContact,
+    FactoryEnvPeriod,
     FactoryProfile,
     ProductionProcess,
+    SocialComplianceProfile,
     WorkforceComposition,
+)
+from app.models.factory_ext import (
+    FactoryEquipment,
+    FactoryLifecycleEvent,
+    HazardousMaterial,
+    RegulatoryRegistration,
 )
 from app.models.flra import FLRA, FLRACrewSignature, FLRAStatus, FLRATeamMember
 from app.models.eai import (
@@ -300,8 +308,14 @@ __all__ = [
     "FactoryCertification",
     "FactoryComplianceSnapshot",
     "FactoryContact",
+    "FactoryEnvPeriod",
+    "SocialComplianceProfile",
     "ProductionProcess",
     "WorkforceComposition",
+    "FactoryEquipment",
+    "FactoryLifecycleEvent",
+    "HazardousMaterial",
+    "RegulatoryRegistration",
     "BcExercise",
     "BusinessProcess",
     "CallTree",

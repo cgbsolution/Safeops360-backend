@@ -174,6 +174,7 @@ _OWNER_FIELDS = (
     "createdById",
     "routedToUserId",
     "assignedOwnerId",
+    "assignedAuditorId",
 )
 
 

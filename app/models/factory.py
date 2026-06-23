@@ -77,6 +77,13 @@ class FactoryProfile(Base, IdMixin):
     lastReviewedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     nextReviewDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # lifecycle workflow (INITIATED → EXECUTION → VALIDATION → ACTIVE → ARCHIVED).
+    # Separate from `profileStatus` (data-completeness) — this is the governance
+    # approval state. See models/factory_ext.FactoryLifecycleEvent for the history.
+    lifecycleStage: Mapped[str] = mapped_column(String, nullable=False, default="INITIATED")
+    lifecycleStageOwnerRole: Mapped[str | None] = mapped_column(String)
+    lifecycleUpdatedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     buildings: Mapped[list["Building"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
     workforceCompositions: Mapped[list["WorkforceComposition"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")
     productionProcesses: Mapped[list["ProductionProcess"]] = relationship(back_populates="factoryProfile", cascade="all, delete-orphan")

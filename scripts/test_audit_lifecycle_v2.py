@@ -146,10 +146,14 @@ async def main() -> None:
         await svc.transition_checkpoint(db, user=owner, audit_id=a8.id, checkpoint_id=cpf.id, action="AUDITEE_RESPOND", payload={"comment": "fixed"})
         await svc.transition_checkpoint(db, user=lead, audit_id=a8.id, checkpoint_id=cpf.id, action="ACCEPT", payload={"comment": "ok"})
         f1 = await svc.generate_report(db, user=lead, audit_id=a8.id, report_type="FINAL", sign_offs=[{"role": "LEAD_AUDITOR", "userId": lead.id}])
-        has_register = "checkpointRegister" in f1["snapshot"] and len(f1["snapshot"]["checkpointRegister"]) == len(r8)
+        # The full register is now served lazily (not inlined into the immutable
+        # snapshot — 1500-cp safe). FINAL sets hasFullRegister; the register
+        # endpoint paginates the whole set.
+        reg = await svc.list_report_register(db, report_id=f1["id"], limit=200)
+        has_register = (f1["snapshot"].get("hasFullRegister") is True) and reg is not None and reg["total"] == len(r8)
         check("TL-09", i1["reportType"] == "INTERIM" and "checkpointRegister" not in i1["snapshot"] and final_blocked
               and has_register and bool(snap_hash) and f1["signOffs"],
-              f"interim+final ok, final-blocked-while-open={final_blocked}, register={has_register}")
+              f"interim+final ok, final-blocked-while-open={final_blocked}, lazy-register={has_register}")
 
         # ── TL-11 tenant isolation (my-checkpoints plant-scoped) ────────
         empty = await svc.my_assigned_checkpoints(db, user=owner, accessible_plants=[])

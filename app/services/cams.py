@@ -18,11 +18,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy.orm import selectinload
 
+from app.models.audit_compliance import AuditCheckpointResponse, ComplianceAudit
 from app.models.capa import Capa, CapaSourceCategory, CapaSourceType
 from app.models.cams import (
     CamsAuditType,
@@ -597,6 +598,65 @@ async def compute_analytics(db: AsyncSession) -> dict[str, Any]:
     )
     capa_overdue_pct = round((capa_overdue / len(capa_open)) * 100, 1) if capa_open else 0
 
+    # ── Fold in ComplianceAudit audits (centralized union) ────────────────────
+    a_engs = await audit_engagements(db)
+    a_finds = await audit_findings(db)
+    _AUDIT_CONDUCTED = {"IN_PROGRESS", "FINDINGS_REVIEW", "REPORT_ISSUED", "CLOSED"}
+    _PROG_BUCKET = {"SCHEDULED": "scheduled", "IN_PROGRESS": "inProgress",
+                    "FINDINGS_REVIEW": "fieldworkComplete", "REPORT_ISSUED": "reportIssued",
+                    "CLOSED": "closed", "CANCELLED": "cancelled", "PLANNED": "planned"}
+    bench_by_site = {b["siteId"]: b for b in benchmarking}
+    a_finds_by_site: dict[str | None, list] = {}
+    for af in a_finds:
+        a_finds_by_site.setdefault(af["siteId"], []).append(af)
+        sev_counts[af["severity"]] = sev_counts.get(af["severity"], 0) + 1
+        if af["status"] != "CLOSED":
+            open_findings += 1
+    for ae in a_engs:
+        st = ae["status"]
+        programme[_PROG_BUCKET.get(st, "inProgress")] = programme.get(_PROG_BUCKET.get(st, "inProgress"), 0) + 1
+        programme["total"] += 1
+        by_type["COMPLIANCE_AUDIT"] = by_type.get("COMPLIANCE_AUDIT", 0) + 1
+        by_source["AUDIT"] = by_source.get("AUDIT", 0) + 1
+        if st == "SCHEDULED" and ae.get("plannedDate"):
+            try:
+                if _as_aware(datetime.fromisoformat(ae["plannedDate"])) < today:
+                    programme["overdue"] += 1
+            except (TypeError, ValueError):
+                pass
+        # Benchmarking fold-in.
+        sid = ae["siteId"]
+        b = bench_by_site.get(sid)
+        if b is None:
+            b = {"siteId": sid, "siteName": ae.get("siteName") or "Corporate / unspecified",
+                 "auditsPlanned": 0, "auditsConducted": 0, "completionRatePct": 0, "avgScorePct": None,
+                 "findingCount": 0, "findingDensity": 0, "majorCriticalCount": 0, "repeatCount": 0,
+                 "_scores": []}
+            bench_by_site[sid] = b
+            benchmarking.append(b)
+        b.setdefault("_scores", [])
+        b["auditsPlanned"] += 1
+        if st in _AUDIT_CONDUCTED:
+            b["auditsConducted"] += 1
+        if ae.get("scorePercent") is not None:
+            b["_scores"].append(ae["scorePercent"])
+        sf = a_finds_by_site.get(sid, [])
+        b["findingCount"] += len(sf)
+        b["majorCriticalCount"] += sum(1 for f in sf if f["severity"] in ("MAJOR_NC", "CRITICAL_NC"))
+    # Recompute blended benchmarking aggregates for sites touched by audits.
+    for b in benchmarking:
+        scores = b.pop("_scores", None)
+        if scores:
+            existing = [b["avgScorePct"]] if b["avgScorePct"] is not None else []
+            alls = existing + scores
+            b["avgScorePct"] = round(sum(alls) / len(alls), 1)
+        b["completionRatePct"] = round((b["auditsConducted"] / b["auditsPlanned"]) * 100, 1) if b["auditsPlanned"] else 0
+        b["findingDensity"] = round(b["findingCount"] / b["auditsConducted"], 2) if b["auditsConducted"] else 0
+    conducted_combined = sum(programme.get(k, 0) for k in ("inProgress", "fieldworkComplete", "reportIssued", "closed"))
+    programme["completionRatePct"] = round((conducted_combined / programme["total"]) * 100, 1) if programme["total"] else 0
+    combined_findings_n = len(findings) + len(a_finds)
+    repeat_rate = round((repeat / combined_findings_n) * 100, 1) if combined_findings_n else 0
+
     return {
         "programme": programme,
         "findingsBySeverity": sev_counts,
@@ -684,3 +744,130 @@ async def compute_compliance(db: AsyncSession) -> dict[str, Any]:
         "statusCounts": status_counts,
         "rows": rows,
     }
+
+
+# ── ComplianceAudit → CAMS union adapters ──────────────────────────────────────
+# Audits run on the ComplianceAudit engine but the centralized CAMS surfaces
+# (command centre / calendar / findings / analytics) present a UNION of audits +
+# inspections. These adapters project ComplianceAudit rows into the CAMS
+# Engagement / Finding DTO shapes (with status + severity vocab translation) so
+# the existing CAMS frontends render audits unchanged.
+
+# ComplianceAudit lifecycle status -> CAMS engagement status vocabulary.
+_AUDIT_STATUS_TO_CAMS = {
+    "scheduled": "SCHEDULED",
+    "in_progress": "IN_PROGRESS",
+    "submitted_pending_response": "FINDINGS_REVIEW",
+    "response_in_progress": "FINDINGS_REVIEW",
+    "under_review": "FINDINGS_REVIEW",
+    "closed": "CLOSED",
+    "cancelled": "CANCELLED",
+}
+
+# Checkpoint criticality -> CAMS finding severity.
+_AUDIT_CRIT_TO_SEV = {
+    "critical": "CRITICAL_NC", "major": "MAJOR_NC", "minor": "MINOR_NC", "observation": "OBSERVATION",
+}
+
+
+def _audit_finding_status(workflow_state: str, capa: dict | None) -> str:
+    """Checkpoint workflowState -> CAMS finding status vocabulary."""
+    if workflow_state in ("RESOLVED", "FINALIZED"):
+        return "CLOSED"
+    if workflow_state == "ACCEPTED_WITH_CAPA" or (capa or {}).get("capa_id"):
+        return "CAPA_RAISED"
+    return "OPEN"  # AWAITING_AUDITEE / AUDITEE_RESPONDED / MORE_INFO_REQUESTED / ESCALATED_PM / OPEN
+
+
+async def audit_engagements(db: AsyncSession) -> list[dict[str, Any]]:
+    """ComplianceAudit rows as CAMS Engagement dicts (href → /cams/audits/{id})."""
+    A = ComplianceAudit
+    audits = (await db.execute(select(A))).scalars().all()
+    if not audits:
+        return []
+    # Finding counts (fail/partial) + open counts per audit — one grouped query.
+    R = AuditCheckpointResponse
+    adverse = R.assessmentStatus.in_(["FAIL", "PARTIAL"])
+    not_resolved = R.workflowState.notin_(["RESOLVED", "ACCEPTED_WITH_CAPA", "FINALIZED", "PASSED"])
+    fc_rows = (
+        await db.execute(
+            select(
+                R.auditId,
+                func.count(R.id).filter(adverse).label("findings"),
+                func.count(R.id).filter(and_(adverse, not_resolved)).label("open"),
+            ).group_by(R.auditId)
+        )
+    ).all()
+    fc = {r.auditId: (r.findings, r.open) for r in fc_rows}
+    names = await user_name_map(db, [a.leadAuditorUserId for a in audits])
+    plants = await plant_name_map(db, [a.plantId for a in audits])
+    out = []
+    for a in audits:
+        findings_n, open_n = fc.get(a.id, (0, 0))
+        out.append({
+            "id": a.id, "engagementCode": a.auditNumber, "title": a.title,
+            "engagementType": "COMPLIANCE_AUDIT", "auditTypeId": None, "auditTypeName": None,
+            "standardRefs": [], "siteId": a.plantId, "siteName": plants.get(a.plantId),
+            "areaOrAssetRef": None, "scopeStatement": a.scopeDescription or "",
+            "leadAuditorId": a.leadAuditorUserId, "leadAuditorName": names.get(a.leadAuditorUserId),
+            "auditTeamIds": [], "auditeeOwnerId": None, "auditeeOwnerName": None,
+            "plannedDate": a.scheduledDate.isoformat() if a.scheduledDate else None,
+            "scheduledStart": None, "scheduledEnd": None,
+            "conductedDate": a.actualStartAt.isoformat() if a.actualStartAt else None,
+            "templateId": a.templateId, "templateName": None, "templateVersionUsed": None,
+            "status": _AUDIT_STATUS_TO_CAMS.get(a.status, "IN_PROGRESS"),
+            "riskBasis": None, "triggeringRiskId": None,
+            "overallResult": None, "scorePercent": a.overallCompliancePct,
+            "nextScheduledDate": None, "sourceModule": "AUDIT",
+            "findingCount": findings_n, "openFindingCount": open_n,
+            "ncCount": findings_n, "updatedAt": a.updatedAt.isoformat() if a.updatedAt else None,
+            # Provenance: the audit lives in the ComplianceAudit module.
+            "href": f"/cams/audits/{a.id}",
+        })
+    return out
+
+
+async def audit_findings(db: AsyncSession) -> list[dict[str, Any]]:
+    """ComplianceAudit fail/partial checkpoints as CAMS Finding dicts."""
+    R = AuditCheckpointResponse
+    rows = (
+        await db.execute(
+            select(R, ComplianceAudit)
+            .join(ComplianceAudit, R.auditId == ComplianceAudit.id)
+            .where(R.assessmentStatus.in_(["FAIL", "PARTIAL"]))
+            .order_by(ComplianceAudit.scheduledDate.desc(), R.sequence)
+        )
+    ).all()
+    if not rows:
+        return []
+    plants = await plant_name_map(db, [a.plantId for _, a in rows])
+    names = await user_name_map(db, [r.assignedOwnerId or r.routedToUserId for r, _ in rows])
+    today = now()
+    out = []
+    for r, a in rows:
+        capa = r.capa or {}
+        due = None  # audit checkpoints carry CAPA due in the capa subdoc
+        owner = r.assignedOwnerId or r.routedToUserId
+        out.append({
+            "id": r.id, "findingCode": r.checkpointCode, "engagementId": a.id,
+            "engagementCode": a.auditNumber, "engagementTitle": a.title,
+            "sourceQuestionId": None, "title": r.checkpointQuestion[:200],
+            "description": r.observation or r.checkpointQuestion, "severity": _AUDIT_CRIT_TO_SEV.get(r.criticality, "MINOR_NC"),
+            "standardClauseRef": r.standard or None, "siteId": a.plantId, "siteName": plants.get(a.plantId),
+            "areaOrAssetRef": None, "ownerId": owner, "ownerName": names.get(owner),
+            "rootCauseMethod": None, "rootCauseSummary": None,
+            "capaId": capa.get("capa_id"), "capaNumber": capa.get("capa_number"), "capaState": capa.get("capa_status"),
+            "status": _audit_finding_status(r.workflowState, capa),
+            "isRepeatFinding": False, "repeatOfFindingId": None, "dueDate": due,
+            "closedBy": None, "closedAt": _iso(r.finalizedAt) if hasattr(r, "finalizedAt") else None,
+            "verificationNote": None, "evidenceAttachmentIds": r.auditorEvidenceIds or [],
+            "ageDays": (today - _as_aware(r.createdAt)).days if r.createdAt else 0,
+            "capaRequired": r.criticality in ("critical", "major"),
+            "createdAt": _iso(r.createdAt), "updatedAt": _iso(r.updatedAt),
+            "href": f"/cams/audits/{a.id}",
+        })
+    return out
+
+
+def _iso(dt) -> str | None:
+    return dt.isoformat() if dt else None

@@ -27,6 +27,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
+from app.models.audit_compliance import AuditCheckpointResponse, ComplianceAudit
 from app.models.capa import Capa
 from app.models.cams import (
     CamsAuditType,
@@ -469,6 +470,44 @@ async def list_engagements(
     return S.EngagementListResponse(items=items, total=len(items), statusCounts=status_counts, typeCounts=type_counts)
 
 
+@router.get("/unified-engagements")
+async def unified_engagements(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Centralized feed: Cams inspections/engagements UNION ComplianceAudit
+    audits (projected to the engagement shape, status vocab translated). Drives
+    the CAMS command centre + calendar. Each item carries `href` so audit rows
+    route to /cams/audits and inspection rows to /cams/engagements."""
+    await _require(db, user, "CAMS.READ")
+    rows = (
+        await db.execute(
+            select(CamsEngagement).where(CamsEngagement.isDeleted.is_(False)).order_by(CamsEngagement.plannedDate.desc())
+        )
+    ).scalars().all()
+    roll = await _finding_rollup(db, [e.id for e in rows])
+    names = await svc.user_name_map(db, [e.leadAuditorId for e in rows] + [e.auditeeOwnerId for e in rows])
+    plants = await svc.plant_name_map(db, [e.siteId for e in rows])
+    type_ids = {e.auditTypeId for e in rows if e.auditTypeId}
+    tpl_ids = {e.templateId for e in rows if e.templateId}
+    types = {t.id: t.name for t in (await db.execute(select(CamsAuditType).where(CamsAuditType.id.in_(type_ids)))).scalars().all()} if type_ids else {}
+    templates = {t.id: t.name for t in (await db.execute(select(CamsTemplate).where(CamsTemplate.id.in_(tpl_ids)))).scalars().all()} if tpl_ids else {}
+
+    cams_items: list[dict[str, Any]] = []
+    for e in rows:
+        d = _serialise_engagement(e, names, plants, types, templates, roll.get(e.id, {})).model_dump()
+        d["href"] = f"/cams/engagements/{e.id}"
+        cams_items.append(d)
+    items = (await svc.audit_engagements(db)) + cams_items
+    items.sort(key=lambda x: x.get("plannedDate") or "", reverse=True)
+    status_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    for it in items:
+        status_counts[it["status"]] = status_counts.get(it["status"], 0) + 1
+        type_counts[it["engagementType"]] = type_counts.get(it["engagementType"], 0) + 1
+    return {"items": items, "total": len(items), "statusCounts": status_counts, "typeCounts": type_counts}
+
+
 async def _engagement_out(db: AsyncSession, e: CamsEngagement) -> S.EngagementOut:
     roll = (await _finding_rollup(db, [e.id])).get(e.id, {})
     names = await svc.user_name_map(db, [e.leadAuditorId, e.auditeeOwnerId])
@@ -745,6 +784,64 @@ async def list_findings(
     return S.FindingListResponse(items=items, total=len(items), severityCounts=sev_counts, statusCounts=status_counts, repeatCount=repeat)
 
 
+@router.get("/unified-findings")
+async def unified_findings(
+    severity: str | None = Query(None),
+    fstatus: str | None = Query(None, alias="status"),
+    standardClauseRef: str | None = Query(None),
+    siteId: str | None = Query(None),
+    repeatOnly: bool = Query(False),
+    overdueOnly: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Centralized findings register: Cams inspection findings UNION
+    ComplianceAudit fail/partial checkpoints (projected to the finding shape).
+    Filters apply to both sources; audit findings are never repeats."""
+    await _require(db, user, "CAMS.READ")
+    rows = (
+        await db.execute(
+            select(CamsFinding).where(CamsFinding.isDeleted.is_(False)).order_by(CamsFinding.createdAt.desc())
+        )
+    ).scalars().all()
+    eng_ids = {f.engagementId for f in rows}
+    engagements = {e.id: e for e in (await db.execute(select(CamsEngagement).where(CamsEngagement.id.in_(eng_ids)))).scalars().all()} if eng_ids else {}
+    names = await svc.user_name_map(db, [f.ownerId for f in rows])
+    plants = await svc.plant_name_map(db, [f.siteId for f in rows])
+    cams_items: list[dict[str, Any]] = []
+    for f in rows:
+        d = (await _serialise_finding(db, f, names, plants, engagements)).model_dump()
+        d["href"] = f"/cams/findings/{f.id}"
+        cams_items.append(d)
+    items = (await svc.audit_findings(db)) + cams_items
+
+    def _keep(it: dict[str, Any]) -> bool:
+        if severity and it["severity"] != severity:
+            return False
+        if fstatus and it["status"] != fstatus:
+            return False
+        if standardClauseRef and (it.get("standardClauseRef") or "") != standardClauseRef:
+            return False
+        if siteId and it.get("siteId") != siteId:
+            return False
+        if repeatOnly and not it.get("isRepeatFinding"):
+            return False
+        if overdueOnly and not (it.get("ageDays") and it["status"] not in ("CLOSED", "ACCEPTED_RISK")):
+            return False
+        return True
+
+    items = [it for it in items if _keep(it)]
+    sev_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    repeat = 0
+    for it in items:
+        sev_counts[it["severity"]] = sev_counts.get(it["severity"], 0) + 1
+        status_counts[it["status"]] = status_counts.get(it["status"], 0) + 1
+        if it.get("isRepeatFinding"):
+            repeat += 1
+    return {"items": items, "total": len(items), "severityCounts": sev_counts, "statusCounts": status_counts, "repeatCount": repeat}
+
+
 @router.post("/findings", response_model=S.FindingOut, status_code=201)
 async def create_finding(body: S.FindingCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "CAMS.FINDING_MANAGE")
@@ -932,6 +1029,17 @@ async def audit_capas(
     eng_ids = {f.engagementId for f in finds.values()}
     engs = {e.id: e for e in (await db.execute(select(CamsEngagement).where(CamsEngagement.id.in_(eng_ids)))).scalars().all()} if eng_ids else {}
 
+    # A CAPA from the ComplianceAudit engine points sourceReferenceId at an
+    # AuditCheckpointResponse (not a CamsFinding). Resolve those too so audit
+    # CAPAs show their checkpoint code + audit number (not blank). The remaining
+    # unresolved ids are the audit-checkpoint ones.
+    acr_ids = [fid for fid in fids if fid not in finds]
+    acr = {r.id: r for r in (await db.execute(
+        select(AuditCheckpointResponse).where(AuditCheckpointResponse.id.in_(acr_ids)))).scalars().all()} if acr_ids else {}
+    acr_audit_ids = {r.auditId for r in acr.values()}
+    acr_audits = {a.id: a for a in (await db.execute(
+        select(ComplianceAudit).where(ComplianceAudit.id.in_(acr_audit_ids)))).scalars().all()} if acr_audit_ids else {}
+
     items = []
     state_counts: dict[str, int] = {}
     overdue_n = open_n = 0
@@ -940,10 +1048,15 @@ async def audit_capas(
         o = S.AuditCapaOut.model_validate(c)
         o.primaryOwnerName = names.get(c.primaryOwnerUserId)
         fnd = finds.get(c.sourceReferenceId) if c.sourceReferenceId else None
+        cp = acr.get(c.sourceReferenceId) if c.sourceReferenceId else None
         if fnd:
             o.findingCode = fnd.findingCode
             eng = engs.get(fnd.engagementId)
             o.engagementCode = eng.engagementCode if eng else None
+        elif cp:
+            o.findingCode = cp.checkpointCode
+            a = acr_audits.get(cp.auditId)
+            o.engagementCode = a.auditNumber if a else None
         is_open = c.state not in closed_states
         if is_open:
             open_n += 1

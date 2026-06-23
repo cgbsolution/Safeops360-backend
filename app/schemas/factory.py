@@ -11,6 +11,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Extension-layer Out schemas embedded in FactoryProfileDetail (one-way import —
+# factory_ext does not import this module, so there is no cycle).
+from app.schemas.factory_ext import (
+    EquipmentOut as FxEquipmentOut,
+    HazmatOut as FxHazmatOut,
+    LifecycleEventOut as FxLifecycleEventOut,
+    RegulatoryOut as FxRegulatoryOut,
+)
+
 FactoryStatusLit = Literal[
     "OPERATIONAL", "UNDER_CONSTRUCTION", "PARTIAL_OPERATION", "SHUTDOWN", "DECOMMISSIONED"
 ]
@@ -493,6 +502,10 @@ class FactoryProfileOut(BaseModel):
     profileStatus: str
     lastReviewedAt: datetime | None = None
     nextReviewDate: datetime | None = None
+    # lifecycle workflow (governance approval state)
+    lifecycleStage: str = "INITIATED"
+    lifecycleStageOwnerRole: str | None = None
+    lifecycleUpdatedAt: datetime | None = None
     # cert roll-up (computed in the list endpoint)
     certCount: int = 0
     certsExpiringCount: int = 0  # EXPIRING_SOON + EXPIRED
@@ -502,8 +515,9 @@ class FactoryProfileOut(BaseModel):
 
 
 class FactoryProfileDetail(FactoryProfileOut):
-    """Profile + its building register, current workforce (+ history) and
-    production processes (F-02 detail page)."""
+    """Profile + its building register, current workforce (+ history),
+    production processes, and the extension layer — equipment / hazardous
+    materials / regulatory registrations / lifecycle events (F-02 detail page)."""
 
     buildings: list[BuildingOut] = []
     currentWorkforce: WorkforceCompositionOut | None = None
@@ -512,6 +526,11 @@ class FactoryProfileDetail(FactoryProfileOut):
     certifications: list[FactoryCertificationOut] = []
     contacts: list[FactoryContactOut] = []
     socialCompliance: SocialComplianceProfileOut | None = None
+    # extension layer (Facilities build spec)
+    equipment: list[FxEquipmentOut] = []
+    hazardousMaterials: list[FxHazmatOut] = []
+    regulatoryRegistrations: list[FxRegulatoryOut] = []
+    lifecycleEvents: list[FxLifecycleEventOut] = []
 
 
 class FactoryProfileListResponse(BaseModel):

@@ -88,6 +88,8 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_RECORDS"},
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        # Audit & Compliance — auditee: read routed audits + respond on own checkpoints.
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ", "UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "CONTRACTOR_WORKMAN": [
         {"module": "SKILL_MATRIX", "actions": ["READ"], "scope": "OWN_RECORDS"},
