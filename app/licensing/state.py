@@ -61,16 +61,26 @@ def licence_file_path() -> str:
 
 
 def read_licence_token() -> str | None:
+    """Locate the licence token. Resolution order:
+      1. the .lic FILE (on-prem default; also where a UI upload is written), then
+      2. the LICENCE_TOKEN env var (robust for cloud/container deploys whose
+         filesystem is ephemeral — set it once in the host's env and it survives
+         restarts).
+    A file, when present and non-empty, wins so a UI upload can override the
+    baseline env token."""
     path = licence_file_path()
     try:
         with open(path, encoding="utf-8") as f:
             token = f.read().strip()
-        return token or None
+        if token:
+            return token
     except FileNotFoundError:
-        return None
-    except OSError as e:  # unreadable / permission — treat as missing, fail closed
+        pass
+    except OSError as e:  # unreadable / permission — fall through to env, fail closed
         log.warning("Could not read licence file %s: %s", path, e)
-        return None
+
+    env_token = (settings.licence_token or "").strip()
+    return env_token or None
 
 
 def write_licence_token(token: str) -> None:

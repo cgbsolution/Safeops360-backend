@@ -47,6 +47,9 @@ DDL: list[str] = [
     """,
     'CREATE UNIQUE INDEX IF NOT EXISTS "FactoryModuleEntitlement_plant_module_key" '
     'ON "FactoryModuleEntitlement" ("plantId", "moduleCode")',
+    # Time-window columns (added later — idempotent ALTERs for existing installs).
+    'ALTER TABLE "FactoryModuleEntitlement" ADD COLUMN IF NOT EXISTS "validFrom" TIMESTAMPTZ',
+    'ALTER TABLE "FactoryModuleEntitlement" ADD COLUMN IF NOT EXISTS "validUntil" TIMESTAMPTZ',
 ]
 
 TABLES = ["LicenceInstallation", "FactoryModuleEntitlement"]

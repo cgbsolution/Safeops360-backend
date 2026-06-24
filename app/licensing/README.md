@@ -121,9 +121,13 @@ On top of that, an admin can turn licensed modules **on/off per factory** from t
 the licence — never grant a module the licence doesn't include — so the
 config-can't-grant rule still holds.
 
-- **Storage:** `FactoryModuleEntitlement` (plantId, moduleCode, enabled) —
-  opt-out; absence of a row = on. Cached in-memory (`factory_entitlements.py`),
-  refreshed on boot + after each save.
+- **Storage:** `FactoryModuleEntitlement` (plantId, moduleCode, enabled,
+  validFrom, validUntil) — opt-out; absence of a row = on with no time bound.
+  Cached in-memory (`factory_entitlements.py`), refreshed on boot + after save.
+- **Validity window:** each module-at-a-factory can be granted for a period
+  (validFrom..validUntil) or with no expiry (validUntil null). The window is
+  evaluated against the licence's monotonic effective clock, so a clock rollback
+  can't extend it either. Outside the window → blocked at that factory.
 - **Effective access at a factory** = `is_module_enabled(code)` (signed ceiling)
   AND not disabled for that plant. `enforcement.is_module_enabled_for_plant`.
 - **Runtime factory** = the active plant. The frontend writes it to the

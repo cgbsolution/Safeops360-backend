@@ -352,7 +352,7 @@ def test_per_factory_allocation_within_ceiling():
     st = evaluate(token(edition="FULL_PLATFORM",
                         enabledModules=["CAMS", "PTW", "INCIDENT"]))
     licence_state._set_state(st)
-    fe._disabled = {"plant-A": {"PTW"}}
+    fe._overrides = {"plant-A": {"PTW": fe.Override(enabled=False, valid_from=None, valid_until=None)}}
     try:
         # Per-factory effective access.
         assert is_module_enabled_for_plant("PTW", "plant-A") is False   # disabled here
@@ -379,7 +379,46 @@ def test_per_factory_allocation_within_ceiling():
         assert is_module_enabled_for_plant("ERM", "plant-A") is False
         assert is_module_enabled_for_plant("ERM", "plant-B") is False
     finally:
-        fe._disabled = {}
+        fe._overrides = {}
+
+
+def test_per_factory_validity_window():
+    # A factory is granted CAMS only for a fixed period; never-expire for PTW.
+    from app.licensing import factory_entitlements as fe
+    from app.licensing.enforcement import is_module_enabled_for_plant
+
+    st = evaluate(token(edition="FULL_PLATFORM", enabledModules=["CAMS", "PTW"]))
+    licence_state._set_state(st)
+    window_from = BASE + timedelta(days=10)
+    window_to = BASE + timedelta(days=40)
+    fe._overrides = {
+        "plant-A": {
+            "CAMS": fe.Override(enabled=True, valid_from=window_from, valid_until=window_to),
+            "PTW": fe.Override(enabled=True, valid_from=None, valid_until=None),  # never expires
+        }
+    }
+    try:
+        # CAMS is gated by the window; the per-factory check evaluates against
+        # the supplied clock.
+        before = BASE + timedelta(days=5)
+        within = BASE + timedelta(days=20)
+        after = BASE + timedelta(days=50)
+        assert fe.is_enabled_for_plant("CAMS", "plant-A", before) is False   # not started
+        assert fe.is_enabled_for_plant("CAMS", "plant-A", within) is True    # in window
+        assert fe.is_enabled_for_plant("CAMS", "plant-A", after) is False    # window ended
+        # PTW has no window → always on (within the ceiling).
+        assert fe.is_enabled_for_plant("PTW", "plant-A", before) is True
+        assert fe.is_enabled_for_plant("PTW", "plant-A", after) is True
+        # window_status reflects the lifecycle.
+        assert fe.window_status("plant-A", "CAMS", before) == "NOT_STARTED"
+        assert fe.window_status("plant-A", "CAMS", within) == "ON"
+        assert fe.window_status("plant-A", "CAMS", after) == "EXPIRED"
+        # Ceiling still wins: a module outside the licence is off regardless of window.
+        cams_only = evaluate(token())  # CAMS_ONLY, no PTW
+        licence_state._set_state(cams_only)
+        assert is_module_enabled_for_plant("PTW", "plant-A", cams_only) is False
+    finally:
+        fe._overrides = {}
 
 
 def test_tl15_disabled_module_treated_as_absent():

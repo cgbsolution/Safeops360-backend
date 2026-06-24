@@ -320,10 +320,13 @@ async def factory_matrix(
     ]
     plants = (await db.execute(select(Plant).order_by(Plant.name))).scalars().all()
     overrides = await factory_entitlements.load_all(db)
-    disabled: dict[str, list[str]] = {}
+    by_plant: dict[str, dict[str, dict]] = {}
     for o in overrides:
-        if not o["enabled"]:
-            disabled.setdefault(o["plantId"], []).append(o["moduleCode"])
+        by_plant.setdefault(o["plantId"], {})[o["moduleCode"]] = {
+            "enabled": o["enabled"],
+            "validFrom": o["validFrom"],
+            "validUntil": o["validUntil"],
+        }
 
     return {
         "modules": [{"code": m.code, "name": m.name, "group": m.group} for m in licensed],
@@ -332,8 +335,9 @@ async def factory_matrix(
                 "id": p.id,
                 "code": p.code,
                 "name": p.name,
-                # effective enabled set for this factory = licensed minus disabled
-                "disabledModules": disabled.get(p.id, []),
+                # explicit per-module overrides {code: {enabled, validFrom, validUntil}};
+                # any licensed module absent here is on with no time bound.
+                "overrides": by_plant.get(p.id, {}),
             }
             for p in plants
         ],
@@ -369,9 +373,51 @@ async def update_factory_matrix(
             },
         )
 
-    normalised = {c: bool(v) for c, v in changes.items()}
+    # Accept either a bare bool (on/off, no window) or a spec object
+    # {enabled, validFrom, validUntil}. Dates may be YYYY-MM-DD (interpreted as
+    # whole days, UTC) or full ISO datetimes.
+    normalised: dict[str, dict] = {}
+    for code, v in changes.items():
+        if isinstance(v, bool):
+            normalised[code] = {"enabled": v, "validFrom": None, "validUntil": None}
+            continue
+        if not isinstance(v, dict):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Bad value for {code}")
+        vf = _parse_window(v.get("validFrom"), end_of_day=False)
+        vu = _parse_window(v.get("validUntil"), end_of_day=True)
+        if vf and vu and vu < vf:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{code}: validUntil before validFrom")
+        normalised[code] = {"enabled": bool(v.get("enabled", True)), "validFrom": vf, "validUntil": vu}
+
     await factory_entitlements.set_for_plant(db, plant_id, normalised, user.id)
-    return {"applied": True, "plantId": plant_id, "modules": normalised}
+    return {
+        "applied": True,
+        "plantId": plant_id,
+        "modules": {
+            c: {
+                "enabled": s["enabled"],
+                "validFrom": s["validFrom"].isoformat() if s["validFrom"] else None,
+                "validUntil": s["validUntil"].isoformat() if s["validUntil"] else None,
+            }
+            for c, s in normalised.items()
+        },
+    }
+
+
+def _parse_window(value, *, end_of_day: bool):
+    """Parse a date/datetime string into a UTC datetime, or None. A bare date
+    means the start (00:00) or end (23:59:59) of that day."""
+    if not value:
+        return None
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        if len(value) == 10:  # YYYY-MM-DD
+            d = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return d + timedelta(hours=23, minutes=59, seconds=59) if end_of_day else d
+        return datetime.fromisoformat(value).astimezone(timezone.utc)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Bad date {value!r}: {e}") from e
 
 
 @router.post("/revalidate")

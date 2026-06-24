@@ -44,16 +44,24 @@ def is_module_enabled(code: str, state: RuntimeLicenceState | None = None) -> bo
     return code in st.enabled_module_set
 
 
+def _effective_now(state: RuntimeLicenceState):
+    """The clock used for per-factory windows — the licence's monotonic
+    effective clock when available, so a rollback can't extend a window either."""
+    return state.effective_clock  # may be None → factory_entitlements uses utcnow()
+
+
 def is_module_enabled_for_plant(
     code: str, plant_id: str | None, state: RuntimeLicenceState | None = None
 ) -> bool:
     """Effective access for a specific factory: the signed ceiling AND the
-    admin's per-factory allocation. Core is never restricted per factory."""
-    if not is_module_enabled(code, state):
+    admin's per-factory allocation (on/off + validity window). Core is never
+    restricted per factory."""
+    st = state or get_state()
+    if not is_module_enabled(code, st):
         return False
     if code in CORE_MODULE_CODES:
         return True
-    return factory_entitlements.is_enabled_for_plant(code, plant_id)
+    return factory_entitlements.is_enabled_for_plant(code, plant_id, _effective_now(st))
 
 
 def require_module(module_code: str):
@@ -92,10 +100,11 @@ def require_module(module_code: str):
                 },
             )
 
-        # 2. Per-factory allocation (within the ceiling) — only when the request
-        #    carries an active plant. Absent header → ceiling-only (safe default).
+        # 2. Per-factory allocation + validity window (within the ceiling) —
+        #    only when the request carries an active plant. Absent header →
+        #    ceiling-only (safe default).
         if x_active_plant and not factory_entitlements.is_enabled_for_plant(
-            module_code, x_active_plant
+            module_code, x_active_plant, _effective_now(st)
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

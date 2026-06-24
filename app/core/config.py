@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # NOTE: this only tells the app WHERE the licence is — it can never GRANT
     # entitlements. Only the signed licence does (build prompt §5.3).
     licence_file_path: str | None = None
+    # Alternative to the file: the full signed licence token, supplied via the
+    # LICENCE_TOKEN env var. Robust for cloud/container backends with an
+    # ephemeral filesystem (Vercel/Dokploy) where an uploaded file wouldn't
+    # survive a restart. The file (if present) takes precedence.
+    licence_token: str | None = None
     # Days before expiry that flip the status to EXPIRING_SOON (banner window).
     licence_warn_days: int = 14
     # Re-validate the licence on this cadence (seconds). Catches expiry roll-over

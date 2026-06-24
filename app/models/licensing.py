@@ -68,4 +68,11 @@ class FactoryModuleEntitlement(Base, IdMixin, TimestampMixin):
     plantId: Mapped[str] = mapped_column(String, nullable=False)
     moduleCode: Mapped[str] = mapped_column(String, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Optional validity window for this module AT THIS FACTORY. The admin grants
+    # a plant a module "for a period". Both null = no time bound (never expires,
+    # the default). validUntil null with validFrom set = active from a date,
+    # forever. Always still capped by the signed-licence ceiling — a per-factory
+    # window can never reach beyond what the licence grants.
+    validFrom: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    validUntil: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updatedBy: Mapped[str | None] = mapped_column(String, nullable=True)
