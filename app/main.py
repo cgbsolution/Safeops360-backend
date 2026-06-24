@@ -5,14 +5,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.core.db import engine, warmup
+from app.licensing.enforcement import require_module
+from app.licensing.router_map import ROUTER_MODULE
+from app.licensing.state import refresh_state
 from app.routers import (
     agents,
     agents_config,
@@ -44,6 +48,7 @@ from app.routers import (
     incidents,
     inspections,
     kaizen,
+    licensing,
     manhours,
     moc,
     near_miss,
@@ -65,6 +70,24 @@ settings = get_settings()
 logging.basicConfig(level=settings.log_level)
 log = logging.getLogger("safeops360")
 
+# Every router this app mounts, keyed by its import name (matches ROUTER_MODULE).
+# Order only affects OpenAPI grouping.
+_ROUTERS = {
+    "auth": auth, "users": users, "observations": observations, "near_miss": near_miss,
+    "ptw": ptw, "ptw_active": ptw_active, "flra": flra, "incidents": incidents,
+    "training": training, "inspections": inspections, "manhours": manhours,
+    "workflow": workflow, "workflow_definitions": workflow_definitions, "anomalies": anomalies,
+    "agents": agents, "agents_config": agents_config, "hira": hira, "capa": capa, "eai": eai,
+    "erm": erm, "erm_p2": erm_p2, "erm_p3": erm_p3, "erm_t3": erm_t3, "competency": competency,
+    "moc": moc, "risk_register": risk_register, "risk_dashboard": risk_dashboard,
+    "scr": scr, "sci": sci, "kaizen": kaizen, "ppe": ppe,
+    "epc_sites": epc_sites, "epc_contractors": epc_contractors, "epc_workers": epc_workers,
+    "epc_mobilization": epc_mobilization, "epc_gate": epc_gate, "epc_induction": epc_induction,
+    "epc_dashboard": epc_dashboard, "audit_compliance": audit_compliance, "cams": cams,
+    "factory": factory, "factory_ext": factory_ext, "devices": devices, "plants": plants,
+    "dashboard": dashboard, "licensing": licensing,
+}
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -75,8 +98,42 @@ async def lifespan(_app: FastAPI):
         log.info("DB connection warmed up")
     except Exception as e:  # noqa: BLE001
         log.warning(f"DB warmup failed (non-fatal): {e}")
-    yield
-    await engine.dispose()
+
+    # Validate the licence on boot (offline; no network). A failure here MUST
+    # NOT crash the app — it fails closed to a locked state instead.
+    try:
+        state = await refresh_state()
+        log.info("Licence boot validation: status=%s", state.status)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Licence boot validation failed (fails closed): %s", e)
+
+    # Load the per-factory module-allocation cache (within the licence ceiling).
+    try:
+        from app.licensing import factory_entitlements
+        await factory_entitlements.refresh()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Factory-entitlement cache load failed: %s", e)
+
+    recheck = asyncio.create_task(_licence_recheck_loop())
+    try:
+        yield
+    finally:
+        recheck.cancel()
+        await engine.dispose()
+
+
+async def _licence_recheck_loop() -> None:
+    """Periodic re-validation — catches expiry roll-over, grace transitions, and
+    clock tamper between boots without needing a restart (build prompt §5.1)."""
+    interval = max(60, settings.licence_recheck_seconds)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await refresh_state()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("Periodic licence re-check failed (fails closed): %s", e)
 
 
 def create_app() -> FastAPI:
@@ -96,53 +153,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Order matters only for OpenAPI grouping.
-    app.include_router(auth.router)
-    app.include_router(users.router)
-    app.include_router(observations.router)
-    app.include_router(near_miss.router)
-    app.include_router(ptw.router)
-    app.include_router(ptw_active.router)
-    app.include_router(flra.router)
-    app.include_router(incidents.router)
-    app.include_router(training.router)
-    app.include_router(inspections.router)
-    app.include_router(manhours.router)
-    app.include_router(workflow.router)
-    app.include_router(workflow_definitions.router)
-    app.include_router(anomalies.router)
-    app.include_router(agents.router)
-    app.include_router(agents_config.router)
-    app.include_router(hira.router)
-    app.include_router(capa.router)
-    app.include_router(eai.router)
-    app.include_router(erm.router)
-    app.include_router(erm_p2.router)
-    app.include_router(erm_p3.router)
-    app.include_router(erm_t3.router)
-    app.include_router(competency.router)
-    app.include_router(moc.router)
-    app.include_router(risk_register.router)
-    app.include_router(risk_dashboard.router)
-    app.include_router(scr.router)
-    app.include_router(sci.router)
-    app.include_router(kaizen.router)
-    app.include_router(ppe.router)
-    # EPC — Engineering, Procurement & Construction module
-    app.include_router(epc_sites.router)
-    app.include_router(epc_contractors.router)
-    app.include_router(epc_workers.router)
-    app.include_router(epc_mobilization.router)
-    app.include_router(epc_gate.router)
-    app.include_router(epc_induction.router)
-    app.include_router(epc_dashboard.router)
-    app.include_router(audit_compliance.router)
-    app.include_router(cams.router)
-    app.include_router(factory.router)
-    app.include_router(factory_ext.router)
-    app.include_router(devices.router)
-    app.include_router(plants.router)
-    app.include_router(dashboard.router)
+    # Mount every router, attaching the module-entitlement guard to gated ones.
+    # The guard is the API security boundary — a disabled module's endpoints
+    # 403 regardless of the UI (build prompt §5.2, TL-01).
+    for name, module in _ROUTERS.items():
+        module_code = ROUTER_MODULE.get(name)
+        deps = [Depends(require_module(module_code))] if module_code else []
+        app.include_router(module.router, dependencies=deps)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:

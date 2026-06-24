@@ -23,6 +23,18 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000"
 
+    # ── Module Entitlement & Licensing System ──────────────────────────────
+    # Path to the signed .lic file. Offline-validated locally; no phone-home.
+    # When unset, the validator looks for `licence.lic` in the backend root.
+    # NOTE: this only tells the app WHERE the licence is — it can never GRANT
+    # entitlements. Only the signed licence does (build prompt §5.3).
+    licence_file_path: str | None = None
+    # Days before expiry that flip the status to EXPIRING_SOON (banner window).
+    licence_warn_days: int = 14
+    # Re-validate the licence on this cadence (seconds). Catches expiry roll-over
+    # and clock-tamper between boots without a restart.
+    licence_recheck_seconds: int = 3600
+
     # AI agents (Anthropic Claude). Optional — when unset, the
     # workflow-rule agents (Pattern A: triage / lessons) log a warning
     # and fall through gracefully so the workflow keeps working. The

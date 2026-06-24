@@ -125,6 +125,7 @@ from app.models.factory import (
 )
 from app.models.factory_ext import (
     FactoryEquipment,
+    FactoryEquipmentInspection,
     FactoryLifecycleEvent,
     HazardousMaterial,
     RegulatoryRegistration,
@@ -178,6 +179,7 @@ from app.models.incident import (
     IncidentStatus,
     IncidentType,
 )
+from app.models.licensing import FactoryModuleEntitlement, LicenceInstallation
 from app.models.manhours import Manhours
 from app.models.masters import Department, MasterItem
 from app.models.epc import (
@@ -313,6 +315,7 @@ __all__ = [
     "ProductionProcess",
     "WorkforceComposition",
     "FactoryEquipment",
+    "FactoryEquipmentInspection",
     "FactoryLifecycleEvent",
     "HazardousMaterial",
     "RegulatoryRegistration",
@@ -388,6 +391,8 @@ __all__ = [
     "IncidentType",
     "Inspection",
     "InstanceStatus",
+    "FactoryModuleEntitlement",
+    "LicenceInstallation",
     "Manhours",
     "NearMiss",
     "NearMissStatus",

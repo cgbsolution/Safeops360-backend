@@ -27,6 +27,7 @@ RenewalFrequencyLit = Literal["ANNUAL", "BIENNIAL", "TRIENNIAL", "ONEOFF", "ONGO
 RegStatusLit = Literal["VALID", "EXPIRING_SOON", "EXPIRED", "PENDING_RENEWAL", "SUSPENDED"]
 ImpactLit = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 LifecycleStageLit = Literal["INITIATED", "EXECUTION", "VALIDATION", "ACTIVE", "ARCHIVED"]
+InspectionResultLit = Literal["PASS", "FAIL", "CONDITIONAL_PASS"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -146,6 +147,8 @@ class EquipmentOut(BaseModel):
     lastMaintenanceType: str | None = None
     nextScheduledDate: datetime | None = None
     downtimeHoursYtd: float
+    lastInspectionDate: datetime | None = None
+    lastInspectionResult: str | None = None  # PASS | FAIL | CONDITIONAL_PASS
     certifiedOperators: list[dict[str, Any]] = []
     spareParts: list[dict[str, Any]] = []
     notes: str | None = None
@@ -155,6 +158,37 @@ class EquipmentOut(BaseModel):
     nextComplianceDue: datetime | None = None
     overdueRegimes: list[str] = []  # e.g. ["PUWER", "LOLER"]
     operatorCertGapFlag: bool = False  # HIGH hazard + no valid certified operator
+
+
+class InspectionCreate(BaseModel):
+    """POST .../equipment/{id}/inspections — records one statutory inspection and
+    rolls the equipment's cached inspection state + regime next-dues forward."""
+
+    inspectionDate: datetime | None = None  # defaults to now
+    inspectorName: str = Field(min_length=1, max_length=100)
+    result: InspectionResultLit
+    findings: str | None = None
+
+
+class EquipmentInspectionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    factoryProfileId: str
+    equipmentId: str
+    siteId: str
+    inspectionDate: datetime
+    inspectorName: str
+    result: str
+    findings: str | None = None
+    createdAt: datetime | None = None
+
+
+class InspectionResponse(BaseModel):
+    """Mirrors the build-spec shape { inspection, updatedEquipment } so the row
+    can refresh its Last-maint / Next-due / Compliance cells in place."""
+
+    inspection: EquipmentInspectionOut
+    updatedEquipment: EquipmentOut
 
 
 # ════════════════════════════════════════════════════════════════════════════

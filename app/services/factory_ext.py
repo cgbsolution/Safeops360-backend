@@ -88,6 +88,15 @@ def equipment_compliance(e: FactoryEquipment) -> tuple[str, datetime | None, lis
     else:
         status = "OK"
     next_due = min(next_dues) if next_dues else None
+
+    # Factor in the most recent recorded statutory inspection (Change 3). A FAIL
+    # is the strongest non-compliant signal and overrides the regime view; a
+    # PASS/CONDITIONAL on regime-less equipment lifts it out of the neutral "NA".
+    result = (e.lastInspectionResult or "").upper()
+    if result == "FAIL":
+        return "OVERDUE", next_due, overdue if "INSPECTION" in overdue else [*overdue, "INSPECTION"]
+    if status == "NA" and result in ("PASS", "CONDITIONAL_PASS"):
+        return ("OK" if result == "PASS" else "ATTENTION"), next_due, overdue
     return status, next_due, overdue
 
 
@@ -118,6 +127,41 @@ def equipment_out(e: FactoryEquipment) -> Sx.EquipmentOut:
     o.complianceStatus, o.nextComplianceDue, o.overdueRegimes = equipment_compliance(e)
     o.operatorCertGapFlag = equipment_operator_gap(e)
     return o
+
+
+def inspection_out(insp) -> Sx.EquipmentInspectionOut:
+    return Sx.EquipmentInspectionOut.model_validate(insp)
+
+
+# Re-test horizon (days) applied to the required regimes after a passing
+# inspection — a clean PASS buys a full year; a CONDITIONAL_PASS only a quarter.
+INSPECTION_HORIZON_DAYS = {"PASS": 365, "CONDITIONAL_PASS": 90}
+
+
+def apply_inspection_to_equipment(e: FactoryEquipment, when: datetime, result: str) -> None:
+    """Roll the parent equipment's cached inspection state forward after an
+    inspection is recorded (Change 3). PASS / CONDITIONAL_PASS also advance every
+    *required* statutory regime's last + next-due so the computed compliance
+    badge clears; a FAIL leaves the regime dates untouched (the compliance engine
+    forces OVERDUE off ``lastInspectionResult`` instead)."""
+    e.lastInspectionDate = when
+    e.lastInspectionResult = result
+    # The Equipment tab surfaces the latest service touch via lastMaintenanceDate
+    # (build-spec §Change 3): an inspection is one such touch.
+    e.lastMaintenanceDate = when
+    e.lastMaintenanceType = f"Statutory inspection ({result})"
+    horizon = INSPECTION_HORIZON_DAYS.get(result)
+    if horizon is None:
+        return
+    nxt = _aware(when) + timedelta(days=horizon)
+    if e.puwerRequired:
+        e.puwerLastInspection, e.puwerNextDue = when, nxt
+    if e.lolerRequired:
+        e.lolerLastInspection, e.lolerNextDue = when, nxt
+    if e.electricalSafetyRequired:
+        e.electricalLastCheck, e.electricalNextDue = when, nxt
+    if e.noiseAssessmentRequired:
+        e.noiseLastTest = when
 
 
 # ════════════════════════════════════════════════════════════════════════════

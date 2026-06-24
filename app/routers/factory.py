@@ -35,6 +35,7 @@ from app.models.factory import (
 )
 from app.models.factory_ext import (
     FactoryEquipment,
+    FactoryEquipmentInspection,
     FactoryLifecycleEvent,
     HazardousMaterial,
     RegulatoryRegistration,
@@ -431,8 +432,8 @@ async def delete_profile(profile_id: str, user: User = Depends(get_current_user)
     # HARD delete, so a soft-deleted profile would otherwise leave active orphans).
     for model in (
         Building, WorkforceComposition, ProductionProcess, FactoryCertification, FactoryContact,
-        SocialComplianceProfile, FactoryEquipment, HazardousMaterial, RegulatoryRegistration,
-        FactoryLifecycleEvent,
+        SocialComplianceProfile, FactoryEquipment, FactoryEquipmentInspection, HazardousMaterial,
+        RegulatoryRegistration, FactoryLifecycleEvent,
     ):
         await db.execute(
             update(model)

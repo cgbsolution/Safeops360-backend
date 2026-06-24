@@ -96,6 +96,10 @@ class FactoryEquipment(Base, IdMixin):
     nextScheduledDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     downtimeHoursYtd: Mapped[float] = mapped_column(Float, nullable=False, default=0)
 
+    # last recorded statutory inspection (see FactoryEquipmentInspection for the log)
+    lastInspectionDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lastInspectionResult: Mapped[str | None] = mapped_column(String)  # PASS | FAIL | CONDITIONAL_PASS
+
     # training + spares (JSON to mirror the keyHazards/attachmentIds convention)
     certifiedOperators: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # [{name, certifiedOn, expiresOn}]
     spareParts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # [{partName, quantityInStock, reorderLevel, vendor}]
@@ -268,4 +272,35 @@ class FactoryLifecycleEvent(Base, IdMixin):
     __table_args__ = (
         Index("ix_FactoryLifecycleEvent_factoryProfileId", "factoryProfileId"),
         Index("ix_FactoryLifecycleEvent_siteId", "siteId"),
+    )
+
+
+# ── Factory Equipment Inspection (statutory inspection log per asset) ──────────
+class FactoryEquipmentInspection(Base, IdMixin):
+    """A recorded statutory inspection against a ``FactoryEquipment`` asset
+    (PUWER/LOLER-style competent-person check). Each row rolls the parent
+    equipment's cached ``lastInspectionDate`` / ``lastInspectionResult`` +
+    regime next-due dates forward (see the router's inspection endpoint)."""
+
+    __tablename__ = "FactoryEquipmentInspection"
+
+    factoryProfileId: Mapped[str] = mapped_column(ForeignKey("FactoryProfile.id", ondelete="CASCADE"), nullable=False)
+    equipmentId: Mapped[str] = mapped_column(ForeignKey("FactoryEquipment.id", ondelete="CASCADE"), nullable=False)
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+
+    inspectionDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    inspectorName: Mapped[str] = mapped_column(String, nullable=False)
+    result: Mapped[str] = mapped_column(String, nullable=False)  # PASS | FAIL | CONDITIONAL_PASS
+    findings: Mapped[str | None] = mapped_column(Text)
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_FactoryEquipmentInspection_equipmentId", "equipmentId"),
+        Index("ix_FactoryEquipmentInspection_factoryProfileId", "factoryProfileId"),
+        Index("ix_FactoryEquipmentInspection_siteId", "siteId"),
     )

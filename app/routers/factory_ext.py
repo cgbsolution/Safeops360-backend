@@ -23,6 +23,7 @@ from app.core.deps import get_current_user
 from app.models.factory import FactoryProfile
 from app.models.factory_ext import (
     FactoryEquipment,
+    FactoryEquipmentInspection,
     FactoryLifecycleEvent,
     HazardousMaterial,
     RegulatoryRegistration,
@@ -139,6 +140,29 @@ async def record_maintenance(
     await db.commit()
     await db.refresh(e)
     return svc.equipment_out(e)
+
+
+@router.post("/equipment/{equipment_id}/inspections", response_model=Sx.InspectionResponse, status_code=201)
+async def record_inspection(
+    equipment_id: str, body: Sx.InspectionCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    """Record one statutory inspection (Change 3). Creates the immutable log row,
+    rolls the equipment's cached inspection state + regime next-dues forward, and
+    returns { inspection, updatedEquipment } so the row refreshes in place."""
+    e = await _load_child(db, user, FactoryEquipment, equipment_id, "FACILITY.UPDATE", "Equipment")
+    when = body.inspectionDate or _now()
+    insp = FactoryEquipmentInspection(
+        factoryProfileId=e.factoryProfileId, equipmentId=e.id, siteId=e.siteId,
+        inspectionDate=when, inspectorName=body.inspectorName.strip(), result=body.result,
+        findings=body.findings, createdBy=user.id,
+    )
+    db.add(insp)
+    svc.apply_inspection_to_equipment(e, when, body.result)
+    e.updatedBy = user.id
+    await db.commit()
+    await db.refresh(e)
+    await db.refresh(insp)
+    return Sx.InspectionResponse(inspection=svc.inspection_out(insp), updatedEquipment=svc.equipment_out(e))
 
 
 # ════════════════════════════════════════════════════════════════════════════
