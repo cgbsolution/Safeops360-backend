@@ -164,10 +164,10 @@ async def seed_kaizen(db):
 # 9) Expired PPE on active permit (P3-3)
 @_section("P3-3 expired-PPE-on-active demo")
 async def seed_expired_ppe(db):
-    from app.models.permit import Permit, PermitCrewMember
+    from app.models.permit import Permit, PermitCrewMember, PermitStatus
     from app.models.ppe import PpeIssuance, PpeItem
     permit = (await db.execute(select(Permit).where(Permit.isDeleted.is_(False)).limit(1))).scalar_one()
-    permit.status = "ACTIVE"
+    permit.status = PermitStatus.ACTIVE  # enum member — a raw string silently fails to persist
     user = (await db.execute(text('SELECT id FROM \"User\" WHERE \"plantId\"=:p LIMIT 1'), {"p": permit.plantId})).first()
     uid = user[0] if user else None
     if uid:

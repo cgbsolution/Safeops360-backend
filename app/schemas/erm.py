@@ -55,6 +55,14 @@ class SubCategoryUpsert(BaseModel):
     isActive: bool = True
 
 
+class SubCategoryUpdate(BaseModel):
+    # code is immutable (rollup rules reference targetSubCategoryCode) — edit the
+    # rest. All optional so the form can patch a single field.
+    name: str | None = None
+    description: str | None = None
+    isActive: bool | None = None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Scoring matrix
 # ─────────────────────────────────────────────────────────────────────

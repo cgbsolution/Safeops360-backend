@@ -299,6 +299,47 @@ async def create_subcategory(
     return S.RiskSubCategoryOut.model_validate(sub)
 
 
+@router.patch("/sub-categories/{sub_id}", response_model=S.RiskSubCategoryOut)
+async def update_subcategory(
+    sub_id: str, body: S.SubCategoryUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    await _require(db, user, "ERM.TAXONOMY_ADMIN")
+    sub = await db.get(RiskSubCategory, sub_id)
+    if not sub:
+        raise HTTPException(404, "Sub-category not found")
+    if body.name is not None:
+        sub.name = body.name
+    if body.description is not None:
+        sub.description = body.description
+    if body.isActive is not None:
+        sub.isActive = body.isActive
+    sub.updatedBy = user.id
+    await db.commit()
+    await db.refresh(sub)
+    return S.RiskSubCategoryOut.model_validate(sub)
+
+
+@router.delete("/sub-categories/{sub_id}")
+async def delete_subcategory(
+    sub_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    await _require(db, user, "ERM.TAXONOMY_ADMIN")
+    sub = await db.get(RiskSubCategory, sub_id)
+    if not sub:
+        raise HTTPException(404, "Sub-category not found")
+    in_use = (
+        await db.execute(
+            select(func.count()).select_from(EnterpriseRisk)
+            .where(EnterpriseRisk.subCategoryId == sub_id).where(EnterpriseRisk.isDeleted.is_(False))
+        )
+    ).scalar() or 0
+    if in_use:
+        raise HTTPException(409, f"Cannot delete — {in_use} risk(s) use this sub-category. Deactivate it instead.")
+    await db.delete(sub)
+    await db.commit()
+    return {"ok": True}
+
+
 # ═════════════════════════════════════════════════════════════════════
 # Scoring matrix
 # ═════════════════════════════════════════════════════════════════════
