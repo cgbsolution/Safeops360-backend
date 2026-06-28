@@ -808,3 +808,28 @@ async def close_audit(
         return await svc.close_audit(db, user=user, audit_id=audit_id, closing_remarks=body.closingRemarks)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+# ── P2-9 Audit report PDF (fpdf2) ────────────────────────────────────────────
+@router.get("/reports/{report_id}/pdf")
+async def audit_report_pdf(report_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Generate the branded PDF for an audit report (cover, INTERIM watermark,
+    sections, sign-off). Sets pdfAttachmentId to mark it generated."""
+    from fastapi.responses import StreamingResponse
+    from app.models.audit_compliance import AuditReport
+    from app.services.report_pdf import render_audit_report_pdf
+
+    rep = await db.get(AuditReport, report_id)
+    if rep is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Report not found")
+    await _require(db, user, "AUDIT_COMPLIANCE.READ")
+    by_name = (await db.get(User, rep.generatedById)).name if rep.generatedById else "—"
+    pdf_bytes = render_audit_report_pdf(svc._report_to_dict(rep), by_name)
+    if not rep.pdfAttachmentId:
+        rep.pdfAttachmentId = f"generated:{report_id}"
+        await db.commit()
+    import io
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{rep.reportCode}.pdf"'},
+    )

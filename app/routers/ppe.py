@@ -703,3 +703,17 @@ async def ptw_gate_check(
         "nonCompliantWorkers": non_compliant,
         "overrideAllowed": False,
     }
+
+
+# ── P3-3 Expired PPE on active permits ───────────────────────────────────────
+@router.get("/expired-on-active-permits")
+async def expired_on_active_permits(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Workers on ACTIVE/SUSPENDED permits whose PPE lapsed (service-life,
+    inspection, fit-test, or recall) after activation. Powers the PTW red banner."""
+    from app.services.access_scope import build_query_scope
+    from app.services.ppe_expiry import expired_ppe_on_active_permits as _q
+    scope = await build_query_scope(db, user.id, "PPE.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await _q(db, pids)

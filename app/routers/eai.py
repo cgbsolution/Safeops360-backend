@@ -656,7 +656,10 @@ async def create_entry(
 
     initial_score = lk.score * mg.score
     initial_level, initial_color = _resolve_impact_level(initial_score)
-    initial_sig = _is_significant(matrix, initial_level)
+    # ISO 14001 §6.1.3 — a legal obligation makes the aspect SIGNIFICANT regardless
+    # of score (P2-7 / EAI legal-override).
+    legal_mandated = bool(payload.regulationRefs) or bool(payload.complianceObligations)
+    initial_sig = _is_significant(matrix, initial_level) or legal_mandated
 
     seq = await _next_sequence_for_study(db, study_id)
 
@@ -1043,6 +1046,11 @@ async def replace_regulation_refs(
         await db.delete(row)
     for item in payload:
         db.add(EaiEntryRegulationRef(entryId=entry_id, **item.model_dump()))
+    # ISO 14001 §6.1.3 — adding a legal regulation forces the aspect SIGNIFICANT.
+    if payload:
+        entry.initialSignificant = True
+        if entry.residualImpactLevel is not None:
+            entry.residualSignificant = True
     await db.commit()
     return (
         await db.execute(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models._base import Base, IdMixin
@@ -83,6 +83,14 @@ class Observation(Base, IdMixin):
     responsiblePersonId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))
 
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    # P3-1 BBS — quality score (0..3 specificity) + optional ABC (antecedent→
+    # behaviour→consequence) fields + auto-prompted CAPA link.
+    qualityScore: Mapped[int | None] = mapped_column(Integer)
+    antecedent: Mapped[str | None] = mapped_column(Text)
+    behaviourObserved: Mapped[str | None] = mapped_column(Text)
+    consequence: Mapped[str | None] = mapped_column(Text)
+    capaId: Mapped[str | None] = mapped_column(String)
+    capaPromptDeclined: Mapped[bool | None] = mapped_column(Boolean)
     immediateAction: Mapped[str | None] = mapped_column(Text)
     targetDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closingRemark: Mapped[str | None] = mapped_column(Text)

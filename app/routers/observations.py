@@ -131,6 +131,15 @@ async def create_observation(
     if plant is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid plant")
 
+    # P3-1 BBS quality gate — reject vague at-risk submissions; compute specificity.
+    from app.services.bbs_quality import capa_recommended, quality_score, validate_quality
+
+    _otype = payload.type.value if hasattr(payload.type, "value") else str(payload.type)
+    _qerr = validate_quality(_otype, payload.description)
+    if _qerr:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _qerr)
+    _qscore = quality_score(payload.description, payload.areaId, payload.responsiblePersonId)
+
     # Compare on date only — sidesteps the offset-naive vs offset-aware
     # datetime mismatch you get when the form sends a bare YYYY-MM-DD that
     # Pydantic parses as a naive datetime.
@@ -155,6 +164,10 @@ async def create_observation(
         observerId=user.id,
         responsiblePersonId=payload.responsiblePersonId,
         description=payload.description,
+        qualityScore=_qscore,
+        antecedent=getattr(payload, "antecedent", None),
+        behaviourObserved=getattr(payload, "behaviourObserved", None),
+        consequence=getattr(payload, "consequence", None),
         immediateAction=payload.immediateAction,
         targetDate=payload.targetDate,
         status=ObservationStatus.OPEN,
@@ -600,3 +613,30 @@ async def download_attachment(
         download=None if inline else att.fileName,
     )
     return {"url": url}
+
+
+# ── P3-1 Raise a corrective action from an at-risk observation ────────────────
+@router.post("/{observation_id}/raise-capa")
+async def raise_capa_from_observation(
+    observation_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict:
+    """One-click CAPA from an at-risk observation (SAFETY_OBSERVATION source).
+    Idempotent — returns the existing CAPA if one was already raised."""
+    obs = await db.get(Observation, observation_id)
+    if obs is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Observation not found")
+    await require_permission_with_context("OBSERVATION.UPDATE", user, db, plant_id=obs.plantId)
+    if obs.capaId:
+        return {"capaId": obs.capaId, "created": False}
+    from app.services.capa_spawn import spawn_capa
+    capa = await spawn_capa(
+        db, source_code="SAFETY_OBSERVATION", plant_id=obs.plantId,
+        title=f"Corrective action — {obs.description[:120]}", problem=obs.description[:500],
+        ref_id=obs.id, ref_url=f"/observations/{obs.id}", ref_summary=obs.number,
+        metadata={"observationNumber": obs.number}, severity="MODERATE",
+        detected_method="SAFETY_OBSERVATION", owner_id=obs.responsiblePersonId or user.id, actor_id=user.id, due_days=30,
+    )
+    await db.flush()
+    obs.capaId = capa.id
+    await db.commit()
+    return {"capaId": capa.id, "capaNumber": capa.capaNumber, "created": True}

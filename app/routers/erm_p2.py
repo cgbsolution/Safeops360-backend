@@ -1074,3 +1074,29 @@ async def export_p2(kind: str, user: User = Depends(get_current_user), db: Async
     else:
         raise HTTPException(404, f"Unknown report kind '{kind}'")
     return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=erm-{kind}.csv"})
+
+
+# ═════════════════════════════════════════════════════════════════════
+# P2-8 Compliance unification — LegalObligation is the single source of truth
+# ═════════════════════════════════════════════════════════════════════
+@router.post("/compliance/link-registrations")
+async def compliance_link_registrations(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Backfill: link every RegulatoryRegistration to a canonical LegalObligation
+    (creating one where none matches). Idempotent."""
+    await _require(db, user, "COMPLIANCE.MANAGE")
+    from app.services.compliance_unification import link_registrations_to_obligations
+    res = await link_registrations_to_obligations(db, actor_id=user.id)
+    await db.commit()
+    return res
+
+
+@router.get("/compliance/statutory-view")
+async def compliance_statutory_view(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Statutory Registers = LegalObligations of statutory types (single source).
+    Same data the CAMS Compliance Tracker surfaces — no second store."""
+    await _require(db, user, "COMPLIANCE.READ")
+    from app.services.access_scope import build_query_scope
+    from app.services.compliance_unification import statutory_view
+    scope = await build_query_scope(db, user.id, "COMPLIANCE.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await statutory_view(db, pids)

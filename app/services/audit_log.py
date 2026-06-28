@@ -191,6 +191,9 @@ async def write_entries(adb: AsyncSession, events: list[dict], actor) -> int:  #
             reason=actor.reason or (ev.get("after") or {}).get("deletionReason"),
             correlationId=actor.correlation_id, previousEntryHash=prev_hash, entryHash=entry_hash,
         ))
+        # flush per entry so the next event's sequence query sees this row —
+        # otherwise two events for the SAME entity in one batch both get seq 1.
+        await adb.flush()
         written += 1
     return written
 

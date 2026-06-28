@@ -23,6 +23,10 @@ class ObservationCreate(BaseModel):
     category: ObservationCategory
     severity: Severity = Severity.LOW
     description: str = Field(min_length=10)
+    # P3-1 BBS — optional ABC (antecedent → behaviour → consequence) analysis
+    antecedent: str | None = None
+    behaviourObserved: str | None = None
+    consequence: str | None = None
     immediateAction: str | None = None
     # responsiblePersonId is now assigned by the Section Head during the
     # CHECKER step, not by the observer at creation time. Kept optional

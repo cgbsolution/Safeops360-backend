@@ -227,6 +227,9 @@ class RegulatoryRegistration(Base, IdMixin):
     alertThresholdDays: Mapped[int] = mapped_column(Integer, nullable=False, default=90)
     complianceImpactIfExpired: Mapped[str] = mapped_column(String, nullable=False, default="MEDIUM")  # CRITICAL|HIGH|MEDIUM|LOW
     documentationIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # P2-8: canonical link to the governed LegalObligation (single source of truth).
+    # Post-migration this row is a read-only display alias of its obligation.
+    legalObligationId: Mapped[str | None] = mapped_column(String)
 
     createdAt: Mapped[datetime] = _created()
     createdBy: Mapped[str | None] = mapped_column(String)
