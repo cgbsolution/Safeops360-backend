@@ -94,6 +94,7 @@ class CamsEngagement(Base, IdMixin):
     reportAttachmentIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     nextScheduledDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sourceModule: Mapped[str | None] = mapped_column(String)
+    sourceEntityId: Mapped[str | None] = mapped_column(String)  # entity this engagement inspects (e.g. FireEquipment.id)
     recurrenceId: Mapped[str | None] = mapped_column(String)
 
     responses: Mapped[list["CamsResponse"]] = relationship(back_populates="engagement", cascade="all, delete-orphan")

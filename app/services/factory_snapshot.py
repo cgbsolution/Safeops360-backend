@@ -108,7 +108,27 @@ async def compute_site_metrics(db: AsyncSession, site_id: str) -> dict[str, Any]
         "overdueObligations": 0,
         "incidentCount12m": 0,
         "lastAuditDate": None,
+        "ermExpectedLossInr": None,
+        "ermCriticalCount": 0,
+        "ermHighCount": 0,
     }
+
+    # ── I-17: ERM ₹ exposure (Σ residual expected loss of HIGH+CRITICAL risks) ──
+    try:
+        from app.models.erm import EnterpriseRisk
+        risks = (
+            await db.execute(
+                select(EnterpriseRisk).where(EnterpriseRisk.plantId == site_id)
+                .where(EnterpriseRisk.isDeleted.is_(False)).where(EnterpriseRisk.lifecycleState != "CLOSED")
+                .where(EnterpriseRisk.residualBand.in_(("HIGH", "CRITICAL")))
+            )
+        ).scalars().all()
+        if risks:
+            m["ermExpectedLossInr"] = round(sum(r.residualExpectedLossInr or 0 for r in risks))
+            m["ermCriticalCount"] = sum(1 for r in risks if r.residualBand == "CRITICAL")
+            m["ermHighCount"] = sum(1 for r in risks if r.residualBand == "HIGH")
+    except Exception:
+        pass
 
     # ── CAMS engagements → compliance score + last audit ──
     if CamsEngagement is not None:

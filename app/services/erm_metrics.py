@@ -219,27 +219,31 @@ class MetricProvider:
     direction: str
     frequency: str
     compute: Callable[[AsyncSession, datetime], Awaitable[float | None]]
+    # LEADING = warns before the loss event (near-misses, training currency, overdue
+    # actions); LAGGING = measures harm already done (LTIFR, realised loss).
+    indicator_type: str = "LAGGING"
 
 
 METRIC_PROVIDERS: dict[str, MetricProvider] = {
     p.key: p
     for p in [
-        MetricProvider("incident.ltifr_12m", "Incident Investigation", "LTIFR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", ltifr_12m),
-        MetricProvider("incident.trir_12m", "Incident Investigation", "TRIR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", trir_12m),
-        MetricProvider("incident.near_miss_ratio", "Safety Observation", "Near-miss : incident ratio", "ratio", "LOWER_IS_WORSE", "MONTHLY", near_miss_ratio),
-        MetricProvider("capa.overdue_pct", "CAPA Universal", "% CAPA items overdue", "%", "HIGHER_IS_WORSE", "MONTHLY", capa_overdue_pct),
-        MetricProvider("capa.avg_closure_days", "CAPA Universal", "Average CAPA closure days", "days", "HIGHER_IS_WORSE", "QUARTERLY", capa_avg_closure_days),
-        MetricProvider("audit.nc_rate", "Audit Management", "Non-conformances per audit", "NCs/audit", "HIGHER_IS_WORSE", "QUARTERLY", audit_nc_rate),
-        MetricProvider("audit.overdue_audits", "Audit Management", "Overdue scheduled audits", "count", "HIGHER_IS_WORSE", "MONTHLY", audit_overdue),
-        MetricProvider("training.competency_currency_pct", "Skill Matrix", "% safety-critical competencies current", "%", "LOWER_IS_WORSE", "MONTHLY", competency_currency_pct),
-        MetricProvider("compliance.overdue_obligations", "Compliance Register", "Overdue statutory obligations", "count", "HIGHER_IS_WORSE", "MONTHLY", compliance_overdue_obligations),
-        MetricProvider("loss.net_loss_quarter", "Loss Event DB", "Net loss — current quarter", "₹ Lakh", "HIGHER_IS_WORSE", "QUARTERLY", loss_net_quarter),
+        MetricProvider("incident.ltifr_12m", "Incident Investigation", "LTIFR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", ltifr_12m, "LAGGING"),
+        MetricProvider("incident.trir_12m", "Incident Investigation", "TRIR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", trir_12m, "LAGGING"),
+        MetricProvider("incident.near_miss_ratio", "Safety Observation", "Near-miss : incident ratio", "ratio", "LOWER_IS_WORSE", "MONTHLY", near_miss_ratio, "LEADING"),
+        MetricProvider("capa.overdue_pct", "CAPA Universal", "% CAPA items overdue", "%", "HIGHER_IS_WORSE", "MONTHLY", capa_overdue_pct, "LEADING"),
+        MetricProvider("capa.avg_closure_days", "CAPA Universal", "Average CAPA closure days", "days", "HIGHER_IS_WORSE", "QUARTERLY", capa_avg_closure_days, "LEADING"),
+        MetricProvider("audit.nc_rate", "Audit Management", "Non-conformances per audit", "NCs/audit", "HIGHER_IS_WORSE", "QUARTERLY", audit_nc_rate, "COINCIDENT"),
+        MetricProvider("audit.overdue_audits", "Audit Management", "Overdue scheduled audits", "count", "HIGHER_IS_WORSE", "MONTHLY", audit_overdue, "LEADING"),
+        MetricProvider("training.competency_currency_pct", "Skill Matrix", "% safety-critical competencies current", "%", "LOWER_IS_WORSE", "MONTHLY", competency_currency_pct, "LEADING"),
+        MetricProvider("compliance.overdue_obligations", "Compliance Register", "Overdue statutory obligations", "count", "HIGHER_IS_WORSE", "MONTHLY", compliance_overdue_obligations, "LEADING"),
+        MetricProvider("loss.net_loss_quarter", "Loss Event DB", "Net loss — current quarter", "₹ Lakh", "HIGHER_IS_WORSE", "QUARTERLY", loss_net_quarter, "LAGGING"),
     ]
 }
 
 
 def catalogue() -> list[dict]:
     return [
-        {"key": p.key, "sourceModule": p.source_module, "label": p.label, "unit": p.unit, "direction": p.direction, "frequency": p.frequency}
+        {"key": p.key, "sourceModule": p.source_module, "label": p.label, "unit": p.unit,
+         "direction": p.direction, "frequency": p.frequency, "indicatorType": p.indicator_type}
         for p in METRIC_PROVIDERS.values()
     ]

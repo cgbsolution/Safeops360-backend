@@ -433,7 +433,12 @@ async def list_engagements(
     db: AsyncSession = Depends(get_db),
 ):
     await _require(db, user, "CAMS.READ")
-    stmt = select(CamsEngagement).where(CamsEngagement.isDeleted.is_(False))
+    # P1-2: scope to the actor's plants (fail-closed). Without this a user could
+    # omit siteId and read every plant's engagements.
+    from app.services.access_scope import build_query_scope
+
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    stmt = scope.apply(select(CamsEngagement).where(CamsEngagement.isDeleted.is_(False)), CamsEngagement)
     if estatus:
         stmt = stmt.where(CamsEngagement.status == estatus)
     if engagementType:
@@ -1083,3 +1088,58 @@ async def audit_capas(
         items = [i for i in items if i.overdueDays > 0]
     items.sort(key=lambda i: (0 if i.overdueDays else 1, i.capaNumber))
     return S.AuditCapaListResponse(items=items, total=len(items), stateCounts=state_counts, overdueCount=overdue_n, openCount=open_n)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Analytics & Benchmarking (P2-4) — computed, not seed commentary
+# ═════════════════════════════════════════════════════════════════════
+@router.post("/analytics/detect-repeats")
+async def analytics_detect_repeats(
+    windowDays: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Recompute is_repeat_finding across all findings (auto-detection engine)."""
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    res = await ca.detect_repeat_findings(db, window_days=windowDays)
+    await db.commit()
+    return res
+
+
+@router.get("/analytics/pareto")
+async def analytics_pareto(
+    dimension: str = Query("clause"), days: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    from app.services.access_scope import build_query_scope
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await ca.findings_pareto(db, pids, dimension=dimension, days=days)
+
+
+@router.get("/analytics/benchmarks")
+async def analytics_benchmarks(
+    days: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    from app.services.access_scope import build_query_scope
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await ca.site_benchmarks(db, pids, days=days)
+
+
+@router.get("/analytics/clause-conformance")
+async def analytics_clause(
+    standardRef: str | None = Query(None), days: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    from app.services.access_scope import build_query_scope
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await ca.clause_analysis(db, pids, standard_ref=standardRef, days=days)

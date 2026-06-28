@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models._base import Base, IdMixin
+from app.models._base import Base, IdMixin, SoftDeleteMixin
 from app.models.user import User
 
 
@@ -45,7 +45,7 @@ class IncidentStatus(str, enum.Enum):
     CLOSED = "CLOSED"
 
 
-class Incident(Base, IdMixin):
+class Incident(Base, IdMixin, SoftDeleteMixin):
     """SQLAlchemy mirror of the Prisma `Incident` model.
 
     Phase 1 of the production-depth refactor adds ~50 new columns covering

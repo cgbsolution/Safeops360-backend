@@ -30,7 +30,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models._base import Base, IdMixin
+from app.models._base import Base, IdMixin, SoftDeleteMixin
 
 
 class AuditCheckpointLibrary(Base, IdMixin):
@@ -77,7 +77,7 @@ class AuditTemplate(Base, IdMixin):
     )
 
 
-class ComplianceAudit(Base, IdMixin):
+class ComplianceAudit(Base, IdMixin, SoftDeleteMixin):
     """One audit instance carrying the full lifecycle via `status`."""
 
     __tablename__ = "ComplianceAudit"

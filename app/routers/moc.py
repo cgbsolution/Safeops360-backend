@@ -486,6 +486,14 @@ async def transition(
 
     prev = cr.status
     cr.status = payload.toStatus
+
+    # I-18: on approval, auto-spawn an implementation-tracking CAPA (MOC_ACTION)
+    # so an approved change is always tracked to closure. Idempotent.
+    moc_capa = None
+    if payload.toStatus == "approved_pending_implementation":
+        from app.services.capa_spawn import spawn_moc_capas
+        moc_capa = await spawn_moc_capas(db, cr, user.id)
+
     if payload.toStatus == "implementation_in_progress" and cr.actualImplementationDate is None:
         cr.actualImplementationDate = datetime.now(timezone.utc)
     if payload.toStatus == "closed_successful" and cr.actualCompletionDate is None:
@@ -516,7 +524,7 @@ async def transition(
         )
     )
     await db.commit()
-    return {"id": cr.id, "status": cr.status, "previousStatus": prev, "cascadedReReviews": cascaded}
+    return {"id": cr.id, "status": cr.status, "previousStatus": prev, "cascadedReReviews": cascaded, "mocCapa": moc_capa}
 
 
 @router.post("/change-requests/{cr_id}/approve")

@@ -153,8 +153,8 @@ async def create_kri(body: S.KriUpsert, user: User = Depends(get_current_user), 
     api_token = secrets.token_urlsafe(24) if body.feedType == "API" else None
     k = KriDefinition(
         kriCode=await _next_kri_code(db), name=body.name, description=body.description, categoryId=body.categoryId,
-        linkedRiskIds=body.linkedRiskIds, unit=body.unit, direction=body.direction, frequency=body.frequency,
-        feedType=body.feedType, metricProviderKey=body.metricProviderKey, apiToken=api_token,
+        linkedRiskIds=body.linkedRiskIds, unit=body.unit, direction=body.direction, indicatorType=body.indicatorType,
+        frequency=body.frequency, feedType=body.feedType, metricProviderKey=body.metricProviderKey, apiToken=api_token,
         thresholdGreen=body.thresholdGreen, thresholdAmber=body.thresholdAmber, ownerId=body.ownerId,
         graceDays=body.graceDays, isActive=body.isActive, createdBy=user.id,
     )
@@ -171,7 +171,7 @@ async def update_kri(kri_id: str, body: S.KriUpsert, user: User = Depends(get_cu
     if not k:
         raise HTTPException(404, "KRI not found")
     thresholds_changed = (k.thresholdGreen != body.thresholdGreen or k.thresholdAmber != body.thresholdAmber or k.direction != body.direction)
-    for f in ("name", "description", "categoryId", "linkedRiskIds", "unit", "direction", "frequency", "feedType", "metricProviderKey", "thresholdGreen", "thresholdAmber", "ownerId", "graceDays", "isActive"):
+    for f in ("name", "description", "categoryId", "linkedRiskIds", "unit", "direction", "indicatorType", "frequency", "feedType", "metricProviderKey", "thresholdGreen", "thresholdAmber", "ownerId", "graceDays", "isActive"):
         setattr(k, f, getattr(body, f))
     k.updatedBy = user.id
     if thresholds_changed:
@@ -230,6 +230,9 @@ async def add_reading(kri_id: str, body: S.ReadingCreate, user: User = Depends(g
     r = await svc.record_reading(db, k, body.periodLabel, pe, body.value, "MANUAL", entered_by=user.id, notes=body.notes)
     if k.currentStatus == "RED":
         await svc.evaluate_appetite(db)
+    # A RED KRI flags its linked risks for reassessment (and clears on recovery).
+    from app.services.erm import sync_kri_alerts as _sync_kri_alerts
+    await _sync_kri_alerts(db)
     await db.commit()
     await db.refresh(r)
     return _reading_out(r, await _names(db, [user.id]))
@@ -250,6 +253,8 @@ async def bulk_readings(rows: list[S.BulkReadingRow], user: User = Depends(get_c
             await db.rollback()
             return {"ok": False, "written": 0, "errors": errors}
         await svc.evaluate_appetite(db)
+        from app.services.erm import sync_kri_alerts as _sync_kri_alerts
+        await _sync_kri_alerts(db)
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -304,8 +309,11 @@ async def run_module_fed(period_end: str | None = Query(None, alias="periodEnd")
     await _require(db, user, "KRI.ADMIN")
     pe = datetime.fromisoformat(period_end) if period_end else _now()
     res = await svc.run_module_fed(db, pe)
-    # KRI readings may have turned RED → re-evaluate appetite (MAX_RED_KRI_COUNT bands).
+    # KRI readings may have turned RED → re-evaluate appetite (MAX_RED_KRI_COUNT bands)
+    # and push linked risks into reassessment.
     await svc.evaluate_appetite(db)
+    from app.services.erm import sync_kri_alerts as _sync_kri_alerts
+    await _sync_kri_alerts(db)
     await db.commit()
     return res
 

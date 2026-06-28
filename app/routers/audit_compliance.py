@@ -26,6 +26,7 @@ from app.services.permissions import (
     PermissionContext,
     can,
     get_accessible_plants,
+    get_accessible_plants_for,
 )
 from app.services.storage import (
     create_signed_download_url,
@@ -256,7 +257,10 @@ async def list_audits(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     await _require(db, user, "AUDIT_COMPLIANCE.READ")
-    plants = await get_accessible_plants(db, user.id)
+    # P1-2: permission-specific scope (fail-closed). The module-agnostic helper
+    # returned None=all as soon as the user held ANY ALL_PLANTS grant, leaking
+    # other plants' audits into the list.
+    plants = await get_accessible_plants_for(db, user.id, "AUDIT_COMPLIANCE.READ")
     audits = await svc.list_audits(db, accessible_plants=plants)
     return {"audits": audits}
 
@@ -336,7 +340,7 @@ async def programme_dashboard(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     await _require(db, user, "AUDIT_COMPLIANCE.READ")
-    plants = await get_accessible_plants(db, user.id)
+    plants = await get_accessible_plants_for(db, user.id, "AUDIT_COMPLIANCE.READ")
     return await svc.programme_dashboard(db, accessible_plants=plants)
 
 

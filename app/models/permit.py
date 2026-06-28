@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models._base import Base, IdMixin
+from app.models._base import Base, IdMixin, SoftDeleteMixin
 
 
 class PermitType(str, enum.Enum):
@@ -45,7 +45,7 @@ class PermitStatus(str, enum.Enum):
     REJECTED = "REJECTED"
 
 
-class Permit(Base, IdMixin):
+class Permit(Base, IdMixin, SoftDeleteMixin):
     """SQLAlchemy mirror of the Prisma `Permit` model.
 
     Production-depth refactor (Commit 1) added ~22 new columns + child

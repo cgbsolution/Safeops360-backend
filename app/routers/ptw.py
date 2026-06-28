@@ -428,10 +428,11 @@ async def get_activation_gate(
 @router.delete("/{permit_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_permit(
     permit_id: str,
+    reason: str | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Hard-delete a permit. Per the RBAC matrix:
+    """Soft-delete a permit (governed entity — never hard-deleted). Per the RBAC matrix:
     - PERMIT_ISSUER can delete OWN_RECORDS (their own draft permits)
     - HSE_MANAGER can delete OWN_PLANT
     - SYSTEM_ADMIN can delete ALL_PLANTS
@@ -468,7 +469,9 @@ async def delete_permit(
     for inst in inst_rows:
         await db.delete(inst)
 
-    await db.delete(permit)
+    from app.core.soft_delete import soft_delete
+
+    soft_delete(permit, user.id, reason or "Permit removed by authorised user via delete endpoint")
     await db.flush()
 
 

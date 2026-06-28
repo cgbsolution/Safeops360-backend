@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # Re-validate the licence on this cadence (seconds). Catches expiry roll-over
     # and clock-tamper between boots without a restart.
     licence_recheck_seconds: int = 3600
+    # P2-1 background scheduler. Default off (opt-in) so a shared dev DB isn't
+    # mutated by interval jobs; on-prem deployments set SCHEDULER_ENABLED=true.
+    scheduler_enabled: bool = False
 
     # AI agents (Anthropic Claude). Optional — when unset, the
     # workflow-rule agents (Pattern A: triage / lessons) log a warning

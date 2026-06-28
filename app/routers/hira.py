@@ -2564,3 +2564,19 @@ async def dashboard_review_compliance(
     return HiraDashboardReviewCompliance(
         overdue=overdue, dueSoon30Days=due_soon, completedLast90Days=completed_90
     )
+
+
+# ── P2-7 ISO 45001 §8.1.2 control-hierarchy validation (soft warning) ─────────
+@router.post("/validate-control-hierarchy")
+async def validate_control_hierarchy_endpoint(
+    payload: dict,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return ISO 45001 §8.1.2 hierarchy warnings for a set of control types.
+    Soft (non-blocking) — the form shows warnings; the assessor acknowledges to save."""
+    from app.services.iso_validation import validate_control_hierarchy
+    control_types = payload.get("controlTypes") or []
+    enforce = payload.get("enforce", True)
+    warnings = validate_control_hierarchy(control_types, enforce=enforce)
+    return {"warnings": warnings, "ok": len(warnings) == 0}

@@ -125,6 +125,27 @@ async def can_ptw_transition_to_active(
             )
         )
 
+    # ─── 1b. Competency RE-CHECK at activation (P3-4) ─────────────────
+    # The competency gate fires at creation; a competency can expire between
+    # creation and activation. Re-run the live Skill-Matrix check now.
+    try:
+        from app.services.competency import check_competency_for_permit_type
+
+        ptype = permit.type.value if hasattr(permit.type, "value") else str(permit.type)
+        crew_ids = {getattr(c, "userId", None) or getattr(c, "workerId", None) for c in (permit.workCrew or [])}
+        crew_ids.add(getattr(permit, "receiverId", None))
+        for uid in [u for u in crew_ids if u]:
+            chk = await check_competency_for_permit_type(db, uid, ptype)
+            if chk is not None and not getattr(chk, "is_valid", getattr(chk, "valid", True)):
+                status.ok = False
+                status.blockers.append(GateBlocker(
+                    code="COMPETENCY_EXPIRED_AT_ACTIVATION",
+                    message=f"Crew member competency for {ptype} is no longer valid: "
+                            f"{getattr(chk, 'reason', 'expired or missing')}. Resolve before activation.",
+                ))
+    except Exception:
+        pass  # competency module absent → degrade gracefully (gate doesn't block on it)
+
     # ─── 2. FLRA gate ─────────────────────────────────────────────────
     flra_stmt = (
         select(FLRA)

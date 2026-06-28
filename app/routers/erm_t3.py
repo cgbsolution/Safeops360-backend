@@ -355,6 +355,10 @@ async def record_test(cid: str, body: S.TestCreate, user: User = Depends(get_cur
         await db.flush()
         t.deficiencyId = d.id
     await svc.recompute_control_ratings(db, c)
+    # A control going deficient must flag every risk it mitigates for reassessment
+    # (and clear the flag when it recovers) — the risk↔control↔residual chain.
+    from app.services.erm import sync_control_alerts as _sync_control_alerts
+    await _sync_control_alerts(db)
     await db.commit()
     await db.refresh(t)
     o = S.TestOut.model_validate(t)

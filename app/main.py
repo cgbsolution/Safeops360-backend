@@ -22,6 +22,7 @@ from app.routers import (
     agents_config,
     anomalies,
     audit_compliance,
+    audit_log,
     auth,
     cams,
     capa,
@@ -42,11 +43,13 @@ from app.routers import (
     epc_workers,
     factory,
     factory_ext,
+    fire_safety,
     plants,
     flra,
     hira,
     incidents,
     inspections,
+    jobs,
     kaizen,
     licensing,
     manhours,
@@ -85,7 +88,12 @@ _ROUTERS = {
     "epc_mobilization": epc_mobilization, "epc_gate": epc_gate, "epc_induction": epc_induction,
     "epc_dashboard": epc_dashboard, "audit_compliance": audit_compliance, "cams": cams,
     "factory": factory, "factory_ext": factory_ext, "devices": devices, "plants": plants,
-    "dashboard": dashboard, "licensing": licensing,
+    "dashboard": dashboard, "licensing": licensing, "audit_log": audit_log, "jobs": jobs,
+    # Fire Safety (FIRE module). Mounted always-on in dev: the unsigned dev licence
+    # predates the FIRE code, so gating it via ROUTER_MODULE would 403 it. The FIRE
+    # module IS registered in the licensing model (registry/editions) — add
+    # "fire_safety": "FIRE" to ROUTER_MODULE once a FIRE-inclusive licence is issued.
+    "fire_safety": fire_safety,
 }
 
 
@@ -115,10 +123,23 @@ async def lifespan(_app: FastAPI):
         log.warning("Factory-entitlement cache load failed: %s", e)
 
     recheck = asyncio.create_task(_licence_recheck_loop())
+
+    # P2-1 background scheduler (opt-in). Single asyncio supervisor; jobs are
+    # idempotent and record JobRun rows. Off by default on a shared dev DB.
+    sched_stop = asyncio.Event()
+    sched_task = None
+    if settings.scheduler_enabled:
+        from app.services.scheduler import supervisor_loop
+        sched_task = asyncio.create_task(supervisor_loop(sched_stop))
+        log.info("Background scheduler ENABLED")
+
     try:
         yield
     finally:
         recheck.cancel()
+        if sched_task is not None:
+            sched_stop.set()
+            sched_task.cancel()
         await engine.dispose()
 
 
@@ -137,6 +158,28 @@ async def _licence_recheck_loop() -> None:
 
 
 def create_app() -> FastAPI:
+    # Install the platform-wide soft-delete guard (P1-3): registers the governed
+    # entities and arms the before_flush hard-delete blocker (import side-effect).
+    from app.core.soft_delete import register_default_governed
+
+    register_default_governed()
+
+    # Arm the unified audit trail (P1-1): import registers the ORM capture
+    # listeners; register the audited entities.
+    from app.models.audit_compliance import ComplianceAudit
+    from app.models.capa import Capa
+    from app.models.erm import EnterpriseRisk, RiskAssessment
+    from app.models.erm_p2 import LossEvent
+    from app.models.incident import Incident
+    from app.models.permit import Permit
+    from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
+    from app.services.audit_log import register_audited
+
+    register_audited(
+        Incident, Capa, ComplianceAudit, Permit, EnterpriseRisk, RiskAssessment, LossEvent,
+        FireEquipment, FireEmergencyPlan, FireDrill,
+    )
+
     app = FastAPI(
         title="SafeOps360 — Backend",
         version="1.0.0",

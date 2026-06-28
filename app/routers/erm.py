@@ -44,6 +44,7 @@ from app.models.plant import Plant
 from app.models.user import User
 from app.schemas import erm as S
 from app.services import erm as svc
+from app.services.access_scope import build_query_scope
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -200,6 +201,20 @@ async def _serialise_list_item(
         residualBand=r.residualBand,
         priorResidualScore=r.priorResidualScore,
         priorResidualBand=r.priorResidualBand,
+        inherentExpectedLossInr=r.inherentExpectedLossInr,
+        residualExpectedLossInr=r.residualExpectedLossInr,
+        residualWorstLossInr=r.residualWorstLossInr,
+        controlEffectivenessPct=r.controlEffectivenessPct,
+        derivedResidualScore=r.derivedResidualScore,
+        derivedResidualBand=r.derivedResidualBand,
+        residualIsOverride=bool(r.residualIsOverride),
+        residualOverrideVariance=r.residualOverrideVariance,
+        controlAlert=bool(r.controlAlert),
+        kriAlert=bool(r.kriAlert),
+        incidentAlert=bool(getattr(r, "incidentAlert", False)),
+        targetScore=r.targetScore,
+        targetBand=r.targetBand,
+        targetExpectedLossInr=r.targetExpectedLossInr,
         nextReviewDate=r.nextReviewDate,
         reviewOverdueDays=overdue,
         reviewBadge=svc.review_badge(overdue),
@@ -434,13 +449,12 @@ async def _next_erm_code(db: AsyncSession) -> str:
 async def _record_assessment(
     db: AsyncSession, risk: EnterpriseRisk, body: S.AssessmentCreate, user_id: str
 ) -> RiskAssessment:
-    """Create an assessment, flip prior current=false, validate residual<=inherent."""
-    impact_scores = [{"dimension": s.dimension, "level": s.level} for s in body.impactScores]
-    dom_dim, overall = svc.dominant_dimension(impact_scores)
-    total = body.likelihood * overall
+    """Create an assessment, flip prior current=false, validate residual<=inherent.
+    Computes monetary expected loss; for a control-derived residual, the
+    likelihood/impact fall out of mapped control effectiveness (not typed in)."""
     bands = await svc.bands_from_active_matrix(db)
-    band = svc.band_for_score(total, bands)
 
+    inh = None
     if body.assessmentType == "RESIDUAL":
         inh = (
             await db.execute(
@@ -452,10 +466,47 @@ async def _record_assessment(
         ).scalar_one_or_none()
         if inh is None:
             raise HTTPException(400, "Record an inherent assessment before a residual one.")
-        if total > inh.totalScore:
+
+    # Control effectiveness (snapshot) — drives a derived residual + override variance.
+    eff = await svc.control_effectiveness(db, risk.id) if body.assessmentType == "RESIDUAL" else None
+
+    likelihood = body.likelihood
+    if body.assessmentType == "RESIDUAL" and body.deriveFromControls:
+        d = svc.derive_residual_from_controls(inh.likelihood, inh.overallImpact, eff, bands)
+        likelihood = d["likelihood"]
+        dom_dim = inh.dominantImpactDimension
+        overall = d["impact"]
+        impact_scores = [{"dimension": dom_dim, "level": overall}]
+    else:
+        impact_scores = [{"dimension": s.dimension, "level": s.level} for s in body.impactScores]
+        if not impact_scores:
             raise HTTPException(
-                400, "Residual risk cannot exceed inherent risk — review existing controls."
+                400, "impactScores is required (or set deriveFromControls=true for a residual)."
             )
+        dom_dim, overall = svc.dominant_dimension(impact_scores)
+
+    total = likelihood * overall
+    band = svc.band_for_score(total, bands)
+
+    if body.assessmentType == "RESIDUAL" and total > inh.totalScore:
+        raise HTTPException(
+            400, "Residual risk cannot exceed inherent risk — review existing controls."
+        )
+
+    # ── Monetary expected loss ──
+    likelihood_pct = body.likelihoodPct if body.likelihoodPct is not None else svc.default_likelihood_pct(likelihood)
+    fin_best, fin_expected, fin_worst = body.financialBestInr, body.financialExpectedInr, body.financialWorstInr
+    if body.assessmentType == "RESIDUAL" and body.deriveFromControls and eff is not None:
+        # Derived residual inherits the inherent ₹ impact attenuated by mitigating controls.
+        atten = 1.0 - eff["mitigating"]
+        if fin_expected is None and inh.financialExpectedInr is not None:
+            fin_expected = round(inh.financialExpectedInr * atten)
+        if fin_worst is None and inh.financialWorstInr is not None:
+            fin_worst = round(inh.financialWorstInr * atten)
+        if fin_best is None and inh.financialBestInr is not None:
+            fin_best = round(inh.financialBestInr * atten)
+    el = svc.expected_loss(likelihood_pct, fin_expected)
+    uel = svc.unexpected_loss(likelihood_pct, fin_expected, fin_worst)
 
     # archive prior current of same type
     prior = (
@@ -475,12 +526,21 @@ async def _record_assessment(
         matrixConfigId=matrix.id if matrix else None,
         matrixVersion=matrix.version if matrix else None,
         assessmentType=body.assessmentType,
-        likelihood=body.likelihood,
+        likelihood=likelihood,
         impactScores=impact_scores,
         dominantImpactDimension=dom_dim,
         overallImpact=overall,
         totalScore=total,
         ratingBand=band,
+        likelihoodPct=likelihood_pct,
+        financialBestInr=fin_best,
+        financialExpectedInr=fin_expected,
+        financialWorstInr=fin_worst,
+        expectedLossInr=el,
+        unexpectedLossInr=uel,
+        timeHorizon=body.timeHorizon,
+        derivedFromControls=bool(body.assessmentType == "RESIDUAL" and body.deriveFromControls),
+        controlEffectivenessPct=round(eff["combined"] * 100.0, 1) if eff is not None else None,
         assessmentDate=_q_now(),
         assessedBy=user_id,
         rationale=body.rationale,
@@ -667,7 +727,9 @@ async def move_to_monitoring(risk_id: str, user: User = Depends(get_current_user
     if not risk:
         raise HTTPException(404, "Risk not found")
     await _require(db, user, "ERM.UPDATE", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
-    # Requires a current residual assessment recorded after the last treatment closed.
+    # Closed-loop gate: a current residual assessment must exist AND have been
+    # recorded AFTER the latest treatment closed — proving the post-mitigation
+    # re-score actually measured the new residual rather than reusing a stale one.
     res = (
         await db.execute(
             select(RiskAssessment)
@@ -678,6 +740,24 @@ async def move_to_monitoring(risk_id: str, user: User = Depends(get_current_user
     ).scalar_one_or_none()
     if res is None:
         raise HTTPException(400, "Record a fresh residual assessment before moving to MONITORING.")
+    last_closed = (
+        await db.execute(
+            select(func.max(Capa.closedAt))
+            .where(Capa.sourceTypeCode == "RISK_TREATMENT")
+            .where(Capa.sourceReferenceId == risk.id)
+            .where(Capa.state.in_(("CLOSED", "VERIFIED")))
+        )
+    ).scalar_one_or_none()
+    if last_closed is not None:
+        res_date = res.assessmentDate.replace(tzinfo=timezone.utc) if res.assessmentDate.tzinfo is None else res.assessmentDate
+        closed_aware = last_closed.replace(tzinfo=timezone.utc) if last_closed.tzinfo is None else last_closed
+        if res_date < closed_aware:
+            raise HTTPException(
+                400,
+                "Re-assess residual risk AFTER the treatment closed — the current residual predates the latest treatment closure, so the reduction is unproven.",
+            )
+        # Loop closed → record what the mitigation actually achieved.
+        await svc.reconcile_treatment_closures(db)
     risk.lifecycleState = "MONITORING"
     risk.updatedBy = user.id
     await db.commit()
@@ -696,6 +776,29 @@ async def create_assessment(
         raise HTTPException(404, "Risk not found")
     await _require(db, user, "ERM.ASSESS", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
     a = await _record_assessment(db, risk, body, user.id)
+    # Override governance (probe-1 hardening): a residual asserted materially more
+    # OPTIMISTIC than the control-derived residual must be both justified AND signed
+    # off by a risk approver — a typed-in residual can no longer silently beat controls.
+    if body.assessmentType == "RESIDUAL" and not body.deriveFromControls:
+        var = risk.residualOverrideVariance  # asserted − derived
+        if var is not None and var <= -svc.OVERRIDE_TOLERANCE:
+            gap = abs(var)
+            if not (body.overrideJustification and body.overrideJustification.strip()):
+                raise HTTPException(
+                    400,
+                    f"This residual is {gap} points more optimistic than your controls justify "
+                    f"(control-derived residual = {risk.derivedResidualScore}). A material override "
+                    f"requires an overrideJustification.",
+                )
+            approver = await can(db, user.id, "ERM.APPROVE", PermissionContext(plant_id=risk.plantId))
+            if not approver.allowed:
+                raise HTTPException(
+                    403,
+                    f"A residual {gap} points below the control-derived value "
+                    f"({risk.derivedResidualScore}) must be signed off by a risk approver "
+                    f"(ERM.APPROVE). Strengthen/evidence the controls, or have the CRO approve the override.",
+                )
+            a.rationale = f"{a.rationale}\n[OVERRIDE approved by {user.id}: {body.overrideJustification.strip()}]"
     if risk.lifecycleState == "DRAFT":
         risk.lifecycleState = "ASSESSED"
     await svc.maybe_escalate(db, risk)
@@ -731,6 +834,220 @@ async def list_assessments(risk_id: str, user: User = Depends(get_current_user),
         o.assessedByName = names.get(r.assessedBy)
         out.append(o)
     return out
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Derived residual · Target · Enterprise exposure (ADVANCED)
+# ═════════════════════════════════════════════════════════════════════
+@router.get("/risks/{risk_id}/derived-residual", response_model=S.DerivedResidualOut)
+async def get_derived_residual(
+    risk_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.READ", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    return await _derived_residual_out(db, risk)
+
+
+@router.post("/risks/{risk_id}/target", response_model=S.RiskDetail)
+async def set_risk_target(
+    risk_id: str, body: S.TargetSet, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.ASSESS", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    bands = await svc.bands_from_active_matrix(db)
+    svc.set_target(
+        risk, body.targetLikelihood, body.targetImpact, bands,
+        target_date=body.targetDate, rationale=body.targetRationale,
+        financial_expected_inr=body.financialExpectedInr, likelihood_pct=body.likelihoodPct,
+    )
+    if risk.residualScore is not None and risk.targetScore is not None and risk.targetScore > risk.residualScore:
+        raise HTTPException(400, "Target risk should be at or below the current residual — you cannot target a worse position.")
+    risk.updatedBy = user.id
+    await db.commit()
+    return await _build_detail(db, risk_id, user)
+
+
+@router.put("/risks/{risk_id}/bowtie", response_model=S.RiskDetail)
+async def set_bowtie(
+    risk_id: str, body: S.BowtieModel, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    """Persist the structured bow-tie (threats → top event → consequences, with
+    preventive/mitigating barriers, each optionally linked to a Control)."""
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.UPDATE", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    # Enrich barriers that reference a control with its current code/rating.
+    payload = body.model_dump()
+    ctrl_ids = [
+        b.get("controlId")
+        for grp in (payload.get("threats", []) + payload.get("consequences", []))
+        for b in (grp.get("preventiveBarriers", []) + grp.get("mitigatingBarriers", []))
+        if b.get("controlId")
+    ]
+    if ctrl_ids:
+        from app.models.erm_t3 import Control
+        ctrls = {c.id: c for c in (await db.execute(select(Control).where(Control.id.in_(ctrl_ids)))).scalars().all()}
+        for grp in payload.get("threats", []) + payload.get("consequences", []):
+            for b in grp.get("preventiveBarriers", []) + grp.get("mitigatingBarriers", []):
+                c = ctrls.get(b.get("controlId"))
+                if c:
+                    b["controlCode"] = c.controlCode
+    risk.bowtie = payload
+    risk.updatedBy = user.id
+    await db.commit()
+    return await _build_detail(db, risk_id, user)
+
+
+@router.put("/risks/{risk_id}/three-lines", response_model=S.RiskDetail)
+async def set_three_lines(
+    risk_id: str, body: S.ThreeLinesUpsert, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    """Assign three-lines-of-defence accountability (1st line = owner/management,
+    2nd line = risk/compliance oversight, 3rd line = independent assurance)."""
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.UPDATE", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    risk.firstLineOwnerId = body.firstLineOwnerId
+    risk.secondLineOwnerId = body.secondLineOwnerId
+    risk.thirdLineAssurance = body.thirdLineAssurance
+    risk.updatedBy = user.id
+    await db.commit()
+    return await _build_detail(db, risk_id, user)
+
+
+@router.get("/exposure-by-factory")
+async def exposure_by_factory(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """I-17 / P2-5 — ₹ enterprise-risk exposure per factory (Σ residual expected
+    loss of HIGH+CRITICAL risks), ranked. Powers the MIS widget + factory cards."""
+    await _require(db, user, "ERM.READ")
+    scope = await build_query_scope(db, user.id, "ERM.READ")
+    plants = await _plant_index(db)
+    q = (
+        select(EnterpriseRisk).where(EnterpriseRisk.isDeleted.is_(False))
+        .where(EnterpriseRisk.lifecycleState != "CLOSED")
+        .where(EnterpriseRisk.residualBand.in_(("HIGH", "CRITICAL")))
+        .where(EnterpriseRisk.plantId.is_not(None))
+    )
+    q = scope.apply(q, EnterpriseRisk)
+    risks = (await db.execute(q)).scalars().all()
+    by_site: dict[str, dict[str, Any]] = {}
+    for r in risks:
+        d = by_site.setdefault(r.plantId, {"plantId": r.plantId, "plantName": plants.get(r.plantId, r.plantId),
+                                           "totalExposureInr": 0.0, "criticalRiskCount": 0, "highRiskCount": 0})
+        d["totalExposureInr"] += r.residualExpectedLossInr or 0
+        if r.residualBand == "CRITICAL":
+            d["criticalRiskCount"] += 1
+        else:
+            d["highRiskCount"] += 1
+    rows = sorted(by_site.values(), key=lambda x: x["totalExposureInr"], reverse=True)
+    for d in rows:
+        d["totalExposureInr"] = round(d["totalExposureInr"])
+        d["worstBand"] = "CRITICAL" if d["criticalRiskCount"] > 0 else "HIGH"
+    return {"factories": rows, "totalExposureInr": round(sum(d["totalExposureInr"] for d in rows))}
+
+
+@router.post("/risks/sync-incident-alerts")
+async def sync_incident_alerts(
+    lookbackDays: int = Query(120, ge=7, le=730),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """I-04 — flag OPS risks whose site had an LTI/Critical incident (on-demand;
+    also runs on the nightly scheduler and on incident closure)."""
+    await _require(db, user, "ERM.UPDATE")
+    res = await svc.sync_incident_risk_alerts(db, lookback_days=lookbackDays)
+    await db.commit()
+    return res
+
+
+@router.get("/exposure", response_model=S.EnterpriseExposureResponse)
+async def enterprise_exposure(
+    plant_id: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Total enterprise risk exposure in ₹ (Σ residual expected loss), the risks
+    that drive most of it, concentration by site & category, and a Herfindahl
+    concentration index. Answers the CRO's 'what's our exposure and what drives it'."""
+    await _require(db, user, "ERM.READ")
+    cats = await _category_index(db)
+    plants = await _plant_index(db)
+    q = (
+        select(EnterpriseRisk)
+        .where(EnterpriseRisk.isDeleted.is_(False))
+        .where(EnterpriseRisk.lifecycleState != "CLOSED")
+    )
+    if plant_id:
+        q = q.where(EnterpriseRisk.plantId == plant_id)
+    risks = (await db.execute(q)).scalars().all()
+
+    total_el = sum(r.residualExpectedLossInr or 0 for r in risks)
+    total_worst = sum(r.residualWorstLossInr or 0 for r in risks)
+    quantified = [r for r in risks if (r.residualExpectedLossInr or 0) > 0]
+    unquantified = [r for r in risks if not (r.residualExpectedLossInr or 0) > 0]
+
+    drivers = sorted(quantified, key=lambda r: r.residualExpectedLossInr or 0, reverse=True)
+    top_rows: list[S.ExposureRow] = []
+    cum = 0.0
+    for i, r in enumerate(drivers[:10], start=1):
+        el = r.residualExpectedLossInr or 0
+        pct = round(el * 100.0 / total_el, 1) if total_el else 0.0
+        cum += pct
+        cat = cats.get(r.categoryId)
+        top_rows.append(S.ExposureRow(
+            rank=i, id=r.id, riskCode=r.riskCode, title=r.title,
+            categoryCode=cat.code if cat else None, categoryName=cat.name if cat else None,
+            residualBand=r.residualBand, residualExpectedLossInr=el,
+            residualWorstLossInr=r.residualWorstLossInr or 0,
+            pctOfTotal=pct, cumulativePct=round(cum, 1),
+        ))
+
+    by_cat: dict[str, dict[str, Any]] = {}
+    for r in quantified:
+        cat = cats.get(r.categoryId)
+        key = cat.code if cat else "UNCATEGORISED"
+        d = by_cat.setdefault(key, {"name": cat.name if cat else "Uncategorised", "color": cat.colorHex if cat else None, "count": 0, "el": 0.0})
+        d["count"] += 1
+        d["el"] += r.residualExpectedLossInr or 0
+    cat_rows = [
+        S.ExposureByCategory(
+            categoryCode=k, categoryName=v["name"], colorHex=v["color"], riskCount=v["count"],
+            expectedLossInr=v["el"], pctOfTotal=round(v["el"] * 100.0 / total_el, 1) if total_el else 0.0,
+        )
+        for k, v in sorted(by_cat.items(), key=lambda kv: kv[1]["el"], reverse=True)
+    ]
+
+    by_site: dict[str | None, dict[str, Any]] = {}
+    for r in quantified:
+        d = by_site.setdefault(r.plantId, {"count": 0, "el": 0.0, "els": []})
+        d["count"] += 1
+        d["el"] += r.residualExpectedLossInr or 0
+        d["els"].append(r.residualExpectedLossInr or 0)
+    site_rows = []
+    for pid, v in sorted(by_site.items(), key=lambda kv: kv[1]["el"], reverse=True):
+        site_total = v["el"] or 1
+        hhi = round(sum((x / site_total) ** 2 for x in v["els"]), 3)
+        site_rows.append(S.ExposureBySite(
+            plantId=pid, plantName=(plants.get(pid) if pid else "Enterprise (no site)"),
+            riskCount=v["count"], expectedLossInr=v["el"], concentrationIndex=hhi,
+        ))
+
+    portfolio_hhi = round(sum(((r.residualExpectedLossInr or 0) / total_el) ** 2 for r in quantified), 3) if total_el else 0.0
+    top5 = sum((r.residualExpectedLossInr or 0) for r in drivers[:5])
+    return S.EnterpriseExposureResponse(
+        totalExpectedLossInr=total_el, totalWorstLossInr=total_worst,
+        quantifiedRiskCount=len(quantified), unquantifiedRiskCount=len(unquantified),
+        topDrivers=top_rows, byCategory=cat_rows, bySite=site_rows,
+        portfolioConcentrationIndex=portfolio_hhi,
+        top5SharePct=round(top5 * 100.0 / total_el, 1) if total_el else 0.0,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -805,6 +1122,14 @@ async def create_treatment(
             "treatmentStrategy": body.treatmentStrategy,
             "expectedResidualReduction": body.expectedResidualReduction,
             "riskCode": risk.riskCode,
+            "costInr": body.costInr,
+            "transferPolicyId": body.transferPolicyId,
+            # Baseline residual snapshot — the closed-loop compares the residual
+            # AFTER closure against this to prove (not assume) the risk fell.
+            "baselineResidualScore": risk.residualScore,
+            "baselineResidualBand": risk.residualBand,
+            "baselineResidualExpectedLossInr": risk.residualExpectedLossInr,
+            "baselineCapturedAt": _q_now().isoformat(),
         },
         problemDescription=body.description or f"Risk treatment ({body.treatmentStrategy}) for {risk.riskCode}: {risk.title}",
         detectionMethod="ERM_TREATMENT",
@@ -849,11 +1174,16 @@ async def _treatments_for_risk(db: AsyncSession, risk_id: str) -> list[S.Treatme
     names = await svc.user_name_map(db, [c.primaryOwnerUserId for c in rows if c.primaryOwnerUserId])
     open_states = {"DRAFT", "SUBMITTED", "UNDER_RCA", "ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS", "PENDING_VERIFICATION"}
     now = _q_now()
+    # current residual of the parent risk — used to compute the achieved reduction live.
+    parent = await db.get(EnterpriseRisk, risk_id)
+    cur_residual = parent.residualScore if parent else None
     out = []
     for c in rows:
         meta = c.sourceMetadata or {}
         is_open = c.state in open_states
         overdue = bool(is_open and c.closureTargetDate and c.closureTargetDate.replace(tzinfo=timezone.utc) < now) if c.closureTargetDate else False
+        achieved = None if is_open else svc.achieved_reduction(meta, cur_residual)
+        expected = _safe_int(meta.get("expectedResidualReduction"))
         out.append(
             S.TreatmentOut(
                 id=c.id, capaNumber=c.capaNumber, title=c.title,
@@ -861,7 +1191,14 @@ async def _treatments_for_risk(db: AsyncSession, risk_id: str) -> list[S.Treatme
                 state=c.state, primaryOwnerUserId=c.primaryOwnerUserId,
                 primaryOwnerName=names.get(c.primaryOwnerUserId) if c.primaryOwnerUserId else None,
                 closureTargetDate=c.closureTargetDate,
-                expectedResidualReduction=_safe_int(meta.get("expectedResidualReduction")),
+                expectedResidualReduction=expected,
+                achievedResidualReduction=achieved,
+                reductionShortfall=(achieved is not None and expected is not None and achieved < expected) or None,
+                baselineResidualScore=_safe_int(meta.get("baselineResidualScore")),
+                costInr=meta.get("costInr"),
+                expectedLossReductionInr=meta.get("expectedLossReductionInr"),
+                riskReductionPerRupee=meta.get("riskReductionPerRupee"),
+                transferPolicyId=meta.get("transferPolicyId"),
                 isOpen=is_open, overdue=overdue,
             )
         )
@@ -887,6 +1224,7 @@ async def treatment_tracker(
     now = _q_now()
     q_start = _quarter_start(now)
     items, open_count, overdue_count, closed_q, closure_days = [], 0, 0, 0, []
+    total_el_reduction = total_cost = 0.0
     for c in rows:
         meta = c.sourceMetadata or {}
         strat = meta.get("treatmentStrategy", "TREAT")
@@ -905,6 +1243,15 @@ async def treatment_tracker(
             if c.createdAt:
                 closure_days.append((c.closedAt - c.createdAt).days)
         risk = risks.get(c.sourceReferenceId)
+        cur_residual = risk.residualScore if risk else None
+        achieved = None if is_open else svc.achieved_reduction(meta, cur_residual)
+        expected = _safe_int(meta.get("expectedResidualReduction"))
+        el_red = meta.get("expectedLossReductionInr")
+        cost = meta.get("costInr")
+        if el_red:
+            total_el_reduction += el_red
+        if cost:
+            total_cost += cost
         items.append(
             S.TreatmentTrackerRow(
                 id=c.id, capaNumber=c.capaNumber, title=c.title, treatmentStrategy=strat,
@@ -913,7 +1260,11 @@ async def treatment_tracker(
                 state=c.state, primaryOwnerUserId=c.primaryOwnerUserId,
                 primaryOwnerName=names.get(c.primaryOwnerUserId) if c.primaryOwnerUserId else None,
                 closureTargetDate=c.closureTargetDate, overdue=overdue,
-                expectedResidualReduction=_safe_int(meta.get("expectedResidualReduction")),
+                expectedResidualReduction=expected,
+                achievedResidualReduction=achieved,
+                reductionShortfall=(achieved is not None and expected is not None and achieved < expected) or None,
+                costInr=cost, expectedLossReductionInr=el_red,
+                riskReductionPerRupee=meta.get("riskReductionPerRupee"),
             )
         )
     items.sort(key=lambda x: (not x.overdue, x.state))
@@ -921,7 +1272,92 @@ async def treatment_tracker(
     return S.TreatmentTrackerResponse(
         items=items, total=len(items), openCount=open_count, overdueCount=overdue_count,
         closedThisQuarter=closed_q, avgClosureDays=avg,
+        totalExpectedLossReductionInr=round(total_el_reduction),
+        totalTreatmentCostInr=round(total_cost),
+        portfolioRiskReductionPerRupee=round(total_el_reduction / total_cost, 2) if total_cost else None,
     )
+
+
+@router.post("/treatments/reconcile")
+async def reconcile_treatments(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Measure achieved-vs-expected residual reduction + ₹ per ₹ across all CLOSED
+    treatments (on-demand job — the platform has no scheduler). CRO / Risk Champion."""
+    await _require(db, user, "ERM.TREAT")
+    res = await svc.reconcile_treatment_closures(db)
+    await db.commit()
+    return res
+
+
+@router.post("/treatments/escalate-overdue")
+async def escalate_overdue_treatments(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Escalate overdue treatments up the OWNER→CHAMPION→CRO ladder by days-overdue
+    and parent-risk severity (on-demand job). CRO / Risk Champion."""
+    await _require(db, user, "ERM.TREAT")
+    res = await svc.escalate_overdue_treatments(db)
+    await db.commit()
+    return res
+
+
+@router.get("/risks/{risk_id}/horizon")
+async def risk_horizon(risk_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Project residual exposure over 1/3/5-year horizons (risk is not point-in-time)."""
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.READ", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    return await svc.horizon_projection(db, risk_id)
+
+
+@router.get("/risks/{risk_id}/stability")
+async def risk_stability(risk_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Longitudinal residual stability — did it fall and STAY down, or rebound?"""
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.READ", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    return await svc.residual_stability(db, risk_id)
+
+
+@router.post("/jobs/run-all")
+async def run_all_jobs(
+    includeModuleFed: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run every on-demand ERM engine in one pass (scheduler substitute — point a cron
+    at this). includeModuleFed re-reads live KRI metrics. CRO / Risk Champion."""
+    await _require(db, user, "ERM.TREAT")
+    res = await svc.run_all_jobs(db, include_module_fed=includeModuleFed)
+    await db.commit()
+    return res
+
+
+@router.post("/control-alerts/sync")
+async def sync_control_alerts(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Re-evaluate which risks have a deficient mapped control and flag them for
+    reassessment (on-demand job). Also runs inline when a control test is recorded."""
+    await _require(db, user, "ERM.ASSESS")
+    res = await svc.sync_control_alerts(db)
+    await db.commit()
+    return res
+
+
+@router.post("/kri-alerts/sync")
+async def sync_kri_alerts(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Re-evaluate which risks have a RED linked KRI and flag them for reassessment
+    (on-demand; also runs inline when a KRI reading is recorded)."""
+    await _require(db, user, "ERM.ASSESS")
+    res = await svc.sync_kri_alerts(db)
+    await db.commit()
+    return res
+
+
+@router.get("/frameworks/coverage", response_model=S.FrameworkCoverageResponse)
+async def frameworks_coverage(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """ISO 31000 / COSO ERM 2017 / SEBI LODR Reg 21 clause-by-clause coverage map —
+    proves framework alignment with the endpoint/feature evidence for each clause."""
+    await _require(db, user, "ERM.READ")
+    return S.FrameworkCoverageResponse(**svc.framework_coverage())
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -953,8 +1389,8 @@ async def create_review(
         notes=body.notes, newAssessmentId=new_assessment_id, createdBy=user.id,
     )
     db.add(review)
-    # reset next review date from current residual band
-    risk.nextReviewDate = await svc.next_review_date_for_band(db, risk.residualBand)
+    # reset next review date from current residual band, compressed by risk velocity
+    risk.nextReviewDate = await svc.next_review_date_for_band(db, risk.residualBand, velocity=risk.velocity)
     risk.updatedBy = user.id
     # T2-11: a RESCORED review can cross an appetite band — run the breach engine.
     if body.outcome == "RESCORED":
@@ -1014,11 +1450,64 @@ async def network_graph(user: User = Depends(get_current_user), db: AsyncSession
     ]
     links = (await db.execute(select(RiskLinkage))).scalars().all()
     edges = [
-        S.NetworkEdge(id=l.id, source=l.sourceRiskId, target=l.targetRiskId, linkageType=l.linkageType, notes=l.notes)
+        S.NetworkEdge(
+            id=l.id, source=l.sourceRiskId, target=l.targetRiskId, linkageType=l.linkageType, notes=l.notes,
+            correlationStrength=l.correlationStrength, impactFactor=l.impactFactor,
+        )
         for l in links
         if l.sourceRiskId in risk_ids and l.targetRiskId in risk_ids
     ]
     return S.NetworkGraph(nodes=nodes, edges=edges)
+
+
+@router.get("/risks/{risk_id}/propagation", response_model=S.PropagationResult)
+async def risk_propagation(risk_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """If this risk materialises, which linked risks move and by how much ₹ (probe 3)."""
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.READ", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    return S.PropagationResult(**await svc.risk_propagation(db, risk_id))
+
+
+@router.get("/portfolio/correlated-exposure", response_model=S.CorrelatedExposureResponse)
+async def correlated_exposure(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Portfolio exposure WITH interdependencies vs the naive independent sum — the
+    contagion exposure a naive Σ hides (probes 3, 9)."""
+    await _require(db, user, "ERM.READ")
+    res = await svc.correlated_exposure(db)
+    res["topContagionSources"] = [S.PropagationResult(**p) for p in res["topContagionSources"]]
+    return S.CorrelatedExposureResponse(**res)
+
+
+@router.get("/portfolio/monte-carlo", response_model=S.MonteCarloResponse)
+async def portfolio_monte_carlo(
+    iterations: int = Query(10000, ge=1000, le=100000),
+    seed: int = Query(42),
+    plant_id: str | None = Query(None),
+    correlate: bool = Query(True),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Monte-Carlo aggregate-loss distribution + VaR (P90/P95/P99) over the portfolio's
+    residual loss profiles — the probabilistic capability behind the heat map (probe 8).
+    correlate=True drives contagion (induced firing + amplification) via the RiskLinkage
+    graph so VaR reflects correlation, and reports the independent-vs-correlated tail delta."""
+    await _require(db, user, "ERM.READ")
+    return S.MonteCarloResponse(**await svc.monte_carlo_portfolio(db, iterations=iterations, seed=seed, plant_id=plant_id, correlate=correlate))
+
+
+@router.get("/portfolio/reverse-stress", response_model=S.ReverseStressResponse)
+async def portfolio_reverse_stress(
+    threshold_inr: float = Query(..., gt=0),
+    plant_id: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reverse stress test — the smallest combination of risks whose simultaneous
+    materialisation breaches a ₹ loss threshold (probe 8: 'what combination breaks us')."""
+    await _require(db, user, "ERM.READ")
+    return S.ReverseStressResponse(**await svc.reverse_stress(db, threshold_inr, plant_id=plant_id))
 
 
 @router.post("/linkages", response_model=S.RiskLinkageOut, status_code=201)
@@ -1039,7 +1528,9 @@ async def create_linkage(
         raise HTTPException(409, "This linkage already exists.")
     link = RiskLinkage(
         sourceRiskId=body.sourceRiskId, targetRiskId=body.targetRiskId,
-        linkageType=body.linkageType, notes=body.notes, createdBy=user.id,
+        linkageType=body.linkageType, notes=body.notes,
+        correlationStrength=body.correlationStrength, impactFactor=body.impactFactor,
+        createdBy=user.id,
     )
     db.add(link)
     await db.commit()
@@ -1403,9 +1894,13 @@ async def render_board_pack(pack_id: str, user: User = Depends(get_current_user)
         {"riskCode": r.riskCode, "title": r.title, "residualBand": r.residualBand}
         for r in rows if r.identifiedDate and r.identifiedDate.replace(tzinfo=timezone.utc) >= q_start
     ]
+    # ₹ exposure + VaR for the board (SEBI LODR Reg 21 — quantified exposure).
+    exposure = await enterprise_exposure(None, user=user, db=db)
+    monte_carlo = S.MonteCarloResponse(**await svc.monte_carlo_portfolio(db, iterations=5000))
     return S.BoardPackRender(
         pack=S.BoardPackOut.model_validate(pack), summary=summary, topRisks=summary.topRisks,
         acceptanceLog=acceptance, escalations=escalations, newRisks=new_risks, movement=summary.movement,
+        exposure=exposure, monteCarlo=monte_carlo,
         generatedAt=now,
     )
 
@@ -1481,6 +1976,41 @@ async def export_csv(kind: str, user: User = Depends(get_current_user), db: Asyn
 # ═════════════════════════════════════════════════════════════════════
 # Detail builder
 # ═════════════════════════════════════════════════════════════════════
+async def _derived_residual_out(db: AsyncSession, r: EnterpriseRisk) -> S.DerivedResidualOut:
+    """Assemble the control-DERIVED residual evidence: effectiveness split, derived
+    score/band, ₹ reduction the control environment buys (probe 10), and the
+    asserted-vs-derived override variance (probe 1)."""
+    bands = await svc.bands_from_active_matrix(db)
+    eff = await svc.control_effectiveness(db, r.id)
+    out = S.DerivedResidualOut(
+        inherentLikelihood=r.inherentLikelihood,
+        inherentImpact=r.inherentImpact,
+        inherentScore=r.inherentScore,
+        preventiveEffectivenessPct=round(eff["preventive"] * 100.0, 1),
+        mitigatingEffectivenessPct=round(eff["mitigating"] * 100.0, 1),
+        combinedEffectivenessPct=round(eff["combined"] * 100.0, 1),
+        assertedResidualScore=r.residualScore,
+        overrideVariance=r.residualOverrideVariance,
+        mappedControlCount=eff["mappedCount"],
+        ratedControlCount=eff["ratedCount"],
+        backTestedControlCount=eff.get("backTestedCount", 0),
+        contributingControls=[S.ControlContribution(**c) for c in eff["contributing"]],
+        inherentExpectedLossInr=r.inherentExpectedLossInr,
+    )
+    if r.inherentLikelihood and r.inherentImpact:
+        d = svc.derive_residual_from_controls(r.inherentLikelihood, r.inherentImpact, eff, bands)
+        out.derivedLikelihood = d["likelihood"]
+        out.derivedImpact = d["impact"]
+        out.derivedResidualScore = d["score"]
+        out.derivedResidualBand = d["band"]
+    if r.inherentExpectedLossInr is not None:
+        # Residual EL without controls = inherent EL; with controls = attenuated.
+        derived_el = round(r.inherentExpectedLossInr * (1.0 - eff["combined"]))
+        out.derivedResidualExpectedLossInr = derived_el
+        out.controlRiskReductionInr = round(r.inherentExpectedLossInr - derived_el)
+    return out
+
+
 async def _build_detail(db: AsyncSession, risk_id: str, user: User) -> S.RiskDetail:
     # populate_existing forces a full reload so server-evaluated columns
     # (createdAt / updatedAt = func.now()) are present even when this runs right
@@ -1557,6 +2087,25 @@ async def _build_detail(db: AsyncSession, risk_id: str, user: User) -> S.RiskDet
 
     treatments = await _treatments_for_risk(db, r.id)
 
+    derived_residual = await _derived_residual_out(db, r)
+    tldof_names = await svc.user_name_map(db, [r.firstLineOwnerId or "", r.secondLineOwnerId or ""])
+
+    # I-14: appetite breaches this risk triggered (open/under-review) → detail chip
+    open_breaches: list[dict[str, Any]] = []
+    try:
+        from app.models.erm_p2 import AppetiteBreach
+        brs = (
+            await db.execute(
+                select(AppetiteBreach).where(AppetiteBreach.status.in_(("OPEN", "UNDER_REVIEW", "TREATMENT_MANDATED", "TEMPORARILY_ACCEPTED")))
+            )
+        ).scalars().all()
+        for b in brs:
+            if r.id in (b.triggeringEntityIds or []):
+                open_breaches.append({"id": b.id, "bandType": b.bandType, "status": b.status,
+                                      "observedValue": b.observedValue, "thresholdValue": b.thresholdValue})
+    except Exception:
+        pass
+
     detail = S.RiskDetail(
         **base.model_dump(),
         description=r.description,
@@ -1566,6 +2115,14 @@ async def _build_detail(db: AsyncSession, risk_id: str, user: User) -> S.RiskDet
         acceptedBy=r.acceptedBy, acceptedByName=names.get(r.acceptedBy) if r.acceptedBy else None,
         acceptedAt=r.acceptedAt, escalatedAt=r.escalatedAt, isRollup=(r.sourceType == "HSE_ROLLUP"),
         version=r.version, currentInherent=cur_inh, currentResidual=cur_res,
+        targetLikelihood=r.targetLikelihood, targetImpact=r.targetImpact,
+        targetDate=r.targetDate, targetRationale=r.targetRationale, controlAlertAt=r.controlAlertAt,
+        incidentAlertReason=r.incidentAlertReason, openAppetiteBreaches=open_breaches,
+        derivedResidual=derived_residual,
+        bowtie=(S.BowtieModel(**r.bowtie) if r.bowtie else None),
+        firstLineOwnerId=r.firstLineOwnerId, firstLineOwnerName=tldof_names.get(r.firstLineOwnerId or ""),
+        secondLineOwnerId=r.secondLineOwnerId, secondLineOwnerName=tldof_names.get(r.secondLineOwnerId or ""),
+        thirdLineAssurance=r.thirdLineAssurance,
         assessmentHistory=[a_out(a) for a in assessments], treatments=treatments,
         linkages=linkage_out, reviews=reviews_out, contributingEntries=contributing, createdAt=r.createdAt,
     )

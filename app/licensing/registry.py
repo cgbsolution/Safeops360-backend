@@ -55,6 +55,7 @@ _PRODUCT: list[ModuleDefinition] = [
     _m("PTW", "Permit to Work", "Operational Safety"),
     _m("FLRA", "Field-Level Risk Assessment", "Operational Safety"),
     _m("INCIDENT", "Incident Investigation", "Operational Safety"),
+    _m("FIRE", "Fire Safety & Emergency Response", "Operational Safety"),
     # Risk Management
     _m("HIRA", "HIRA — Hazard Risk Register", "Risk Management"),
     _m("EAI", "EAI — Environmental Aspect/Impact", "Risk Management"),

@@ -35,7 +35,7 @@ class Edition:
 # The safety / integrated-management bundle (everything an EHS site team runs).
 _IMS_MODULES = (
     "CAMS", "CAPA",
-    "OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT",
+    "OBSERVATION", "NEAR_MISS", "PTW", "FLRA", "INCIDENT", "FIRE",
     "HIRA", "EAI", "MOC", "STATUTORY_REGISTERS", "RISK_AGG",
     "PPE", "INSPECTION", "TRAINING", "COMPETENCY", "SCI",
     "MANHOURS", "ANOMALIES", "AI_ASSIST",

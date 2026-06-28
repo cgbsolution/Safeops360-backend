@@ -86,7 +86,8 @@ async def _load_user_snapshot(db: AsyncSession, user_id: str) -> _UserSnapshot:
     now = datetime.now(timezone.utc)
     user = await db.get(User, user_id)
     if user is None:
-        empty = _UserSnapshot(rows=[], role_codes=[], plant_id=None, department=None)
+        # Fail closed: a missing/deleted user has no permissions and no plants.
+        empty = _UserSnapshot(rows=[], role_codes=[], plant_id=None, plant_ids=set(), department=None)
         _CACHE[user_id] = empty
         return empty
 
