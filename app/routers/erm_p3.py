@@ -903,6 +903,17 @@ async def list_scenarios(user: User = Depends(get_current_user), db: AsyncSessio
     return [await _serialise_scenario(db, s) for s in rows]
 
 
+@router.get("/bcm/scenarios/{sid}", response_model=S.ScenarioOut)
+async def get_scenario(sid: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Single-scenario detail (the detail screen reads this). Was missing — a GET
+    to /bcm/scenarios/{sid} hit only the PATCH route → 405 Method Not Allowed."""
+    await _require(db, user, "BCM.READ")
+    s = await db.get(Scenario, sid)
+    if not s or s.isDeleted:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Scenario not found")
+    return await _serialise_scenario(db, s)
+
+
 @router.post("/bcm/scenarios", response_model=S.ScenarioOut, status_code=201)
 async def create_scenario(body: S.ScenarioUpsert, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "SCENARIO.WRITE")
