@@ -59,6 +59,7 @@ from app.routers import (
     ppe,
     ptw,
     ptw_active,
+    rca,
     risk_dashboard,
     risk_register,
     sci,
@@ -83,6 +84,7 @@ _ROUTERS = {
     "agents": agents, "agents_config": agents_config, "hira": hira, "capa": capa, "eai": eai,
     "erm": erm, "erm_p2": erm_p2, "erm_p3": erm_p3, "erm_t3": erm_t3, "competency": competency,
     "moc": moc, "risk_register": risk_register, "risk_dashboard": risk_dashboard,
+    "rca": rca,
     "scr": scr, "sci": sci, "kaizen": kaizen, "ppe": ppe,
     "epc_sites": epc_sites, "epc_contractors": epc_contractors, "epc_workers": epc_workers,
     "epc_mobilization": epc_mobilization, "epc_gate": epc_gate, "epc_induction": epc_induction,
@@ -173,11 +175,13 @@ def create_app() -> FastAPI:
     from app.models.incident import Incident
     from app.models.permit import Permit
     from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
+    from app.models.rca import RcaIdentifiedCause, RcaRiskLink, RootCauseAnalysis
     from app.services.audit_log import register_audited
 
     register_audited(
         Incident, Capa, ComplianceAudit, Permit, EnterpriseRisk, RiskAssessment, LossEvent,
         FireEquipment, FireEmergencyPlan, FireDrill,
+        RootCauseAnalysis, RcaIdentifiedCause, RcaRiskLink,
     )
 
     app = FastAPI(

@@ -94,8 +94,12 @@ def register_default_governed() -> None:
     from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
     from app.models.incident import Incident
     from app.models.permit import Permit
+    from app.models.rca import RootCauseAnalysis
 
-    register_governed(Incident, Capa, Permit, ComplianceAudit, FireEquipment, FireEmergencyPlan, FireDrill)
+    register_governed(
+        Incident, Capa, Permit, ComplianceAudit, FireEquipment, FireEmergencyPlan, FireDrill,
+        RootCauseAnalysis,
+    )
 
 
 @event.listens_for(Session, "before_flush")

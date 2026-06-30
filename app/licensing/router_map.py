@@ -43,6 +43,7 @@ ROUTER_MODULE: dict[str, str | None] = {
     "erm_p2": "ERM",
     "erm_p3": "ERM",
     "erm_t3": "ERM",
+    "rca": "ERM",  # Cross-Domain RCA & Causal Intelligence (ERM sub-module)
     # ── Audit & Compliance (CAMS) ──
     "audit_compliance": "CAMS",
     "cams": "CAMS",
