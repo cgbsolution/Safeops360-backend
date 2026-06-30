@@ -2372,9 +2372,14 @@ async def study_wizard_options(
     from app.models.masters import Department
     from app.models.plant import Area, Plant
 
-    check = await can(db, user.id, "HIRA.CREATE", PermissionContext())
-    if not check.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+    # Shared master-data endpoint: the HIRA new-study wizard AND every CAPA intake
+    # form (/capa/new/*) read it for the plant + user pickers. A CAPA creator
+    # (e.g. the CRO) often holds CAPA.CREATE but not HIRA.CREATE — gating only on
+    # HIRA.CREATE 403'd that call and crashed the CAPA pages. Accept either role.
+    hira_ok = (await can(db, user.id, "HIRA.CREATE", PermissionContext())).allowed
+    capa_ok = (await can(db, user.id, "CAPA.CREATE", PermissionContext())).allowed
+    if not (hira_ok or capa_ok):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
 
     accessible = await get_accessible_plants(db, user.id)
 
