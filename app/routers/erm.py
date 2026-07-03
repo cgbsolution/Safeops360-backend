@@ -638,6 +638,11 @@ async def create_risk(
         if body.residualAssessment:
             await _record_assessment(db, risk, body.residualAssessment, user.id)
         risk.lifecycleState = "SUBMITTED"
+    # Automated notification (§8b) — alert the risk owner on assignment (in-app + email).
+    from app.services.erm_notifications import notify_risk_owner_assigned
+    await notify_risk_owner_assigned(
+        db, risk_id=risk.id, risk_code=risk.riskCode, risk_title=risk.title, owner_user_id=risk.riskOwnerId
+    )
     await db.commit()
     return await _build_detail(db, risk.id, user)
 
@@ -880,6 +885,49 @@ async def list_assessments(risk_id: str, user: User = Depends(get_current_user),
 # ═════════════════════════════════════════════════════════════════════
 # Derived residual · Target · Enterprise exposure (ADVANCED)
 # ═════════════════════════════════════════════════════════════════════
+@router.get("/risks/{risk_id}/history")
+async def risk_history(risk_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """§9 — the full audit trail for one risk: creation/updates, assessment changes
+    and mitigation (treatment) updates, each with user name, date/time and the
+    before/after detail. Gated on ERM.READ (the platform-wide audit viewer is
+    compliance-role-gated; this is the risk-scoped, owner-visible view)."""
+    from sqlalchemy import or_
+
+    from app.models.audit_log import AuditLog
+
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if not risk or risk.isDeleted:
+        raise HTTPException(404, "Risk not found")
+    await _require(db, user, "ERM.READ", plant_id=risk.plantId, record_id=risk.id, record=_owner_record(risk))
+    assess_ids = (await db.execute(select(RiskAssessment.id).where(RiskAssessment.riskId == risk_id))).scalars().all()
+    capa_ids = (
+        await db.execute(
+            select(Capa.id).where(Capa.sourceTypeCode == "RISK_TREATMENT").where(Capa.sourceReferenceId == risk_id)
+        )
+    ).scalars().all()
+    conds = [(AuditLog.entityType == "EnterpriseRisk") & (AuditLog.entityId == risk_id)]
+    if assess_ids:
+        conds.append((AuditLog.entityType == "RiskAssessment") & (AuditLog.entityId.in_(list(assess_ids))))
+    if capa_ids:
+        conds.append((AuditLog.entityType == "Capa") & (AuditLog.entityId.in_(list(capa_ids))))
+    rows = (
+        await db.execute(select(AuditLog).where(or_(*conds)).order_by(AuditLog.timestamp.desc()).limit(500))
+    ).scalars().all()
+    names = await svc.user_name_map(db, [r.actorId for r in rows if r.actorId and not str(r.actorId).startswith("SYSTEM")])
+    label = {"EnterpriseRisk": "Risk", "RiskAssessment": "Assessment", "Capa": "Mitigation"}
+    entries = [
+        {
+            "id": r.id, "entityType": r.entityType, "entityLabel": label.get(r.entityType, r.entityType),
+            "action": r.action, "actorId": r.actorId,
+            "actorName": names.get(r.actorId or "", r.actorId), "actorType": r.actorType,
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+            "changedFields": r.changedFields, "before": r.before, "after": r.after, "reason": r.reason,
+        }
+        for r in rows
+    ]
+    return {"riskId": risk_id, "entries": entries, "total": len(entries)}
+
+
 @router.get("/risks/{risk_id}/derived-residual", response_model=S.DerivedResidualOut)
 async def get_derived_residual(
     risk_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
@@ -1162,6 +1210,7 @@ async def create_treatment(
         sourceMetadata={
             "treatmentStrategy": body.treatmentStrategy,
             "expectedResidualReduction": body.expectedResidualReduction,
+            "completionPercent": body.completionPercent or 0,
             "riskCode": risk.riskCode,
             "costInr": body.costInr,
             "transferPolicyId": body.transferPolicyId,
@@ -1192,6 +1241,9 @@ async def create_treatment(
     if risk.lifecycleState in ("ASSESSED", "MONITORING"):
         risk.lifecycleState = "TREATMENT_ACTIVE"
     risk.updatedBy = user.id
+    # Automated notification (§8b) — alert the treatment owner on assignment.
+    from app.services.erm_notifications import notify_treatment_owner_assigned
+    await notify_treatment_owner_assigned(db, capa=capa)
     await db.commit()
     await db.refresh(capa)
     return {"ok": True, "capaId": capa.id, "capaNumber": capa.capaNumber, "strategy": body.treatmentStrategy}
@@ -1240,10 +1292,81 @@ async def _treatments_for_risk(db: AsyncSession, risk_id: str) -> list[S.Treatme
                 expectedLossReductionInr=meta.get("expectedLossReductionInr"),
                 riskReductionPerRupee=meta.get("riskReductionPerRupee"),
                 transferPolicyId=meta.get("transferPolicyId"),
+                completionPercent=_safe_int(meta.get("completionPercent")) or 0,
                 isOpen=is_open, overdue=overdue,
             )
         )
     return out
+
+
+async def _auto_apply_post_mitigation_residual(
+    db: AsyncSession, risk: EnterpriseRisk, capa: Capa, meta: dict, actor_id: str
+) -> bool:
+    """§7d — when a treatment reaches 100%, AUTOMATICALLY record a fresh RESIDUAL
+    assessment that applies the treatment's expected reduction, so the residual
+    score/band (and the heat map) fall on their own post-mitigation. It's a real
+    recorded assessment, so it stays governed and audit-trailed."""
+    expected = _safe_int(meta.get("expectedResidualReduction"))
+    cur = (
+        await db.execute(
+            select(RiskAssessment)
+            .where(RiskAssessment.riskId == risk.id)
+            .where(RiskAssessment.assessmentType == "RESIDUAL")
+            .where(RiskAssessment.isCurrent.is_(True))
+        )
+    ).scalar_one_or_none()
+    if cur is None or not expected or expected <= 0 or not cur.totalScore:
+        return False
+    new_score = max(1, cur.totalScore - expected)
+    if new_score >= cur.totalScore:
+        return False
+    likelihood, impact = svc.factor_score(new_score)
+    dim = cur.dominantImpactDimension or "Financial"
+    try:
+        ac = S.AssessmentCreate(
+            assessmentType="RESIDUAL",
+            likelihood=likelihood,
+            impactScores=[S.ImpactScore(dimension=dim, level=impact)],
+            deriveFromControls=False,
+            rationale=f"Auto: post-mitigation residual recalculation — treatment {capa.capaNumber} reached 100% completion.",
+        )
+        await _record_assessment(db, risk, ac, actor_id)
+    except Exception:
+        return False
+    meta["residualAutoAppliedAt"] = _q_now().isoformat()
+    capa.sourceMetadata = dict(meta)
+    return True
+
+
+@router.patch("/treatments/{capa_id}/progress")
+async def update_treatment_progress(
+    capa_id: str, body: S.TreatmentProgress, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+):
+    """§7c — track mitigation % completion. Reaching 100% triggers §7d automatic
+    residual recalculation on the parent risk."""
+    capa = await db.get(Capa, capa_id)
+    if not capa or capa.sourceTypeCode != "RISK_TREATMENT":
+        raise HTTPException(404, "Treatment not found")
+    risk = await db.get(EnterpriseRisk, capa.sourceReferenceId) if capa.sourceReferenceId else None
+    await _require(
+        db, user, "ERM.TREAT",
+        plant_id=risk.plantId if risk else None,
+        record_id=risk.id if risk else None,
+        record=_owner_record(risk) if risk else None,
+    )
+    meta = dict(capa.sourceMetadata or {})
+    prev = _safe_int(meta.get("completionPercent")) or 0
+    meta["completionPercent"] = body.completionPercent
+    if body.note:
+        plog = list(meta.get("progressLog") or [])
+        plog.append({"at": _q_now().isoformat(), "by": user.id, "pct": body.completionPercent, "note": body.note})
+        meta["progressLog"] = plog[-20:]
+    capa.sourceMetadata = meta
+    residual_recalculated = False
+    if body.completionPercent >= 100 and prev < 100 and risk is not None and not meta.get("residualAutoAppliedAt"):
+        residual_recalculated = await _auto_apply_post_mitigation_residual(db, risk, capa, meta, user.id)
+    await db.commit()
+    return {"ok": True, "completionPercent": body.completionPercent, "residualRecalculated": residual_recalculated}
 
 
 @router.get("/treatments", response_model=S.TreatmentTrackerResponse)
@@ -1306,6 +1429,7 @@ async def treatment_tracker(
                 reductionShortfall=(achieved is not None and expected is not None and achieved < expected) or None,
                 costInr=cost, expectedLossReductionInr=el_red,
                 riskReductionPerRupee=meta.get("riskReductionPerRupee"),
+                completionPercent=_safe_int(meta.get("completionPercent")) or 0,
             )
         )
     items.sort(key=lambda x: (not x.overdue, x.state))
@@ -1756,6 +1880,67 @@ async def dashboard_summary(
     overdue = sum(1 for r in rows if svc.review_overdue_days(r.nextReviewDate) > 0)
     open_treat = sum(treat_counts.values())
     escalated_q = sum(1 for r in rows if r.escalatedAt and r.escalatedAt.replace(tzinfo=timezone.utc) >= q_start)
+    med = sum(1 for r in rows if r.residualBand == "MEDIUM")
+    low = sum(1 for r in rows if r.residualBand == "LOW")
+
+    # Mitigation progress % + overdue actions (§1d) across this scope's treatments.
+    _open_states = {"DRAFT", "SUBMITTED", "UNDER_RCA", "ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS", "PENDING_VERIFICATION"}
+    treat_rows = (
+        await db.execute(
+            select(Capa)
+            .where(Capa.sourceTypeCode == "RISK_TREATMENT")
+            .where(Capa.sourceReferenceId.in_([r.id for r in rows] or ["__none__"]))
+        )
+    ).scalars().all()
+    open_pcts: list[int] = []
+    overdue_treat = 0
+    for c in treat_rows:
+        if c.state not in _open_states:
+            continue
+        m = c.sourceMetadata or {}
+        open_pcts.append(_safe_int(m.get("completionPercent")) or 0)
+        due = c.closureTargetDate
+        if due and (due.replace(tzinfo=timezone.utc) if due.tzinfo is None else due) < now:
+            overdue_treat += 1
+    mitigation_pct = round(sum(open_pcts) / len(open_pcts), 1) if open_pcts else 0.0
+
+    # Department / Business-Unit summary (§1b)
+    dept_map: dict[str, S.DepartmentBarSegment] = {}
+    for r in rows:
+        bu = r.businessUnit or "Unassigned"
+        seg = dept_map.setdefault(bu, S.DepartmentBarSegment(businessUnit=bu))
+        b = (r.residualBand or "").upper()
+        if b == "LOW":
+            seg.low += 1
+        elif b == "MEDIUM":
+            seg.medium += 1
+        elif b == "HIGH":
+            seg.high += 1
+        elif b == "CRITICAL":
+            seg.critical += 1
+        seg.total += 1
+    dept_bars = sorted(dept_map.values(), key=lambda s: -s.total)
+
+    # Top root causes (§1c) — best-effort from approved-RCA causal analytics.
+    top_causes: list[S.RootCauseSummary] = []
+    try:
+        from app.services.access_scope import build_query_scope
+        from app.services.rca_analytics import compute_cause_analytics
+        rca_scope = await build_query_scope(db, user.id, "RCA.READ")
+        ca = await compute_cause_analytics(db, rca_scope)
+        for cz in (ca.get("causes") or [])[:5]:
+            top_causes.append(
+                S.RootCauseSummary(
+                    label=cz.get("subCauseName") or cz.get("subCauseCode") or "—",
+                    categoryCode=cz.get("categoryCode") or None,
+                    categoryName=cz.get("categoryName") or None,
+                    occurrences=cz.get("occurrences") or 0,
+                    riskReach=cz.get("riskReach") or 0,
+                    isRecurringDriver=bool(cz.get("isRecurringDriver")),
+                )
+            )
+    except Exception:
+        top_causes = []
 
     # category bars
     bar_map: dict[str, S.CategoryBarSegment] = {}
@@ -1807,10 +1992,12 @@ async def dashboard_summary(
             movement.append(S.MovementRow(id=r.id, riskCode=r.riskCode, title=r.title, fromBand=r.priorResidualBand, toBand=r.residualBand, direction=direction))
 
     return S.DashboardSummary(
-        totalActiveRisks=total_active, criticalResidual=crit, highResidual=high, overdueReviews=overdue,
-        openTreatments=open_treat, escalatedThisQuarter=escalated_q,
+        totalActiveRisks=total_active, criticalResidual=crit, highResidual=high,
+        mediumResidual=med, lowResidual=low, overdueReviews=overdue,
+        openTreatments=open_treat, overdueTreatments=overdue_treat, mitigationProgressPct=mitigation_pct,
+        escalatedThisQuarter=escalated_q,
         inherentHeatMap=_heatmap_from(rows, "INHERENT", bands), residualHeatMap=_heatmap_from(rows, "RESIDUAL", bands),
-        categoryBars=bars, topRisks=top, movement=movement,
+        categoryBars=bars, departmentBars=dept_bars, topRootCauses=top_causes, topRisks=top, movement=movement,
     )
 
 
@@ -1960,57 +2147,223 @@ async def take_snapshot(
 
 
 # ═════════════════════════════════════════════════════════════════════
-# Reports — CSV exports
+# Reports — CSV / Excel (.xlsx) / PDF exports  (Page Industries §10)
 # ═════════════════════════════════════════════════════════════════════
-@router.get("/reports/{kind}.csv")
-async def export_csv(kind: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    await _require(db, user, "ERM.EXPORT")
+_REPORT_KINDS = {
+    "register": "Risk Register",
+    "assessments": "Assessment History",
+    "treatments": "Mitigation Action Tracker",
+    "overdue": "Overdue Action Report",
+    "department": "Department-wise Risk Report",
+    "heatmap": "Risk Heat Map Report",
+    "escalations": "Escalation Log",
+    "acceptances": "Risk Acceptance Log",
+}
+
+
+async def _gather_report(kind: str, db: AsyncSession, user: User) -> tuple[str, list[str], list[list]]:
+    """Build (title, headers, rows) for an ERM report — the single source of truth
+    behind the CSV / Excel / PDF renderers."""
+    title = _REPORT_KINDS.get(kind)
+    if title is None:
+        raise HTTPException(404, f"Unknown report kind '{kind}'")
     stmt, _, _ = await _scope_query(db, user)
     rows = (await db.execute(stmt)).scalars().all()
     cats = await _category_index(db)
-    buf = io.StringIO()
-    w = csv.writer(buf)
+    out: list[list] = []
+
     if kind == "register":
-        w.writerow(["Code", "Title", "Category", "Org Level", "State", "Inherent", "Residual", "Band", "Owner", "Next Review"])
+        headers = ["Code", "Title", "Category", "Business Unit", "Org Level", "State", "Inherent", "Residual", "Band", "Owner", "Next Review"]
         names = await svc.user_name_map(db, [r.riskOwnerId for r in rows])
         for r in rows:
             c = cats.get(r.categoryId)
-            w.writerow([r.riskCode, r.title, c.name if c else "", r.orgLevel, r.lifecycleState,
+            out.append([r.riskCode, r.title, c.name if c else "", r.businessUnit or "", r.orgLevel, r.lifecycleState,
                         r.inherentScore or "", r.residualScore or "", r.residualBand or "",
                         names.get(r.riskOwnerId, ""), r.nextReviewDate.date().isoformat() if r.nextReviewDate else ""])
+
     elif kind == "assessments":
-        w.writerow(["Risk", "Type", "Likelihood", "Impact", "Score", "Band", "Date", "Current"])
+        headers = ["Risk", "Type", "Likelihood", "Impact", "Score", "Band", "Date", "Current"]
         ar = (await db.execute(select(RiskAssessment))).scalars().all()
         rmap = {r.id: r.riskCode for r in rows}
         for a in ar:
             if a.riskId not in rmap:
                 continue
-            w.writerow([rmap.get(a.riskId, ""), a.assessmentType, a.likelihood, a.overallImpact, a.totalScore, a.ratingBand, a.assessmentDate.date().isoformat(), a.isCurrent])
+            out.append([rmap.get(a.riskId, ""), a.assessmentType, a.likelihood, a.overallImpact, a.totalScore, a.ratingBand, a.assessmentDate.date().isoformat(), a.isCurrent])
+
     elif kind == "treatments":
+        headers = ["CAPA", "Strategy", "Risk", "Owner", "State", "% Complete", "Due", "Expected Reduction", "Achieved Reduction"]
         tr = (await db.execute(select(Capa).where(Capa.sourceTypeCode == "RISK_TREATMENT"))).scalars().all()
         rmap = {r.id: r for r in rows}
-        w.writerow(["CAPA", "Strategy", "Risk", "State", "Due", "Expected Reduction"])
+        names = await svc.user_name_map(db, [c.primaryOwnerUserId for c in tr if c.primaryOwnerUserId])
         for c in tr:
             meta = c.sourceMetadata or {}
             rr = rmap.get(c.sourceReferenceId)
-            w.writerow([c.capaNumber, meta.get("treatmentStrategy", ""), rr.riskCode if rr else "", c.state,
-                        c.closureTargetDate.date().isoformat() if c.closureTargetDate else "", meta.get("expectedResidualReduction", "")])
+            out.append([c.capaNumber, meta.get("treatmentStrategy", ""), rr.riskCode if rr else "",
+                        names.get(c.primaryOwnerUserId, "") if c.primaryOwnerUserId else "", c.state,
+                        meta.get("completionPercent", 0),
+                        c.closureTargetDate.date().isoformat() if c.closureTargetDate else "",
+                        meta.get("expectedResidualReduction", ""), meta.get("achievedResidualReduction", "")])
+
+    elif kind == "overdue":
+        headers = ["CAPA", "Risk", "Title", "Owner", "Strategy", "State", "Due", "Days Overdue", "% Complete"]
+        _open = {"DRAFT", "SUBMITTED", "UNDER_RCA", "ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS", "PENDING_VERIFICATION"}
+        tr = (await db.execute(select(Capa).where(Capa.sourceTypeCode == "RISK_TREATMENT").where(Capa.state.in_(_open)))).scalars().all()
+        rmap = {r.id: r for r in rows}
+        names = await svc.user_name_map(db, [c.primaryOwnerUserId for c in tr if c.primaryOwnerUserId])
+        now = _q_now()
+        for c in tr:
+            if not c.closureTargetDate:
+                continue
+            due = c.closureTargetDate.replace(tzinfo=timezone.utc) if c.closureTargetDate.tzinfo is None else c.closureTargetDate
+            if due >= now:
+                continue
+            rr = rmap.get(c.sourceReferenceId)
+            meta = c.sourceMetadata or {}
+            out.append([c.capaNumber, rr.riskCode if rr else "", c.title,
+                        names.get(c.primaryOwnerUserId, "") if c.primaryOwnerUserId else "",
+                        meta.get("treatmentStrategy", ""), c.state, due.date().isoformat(), (now - due).days,
+                        meta.get("completionPercent", 0)])
+        out.sort(key=lambda x: -(x[7] if isinstance(x[7], int) else 0))
+
+    elif kind == "department":
+        headers = ["Department / Business Unit", "Total", "Critical", "High", "Medium", "Low"]
+        agg: dict[str, dict] = {}
+        for r in rows:
+            if r.lifecycleState == "CLOSED":
+                continue
+            bu = r.businessUnit or "Unassigned"
+            a = agg.setdefault(bu, {"total": 0, "CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0})
+            a["total"] += 1
+            b = (r.residualBand or "").upper()
+            if b in a:
+                a[b] += 1
+        for bu, a in sorted(agg.items(), key=lambda kv: -kv[1]["total"]):
+            out.append([bu, a["total"], a["CRITICAL"], a["HIGH"], a["MEDIUM"], a["LOW"]])
+
+    elif kind == "heatmap":
+        headers = ["Likelihood", "Impact", "Score", "Band", "Count", "Risk Codes"]
+        bands = await svc.bands_from_active_matrix(db)
+        active = [r for r in rows if r.lifecycleState != "CLOSED"]
+        code_by_id = {r.id: r.riskCode for r in active}
+        for cell in sorted(_heatmap_from(active, "RESIDUAL", bands), key=lambda c: (-c.likelihood, -c.impact)):
+            if cell.count == 0:
+                continue
+            out.append([cell.likelihood, cell.impact, cell.score, cell.band, cell.count,
+                        ", ".join(code_by_id.get(i, "") for i in cell.riskIds)])
+
     elif kind == "escalations":
-        w.writerow(["Code", "Title", "Residual Band", "Escalated At"])
+        headers = ["Code", "Title", "Residual Band", "Escalated At"]
         for r in rows:
             if r.lifecycleState == "ESCALATED" or r.escalatedAt:
-                w.writerow([r.riskCode, r.title, r.residualBand or "", r.escalatedAt.isoformat() if r.escalatedAt else ""])
+                out.append([r.riskCode, r.title, r.residualBand or "", r.escalatedAt.isoformat() if r.escalatedAt else ""])
+
     elif kind == "acceptances":
-        w.writerow(["Code", "Title", "Justification", "Accepted By", "Accepted At"])
+        headers = ["Code", "Title", "Justification", "Accepted By", "Accepted At"]
         names = await svc.user_name_map(db, [r.acceptedBy for r in rows if r.acceptedBy])
         for r in rows:
             if r.lifecycleState == "ACCEPTED":
-                w.writerow([r.riskCode, r.title, r.acceptanceJustification or "", names.get(r.acceptedBy, "") if r.acceptedBy else "", r.acceptedAt.isoformat() if r.acceptedAt else ""])
-    else:
+                out.append([r.riskCode, r.title, r.acceptanceJustification or "", names.get(r.acceptedBy, "") if r.acceptedBy else "", r.acceptedAt.isoformat() if r.acceptedAt else ""])
+    else:  # pragma: no cover — guarded by _REPORT_KINDS above
         raise HTTPException(404, f"Unknown report kind '{kind}'")
+
+    return title, headers, out
+
+
+def _report_csv(headers: list[str], rows: list[list]) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers)
+    for row in rows:
+        w.writerow(row)
+    return buf.getvalue().encode("utf-8-sig")  # BOM so Excel opens UTF-8 cleanly
+
+
+def _report_xlsx(title: str, headers: list[str], rows: list[list]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title[:31]
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1E3A5F")
+    ws.append(headers)
+    for ci in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=ci)
+        cell.font = header_font
+        cell.fill = header_fill
+    for row in rows:
+        ws.append(["" if v is None else v for v in row])
+    for ci, h in enumerate(headers, 1):
+        width = max([len(str(h))] + [len(str(r[ci - 1])) for r in rows]) if rows else len(str(h))
+        ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = min(max(width + 2, 10), 60)
+    ws.freeze_panes = "A2"
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _lat1(v: Any) -> str:
+    """fpdf2 core fonts are latin-1 only; ₹, em-dashes etc. would crash them."""
+    return ("" if v is None else str(v)).encode("latin-1", "replace").decode("latin-1")
+
+
+def _report_pdf(title: str, headers: list[str], rows: list[list]) -> bytes:
+    from fpdf import FPDF
+
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, _lat1(f"SafeOps360 — {title}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.cell(0, 6, _lat1(f"Generated {_q_now().date().isoformat()} · {len(rows)} rows"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+    epw = pdf.w - 2 * pdf.l_margin
+    col_w = epw / max(len(headers), 1)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_fill_color(30, 58, 95)
+    pdf.set_text_color(255, 255, 255)
+    for h in headers:
+        pdf.cell(col_w, 7, _lat1(h)[:28], border=1, fill=True)
+    pdf.ln()
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 7)
+    for row in rows:
+        for v in row:
+            pdf.cell(col_w, 6, _lat1(v)[:32], border=1)
+        pdf.ln()
+    return bytes(pdf.output())
+
+
+@router.get("/reports/{kind}.csv")
+async def export_csv(kind: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await _require(db, user, "ERM.EXPORT")
+    _title, headers, rows = await _gather_report(kind, db, user)
     return Response(
-        content=buf.getvalue(), media_type="text/csv",
+        content=_report_csv(headers, rows), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=erm-{kind}.csv"},
+    )
+
+
+@router.get("/reports/{kind}.xlsx")
+async def export_xlsx(kind: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await _require(db, user, "ERM.EXPORT")
+    title, headers, rows = await _gather_report(kind, db, user)
+    return Response(
+        content=_report_xlsx(title, headers, rows),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=erm-{kind}.xlsx"},
+    )
+
+
+@router.get("/reports/{kind}.pdf")
+async def export_pdf(kind: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await _require(db, user, "ERM.EXPORT")
+    title, headers, rows = await _gather_report(kind, db, user)
+    return Response(
+        content=_report_pdf(title, headers, rows), media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=erm-{kind}.pdf"},
     )
 
 

@@ -112,6 +112,8 @@ from app.models.erm_t3 import (
     VendorProfile,
     VendorScoringConfig,
 )
+from app.models.erm_attachments import ControlAttachment, RiskAttachment
+from app.models.notification import Notification
 from app.models.factory import (
     Building,
     FactoryCertification,
@@ -363,6 +365,9 @@ __all__ = [
     "RollupLinkage",
     "RollupRule",
     "ScoringMatrixConfig",
+    "RiskAttachment",
+    "ControlAttachment",
+    "Notification",
     "FLRA",
     "FLRACrewSignature",
     "FLRAStatus",

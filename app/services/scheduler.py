@@ -104,8 +104,30 @@ async def _job_audit_integrity(db) -> dict:
     return {"chainsChecked": checked, "chainsBroken": broken}
 
 
+async def _job_treatment_reminders(db) -> dict:
+    from app.services.erm_notifications import run_treatment_pre_due_reminders
+    return await run_treatment_pre_due_reminders(db)
+
+
+async def _job_treatment_overdue(db) -> dict:
+    from app.services.erm_notifications import run_treatment_overdue_escalations
+    return await run_treatment_overdue_escalations(db)
+
+
+async def _job_treatment_reconcile(db) -> dict:
+    """Auto-reconcile closed treatments (§7d) — measure achieved-vs-expected residual
+    reduction and escalate overdue treatments up the ladder."""
+    from app.services.erm import escalate_overdue_treatments, reconcile_treatment_closures
+    a = await reconcile_treatment_closures(db)
+    b = await escalate_overdue_treatments(db)
+    return {"reconciled": a.get("reconciled", 0), "escalated": b.get("escalated", 0)}
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
+    Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
+    Job("treatment_overdue_escalations", "Risk treatment overdue escalations", 6 * HOUR, _job_treatment_overdue),
+    Job("treatment_reconcile", "Treatment residual reconcile + escalation ladder", 6 * HOUR, _job_treatment_reconcile),
     Job("loss_auto_feed", "Incident → Loss Event auto-feed", 2 * HOUR, _job_loss_auto_feed),
     Job("erm_rollup", "HIRA/EAI → CRR → ERM rollup", 4 * HOUR, _job_rollup),
     Job("appetite_eval", "Risk appetite breach evaluation", 4 * HOUR, _job_appetite_eval),

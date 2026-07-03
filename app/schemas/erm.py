@@ -393,6 +393,7 @@ class TreatmentOut(BaseModel):
     expectedLossReductionInr: float | None = None
     riskReductionPerRupee: float | None = None
     transferPolicyId: str | None = None
+    completionPercent: int | None = None
     isOpen: bool
     overdue: bool = False
 
@@ -609,6 +610,14 @@ class TreatmentCreate(BaseModel):
     costInr: float | None = Field(default=None, ge=0)  # treatment spend — risk-reduction-per-cost
     transferPolicyId: str | None = None  # TRANSFER → bind to an InsurancePolicy
     acceptanceJustification: str | None = None  # required for TOLERATE
+    completionPercent: int = Field(default=0, ge=0, le=100)  # initial mitigation progress
+
+
+class TreatmentProgress(BaseModel):
+    """Update mitigation progress (% completion). At 100% the residual is
+    auto-recalculated (post-mitigation) — see PATCH /treatments/{id}/progress."""
+    completionPercent: int = Field(ge=0, le=100)
+    note: str | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -723,6 +732,27 @@ class CategoryBarSegment(BaseModel):
     total: int = 0
 
 
+class DepartmentBarSegment(BaseModel):
+    """Department / Business-Unit risk summary (Page Industries §1b)."""
+    businessUnit: str
+    low: int = 0
+    medium: int = 0
+    high: int = 0
+    critical: int = 0
+    total: int = 0
+
+
+class RootCauseSummary(BaseModel):
+    """Top root cause contributing to risks (Page Industries §1c). Sourced from
+    approved RCA records via the causal-analytics engine."""
+    label: str
+    categoryCode: str | None = None
+    categoryName: str | None = None
+    occurrences: int = 0
+    riskReach: int = 0
+    isRecurringDriver: bool = False
+
+
 class TopRiskRow(BaseModel):
     rank: int
     id: str
@@ -753,12 +783,18 @@ class DashboardSummary(BaseModel):
     totalActiveRisks: int
     criticalResidual: int
     highResidual: int
+    mediumResidual: int = 0
+    lowResidual: int = 0
     overdueReviews: int
     openTreatments: int
+    overdueTreatments: int = 0
+    mitigationProgressPct: float = 0.0  # avg % completion across open treatments (§1d)
     escalatedThisQuarter: int
     inherentHeatMap: list[HeatMapCell] = []
     residualHeatMap: list[HeatMapCell] = []
     categoryBars: list[CategoryBarSegment] = []
+    departmentBars: list[DepartmentBarSegment] = []  # §1b department/BU summary
+    topRootCauses: list[RootCauseSummary] = []  # §1c top root causes
     topRisks: list[TopRiskRow] = []
     movement: list[MovementRow] = []
 
@@ -812,6 +848,7 @@ class TreatmentTrackerRow(BaseModel):
     costInr: float | None = None
     expectedLossReductionInr: float | None = None
     riskReductionPerRupee: float | None = None
+    completionPercent: int | None = None
 
 
 class TreatmentTrackerResponse(BaseModel):
