@@ -243,6 +243,44 @@ async def list_categories(
     return [S.RiskCategoryOut.model_validate(c) for c in cats]
 
 
+# Canonical enterprise Business Unit / Department master. Kept as a curated set
+# (union'd with any values already in the register) so the field is structured —
+# a dropdown on create and a first-class filter, not a free-text box.
+CANONICAL_BUSINESS_UNITS = [
+    "Manufacturing & Supply Chain",
+    "Corporate Strategy",
+    "Finance & Treasury",
+    "IT & Digital",
+    "Legal & Compliance",
+    "Compliance & Sustainability",
+    "Human Resources",
+    "Sales & Marketing",
+    "Research & Development",
+    "Procurement",
+]
+
+
+@router.get("/business-units", response_model=list[str])
+async def list_business_units(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Structured Business Unit / Department options — the canonical master
+    union'd with any distinct values already present on risks."""
+    await _require(db, user, "ERM.READ")
+    used = (
+        await db.execute(
+            select(EnterpriseRisk.businessUnit)
+            .where(EnterpriseRisk.businessUnit.is_not(None))
+            .where(EnterpriseRisk.isDeleted.is_(False))
+            .distinct()
+        )
+    ).scalars().all()
+    seen, out = set(), []
+    for bu in CANONICAL_BUSINESS_UNITS + [u for u in used if u]:
+        if bu and bu not in seen:
+            seen.add(bu)
+            out.append(bu)
+    return sorted(out)
+
+
 @router.post("/categories", response_model=S.RiskCategoryOut, status_code=201)
 async def create_category(
     body: S.CategoryUpsert, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
@@ -419,6 +457,8 @@ async def list_risks(
     siteId: str | None = Query(None),
     owner: str | None = Query(None),
     source: str | None = Query(None),
+    businessUnit: str | None = Query(None),
+    search: str | None = Query(None),
     overdueOnly: bool = Query(False),
     likelihood: int | None = Query(None),
     impact: int | None = Query(None),
@@ -448,6 +488,13 @@ async def list_risks(
             return False
         if source and r.sourceType != source:
             return False
+        if businessUnit and (r.businessUnit or "") != businessUnit:
+            return False
+        if search:
+            q = search.strip().lower()
+            hay = f"{r.riskCode or ''} {r.title or ''} {r.description or ''}".lower()
+            if q and q not in hay:
+                return False
         if overdueOnly and svc.review_overdue_days(r.nextReviewDate) <= 0:
             return False
         if likelihood and (r.residualLikelihood or 0) != likelihood:
@@ -832,17 +879,31 @@ async def create_assessment(
             if not (body.overrideJustification and body.overrideJustification.strip()):
                 raise HTTPException(
                     400,
-                    f"This residual is {gap} points more optimistic than your controls justify "
-                    f"(control-derived residual = {risk.derivedResidualScore}). A material override "
-                    f"requires an overrideJustification.",
+                    detail={
+                        "code": "OVERRIDE_JUSTIFICATION_REQUIRED",
+                        "message": (
+                            f"This residual is {gap} points more optimistic than your controls justify "
+                            f"(control-derived residual = {risk.derivedResidualScore}). Add a short justification "
+                            f"for the override, or map/strengthen controls so the residual is supported."
+                        ),
+                        "gap": gap,
+                        "derivedResidualScore": risk.derivedResidualScore,
+                    },
                 )
             approver = await can(db, user.id, "ERM.APPROVE", PermissionContext(plant_id=risk.plantId))
             if not approver.allowed:
                 raise HTTPException(
                     403,
-                    f"A residual {gap} points below the control-derived value "
-                    f"({risk.derivedResidualScore}) must be signed off by a risk approver "
-                    f"(ERM.APPROVE). Strengthen/evidence the controls, or have the CRO approve the override.",
+                    detail={
+                        "code": "OVERRIDE_APPROVAL_REQUIRED",
+                        "message": (
+                            f"A residual {gap} points below the control-derived value "
+                            f"({risk.derivedResidualScore}) must be signed off by a risk approver "
+                            f"(ERM.APPROVE). Strengthen/evidence the controls, or have the CRO approve the override."
+                        ),
+                        "gap": gap,
+                        "derivedResidualScore": risk.derivedResidualScore,
+                    },
                 )
             a.rationale = f"{a.rationale}\n[OVERRIDE approved by {user.id}: {body.overrideJustification.strip()}]"
     if risk.lifecycleState == "DRAFT":
@@ -1307,6 +1368,12 @@ async def _auto_apply_post_mitigation_residual(
     score/band (and the heat map) fall on their own post-mitigation. It's a real
     recorded assessment, so it stays governed and audit-trailed."""
     expected = _safe_int(meta.get("expectedResidualReduction"))
+    if not expected or expected <= 0:
+        return False
+    # Baseline = current residual if one exists; otherwise fall back to the
+    # current inherent assessment. This makes the residual drop on the NATURAL
+    # path too (create → assess inherent → mitigate → complete), where no
+    # residual has been recorded yet — previously this silently no-op'd.
     cur = (
         await db.execute(
             select(RiskAssessment)
@@ -1315,13 +1382,23 @@ async def _auto_apply_post_mitigation_residual(
             .where(RiskAssessment.isCurrent.is_(True))
         )
     ).scalar_one_or_none()
-    if cur is None or not expected or expected <= 0 or not cur.totalScore:
+    baseline = cur
+    if baseline is None:
+        baseline = (
+            await db.execute(
+                select(RiskAssessment)
+                .where(RiskAssessment.riskId == risk.id)
+                .where(RiskAssessment.assessmentType == "INHERENT")
+                .where(RiskAssessment.isCurrent.is_(True))
+            )
+        ).scalar_one_or_none()
+    if baseline is None or not baseline.totalScore:
         return False
-    new_score = max(1, cur.totalScore - expected)
-    if new_score >= cur.totalScore:
+    new_score = max(1, baseline.totalScore - expected)
+    if new_score >= baseline.totalScore:
         return False
     likelihood, impact = svc.factor_score(new_score)
-    dim = cur.dominantImpactDimension or "Financial"
+    dim = baseline.dominantImpactDimension or "Financial"
     try:
         ac = S.AssessmentCreate(
             assessmentType="RESIDUAL",
@@ -1363,10 +1440,26 @@ async def update_treatment_progress(
         meta["progressLog"] = plog[-20:]
     capa.sourceMetadata = meta
     residual_recalculated = False
+    state_advanced = False
     if body.completionPercent >= 100 and prev < 100 and risk is not None and not meta.get("residualAutoAppliedAt"):
         residual_recalculated = await _auto_apply_post_mitigation_residual(db, risk, capa, meta, user.id)
+    # Reaching 100% means the mitigation WORK is done — advance the treatment out
+    # of the planning/in-progress state into PENDING_VERIFICATION so the tracker
+    # reflects it (full closure still requires a governance verification step).
+    if body.completionPercent >= 100 and capa.state in {"ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS"}:
+        capa.state = "PENDING_VERIFICATION"
+        meta = dict(capa.sourceMetadata or {})
+        meta["completedAt"] = _q_now().isoformat()
+        capa.sourceMetadata = meta
+        state_advanced = True
     await db.commit()
-    return {"ok": True, "completionPercent": body.completionPercent, "residualRecalculated": residual_recalculated}
+    return {
+        "ok": True,
+        "completionPercent": body.completionPercent,
+        "residualRecalculated": residual_recalculated,
+        "stateAdvanced": state_advanced,
+        "state": capa.state,
+    }
 
 
 @router.get("/treatments", response_model=S.TreatmentTrackerResponse)
@@ -1991,11 +2084,32 @@ async def dashboard_summary(
             direction = "UP" if svc._BAND_RANK.get(r.residualBand, 0) > svc._BAND_RANK.get(r.priorResidualBand, 0) else "DOWN"
             movement.append(S.MovementRow(id=r.id, riskCode=r.riskCode, title=r.title, fromBand=r.priorResidualBand, toBand=r.residualBand, direction=direction))
 
+    # §7.5 Pending approvals — items awaiting a governance decision (risks
+    # submitted for validation, treatments awaiting verification).
+    pending_items: list[S.PendingApprovalItem] = []
+    for r in rows:
+        if r.lifecycleState == "SUBMITTED":
+            pending_items.append(S.PendingApprovalItem(
+                type="RISK", code=r.riskCode, title=r.title, href=f"/erm/register/{r.id}",
+                state=r.lifecycleState, ownerName=names.get(r.riskOwnerId),
+            ))
+    risk_by_id = {r.id: r for r in rows}
+    for c in treat_rows:
+        if c.state == "PENDING_VERIFICATION":
+            rk = risk_by_id.get(c.sourceReferenceId)
+            pending_items.append(S.PendingApprovalItem(
+                type="TREATMENT", code=c.capaNumber, title=c.title,
+                href=(f"/erm/register/{rk.id}" if rk else "/erm/treatments"),
+                state=c.state,
+            ))
+    pending_items = pending_items[:25]
+
     return S.DashboardSummary(
         totalActiveRisks=total_active, criticalResidual=crit, highResidual=high,
         mediumResidual=med, lowResidual=low, overdueReviews=overdue,
         openTreatments=open_treat, overdueTreatments=overdue_treat, mitigationProgressPct=mitigation_pct,
         escalatedThisQuarter=escalated_q,
+        pendingApprovals=len(pending_items), pendingApprovalItems=pending_items,
         inherentHeatMap=_heatmap_from(rows, "INHERENT", bands), residualHeatMap=_heatmap_from(rows, "RESIDUAL", bands),
         categoryBars=bars, departmentBars=dept_bars, topRootCauses=top_causes, topRisks=top, movement=movement,
     )

@@ -192,7 +192,12 @@ def create_app() -> FastAPI:
         title="SafeOps360 — Backend",
         version="1.0.0",
         description="Python backend for the SafeOps360 EHS platform.",
-        debug=not settings.is_production,
+        # Keep debug OFF in every environment. When Starlette runs with debug=True
+        # its ServerErrorMiddleware renders the raw traceback for an unhandled 500
+        # AND bypasses the custom Exception handler below — leaking a stack trace to
+        # the browser. The handler already logs the full traceback server-side and
+        # returns a clean JSON 500, so the debug page is both redundant and unsafe.
+        debug=False,
         lifespan=lifespan,
     )
 
@@ -203,6 +208,20 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Never leak a raw Python traceback to an API client (even in dev/debug).
+    # Unhandled errors are logged server-side and returned as a clean JSON 500.
+    # HTTPException keeps its own handler, so 4xx business errors are unaffected.
+    from fastapi.responses import JSONResponse
+    from starlette.requests import Request
+
+    @app.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception):  # noqa: ANN001
+        log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error. The team has been notified."},
+        )
 
     # Mount every router, attaching the module-entitlement guard to gated ones.
     # The guard is the API security boundary — a disabled module's endpoints

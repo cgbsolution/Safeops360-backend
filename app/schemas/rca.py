@@ -138,6 +138,12 @@ class RiskLinkIn(BaseModel):
 # ─────────────────────────────────────────────────────────────────────
 # RootCauseAnalysis
 # ─────────────────────────────────────────────────────────────────────
+class LinkedRiskRef(BaseModel):
+    riskId: str
+    riskCode: str | None = None
+    riskTitle: str | None = None
+
+
 class RcaListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -153,6 +159,13 @@ class RcaListItem(BaseModel):
     createdAt: datetime
     causeCount: int = 0
     linkedRiskCount: int = 0
+    # Traceability — the originating record + every risk this RCA touches.
+    sourceEventId: str | None = None
+    sourceRiskId: str | None = None
+    sourceLossEventId: str | None = None
+    sourceCode: str | None = None
+    sourceHref: str | None = None
+    linkedRisks: list[LinkedRiskRef] = []
 
 
 class RcaListResponse(BaseModel):
@@ -274,6 +287,38 @@ class CauseAnalyticsResponse(BaseModel):
     causes: list[CauseAnalytic] = []
     categories: list[CategoryRollup] = []
     recurringDriverThreshold: int = 2
+    note: str = "Computed from approved RCA records."
+
+
+class CauseDetailRisk(BaseModel):
+    riskId: str
+    riskCode: str | None = None
+    riskTitle: str | None = None
+    residualBand: str | None = None
+    residualScore: int | None = None
+
+
+class CauseDetailRca(BaseModel):
+    rcaId: str
+    rcaCode: str
+    title: str
+    originType: str | None = None
+    primaryDomain: str | None = None
+
+
+class CauseDetailResponse(BaseModel):
+    computedAt: datetime
+    subCauseId: str
+    subCauseCode: str
+    subCauseName: str
+    categoryCode: str = ""
+    categoryName: str = ""
+    occurrences: int = 0
+    riskReach: int = 0
+    domainSpread: int = 0
+    domains: list[str] = []
+    risks: list[CauseDetailRisk] = []
+    rcas: list[CauseDetailRca] = []
     note: str = "Computed from approved RCA records."
 
 

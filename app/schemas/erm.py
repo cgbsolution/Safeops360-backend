@@ -779,6 +779,15 @@ class MovementRow(BaseModel):
     direction: str  # UP | DOWN
 
 
+class PendingApprovalItem(BaseModel):
+    type: str  # RISK | TREATMENT
+    code: str | None = None
+    title: str | None = None
+    href: str
+    state: str | None = None
+    ownerName: str | None = None
+
+
 class DashboardSummary(BaseModel):
     totalActiveRisks: int
     criticalResidual: int
@@ -790,6 +799,8 @@ class DashboardSummary(BaseModel):
     overdueTreatments: int = 0
     mitigationProgressPct: float = 0.0  # avg % completion across open treatments (§1d)
     escalatedThisQuarter: int
+    pendingApprovals: int = 0  # §7.5 items awaiting a governance decision
+    pendingApprovalItems: list[PendingApprovalItem] = []
     inherentHeatMap: list[HeatMapCell] = []
     residualHeatMap: list[HeatMapCell] = []
     categoryBars: list[CategoryBarSegment] = []

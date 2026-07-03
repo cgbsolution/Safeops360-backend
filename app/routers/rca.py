@@ -292,15 +292,60 @@ async def list_rcas(
     if enterpriseCategoryId:
         rows = [r for r in rows if any(c.enterpriseCategoryId == enterpriseCategoryId for c in r.identifiedCauses)]
 
-    items = [
-        S.RcaListItem(
+    # Batch-resolve traceability: every risk this RCA touches (source + links)
+    # and the originating record's code, so the register can show a Source
+    # column and a linked-risks popover that click through to the risk.
+    risk_ids: set[str] = set()
+    loss_ids: set[str] = set()
+    for r in rows:
+        if r.sourceRiskId:
+            risk_ids.add(r.sourceRiskId)
+        if r.sourceLossEventId:
+            loss_ids.add(r.sourceLossEventId)
+        for lk in r.riskLinks:
+            if lk.riskId:
+                risk_ids.add(lk.riskId)
+    risk_map: dict[str, EnterpriseRisk] = {}
+    if risk_ids:
+        risk_map = {
+            x.id: x for x in (await db.execute(select(EnterpriseRisk).where(EnterpriseRisk.id.in_(risk_ids)))).scalars().all()
+        }
+    loss_map: dict[str, LossEvent] = {}
+    if loss_ids:
+        loss_map = {
+            x.id: x for x in (await db.execute(select(LossEvent).where(LossEvent.id.in_(loss_ids)))).scalars().all()
+        }
+
+    def _source(r: RootCauseAnalysis) -> tuple[str | None, str | None]:
+        if r.originType == "RISK" and r.sourceRiskId:
+            rk = risk_map.get(r.sourceRiskId)
+            return (rk.riskCode if rk else None), (f"/erm/register/{r.sourceRiskId}" if rk else None)
+        if r.originType == "LOSS_EVENT" and r.sourceLossEventId:
+            le = loss_map.get(r.sourceLossEventId)
+            return (le.eventCode if le else None), (f"/erm/loss?focus={r.sourceLossEventId}" if le else None)
+        if r.originType == "EVENT" and r.sourceEventId:
+            return "Incident", f"/incidents/{r.sourceEventId}"
+        return None, None
+
+    items = []
+    for r in rows:
+        src_code, src_href = _source(r)
+        linked = []
+        seen_ids: set[str] = set()
+        for lk in r.riskLinks:
+            if lk.riskId and lk.riskId not in seen_ids:
+                seen_ids.add(lk.riskId)
+                rk = risk_map.get(lk.riskId)
+                linked.append(S.LinkedRiskRef(riskId=lk.riskId, riskCode=rk.riskCode if rk else None,
+                                              riskTitle=rk.title if rk else None))
+        items.append(S.RcaListItem(
             id=r.id, rcaCode=r.rcaCode, title=r.title, originType=r.originType, primaryDomain=r.primaryDomain,
             methodology=r.methodology, status=r.status, analystId=r.analystId, plantId=r.plantId,
             occurrenceDate=r.occurrenceDate, createdAt=r.createdAt,
             causeCount=len(r.identifiedCauses), linkedRiskCount=len(r.riskLinks),
-        )
-        for r in rows
-    ]
+            sourceEventId=r.sourceEventId, sourceRiskId=r.sourceRiskId, sourceLossEventId=r.sourceLossEventId,
+            sourceCode=src_code, sourceHref=src_href, linkedRisks=linked,
+        ))
     return S.RcaListResponse(items=items, total=len(items))
 
 
@@ -513,6 +558,18 @@ async def cause_analytics(domain: str | None = None, user: User = Depends(get_cu
                 domain = next(iter(allowed))
     result = await rca_analytics.compute_cause_analytics(db, scope, domain_filter=domain)
     return result
+
+
+@router.get("/analytics/cause/{sub_cause_id}", response_model=S.CauseDetailResponse)
+async def cause_detail(sub_cause_id: str, domain: str | None = None,
+                       user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Drill-through: the risks + RCAs behind one root-cause row (analytics drawer)."""
+    await _require(db, user, "RCA.READ")
+    scope = await build_query_scope(db, user.id, "RCA.READ")
+    allowed = await _effective_domains(db, user)
+    if allowed is not None and domain and domain not in allowed:
+        raise HTTPException(403, "Domain outside your analytics scope")
+    return await rca_analytics.compute_cause_detail(db, scope, sub_cause_id, domain_filter=domain)
 
 
 @router.get("/analytics/recurring-drivers", response_model=list[S.CauseAnalytic])

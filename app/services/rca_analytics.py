@@ -99,6 +99,11 @@ def aggregate_cause_metrics(rcas: list, cats: dict, subs: dict, *, threshold: in
 
     for rca in rcas:
         risk_ids = [link.riskId for link in rca.riskLinks]
+        # A RISK-originated RCA reaches its own source risk even without an
+        # explicit RcaRiskLink — count it so reach reconciles with the drill.
+        _src = getattr(rca, "sourceRiskId", None)
+        if _src:
+            risk_ids.append(_src)
         for c in rca.identifiedCauses:
             sa = sub_agg[c.subCauseId]
             sa["count"] += 1
@@ -181,6 +186,62 @@ async def compute_cause_analytics(
         "causes": causes,
         "categories": categories,
         "recurringDriverThreshold": threshold,
+        "note": "Computed from approved RCA records.",
+    }
+
+
+async def compute_cause_detail(
+    db: AsyncSession, scope: QueryScope, sub_cause_id: str, *, domain_filter: str | None = None
+) -> dict:
+    """Drill-through for one sub-cause: the underlying risks it reaches and the
+    RCAs that cite it. Powers the Root-Cause Analytics 'click a cause row' drawer.
+    Reconciles with the Pareto risk-reach (distinct risks)."""
+    rcas = await _load_approved_rcas(db, scope, domain_filter=domain_filter)
+    cats, subs = await _taxonomy_index(db)
+    sub = subs.get(sub_cause_id)
+    cat = cats.get(sub.categoryId) if sub and getattr(sub, "categoryId", None) else None
+
+    citing = [r for r in rcas if any(c.subCauseId == sub_cause_id for c in r.identifiedCauses)]
+    risk_ids: set[str] = set()
+    rca_rows = []
+    domains: set[str] = set()
+    for r in citing:
+        domains.add(r.primaryDomain)
+        for lk in r.riskLinks:
+            if lk.riskId:
+                risk_ids.add(lk.riskId)
+        if getattr(r, "sourceRiskId", None):
+            risk_ids.add(r.sourceRiskId)
+        rca_rows.append({"rcaId": r.id, "rcaCode": r.rcaCode, "title": r.title,
+                         "originType": r.originType, "primaryDomain": r.primaryDomain})
+
+    risk_map: dict[str, EnterpriseRisk] = {}
+    if risk_ids:
+        risk_map = {
+            x.id: x for x in (await db.execute(select(EnterpriseRisk).where(EnterpriseRisk.id.in_(risk_ids)))).scalars().all()
+        }
+    risks = [
+        {"riskId": rid, "riskCode": (risk_map[rid].riskCode if rid in risk_map else None),
+         "riskTitle": (risk_map[rid].title if rid in risk_map else None),
+         "residualBand": (risk_map[rid].residualBand if rid in risk_map else None),
+         "residualScore": (risk_map[rid].residualScore if rid in risk_map else None)}
+        for rid in risk_ids
+    ]
+    risks.sort(key=lambda x: (x["residualScore"] or 0), reverse=True)
+    occurrences = sum(1 for r in citing for c in r.identifiedCauses if c.subCauseId == sub_cause_id)
+    return {
+        "computedAt": _now(),
+        "subCauseId": sub_cause_id,
+        "subCauseCode": sub.code if sub else sub_cause_id,
+        "subCauseName": sub.name if sub else sub_cause_id,
+        "categoryCode": cat.code if cat else "",
+        "categoryName": cat.name if cat else "",
+        "occurrences": occurrences,
+        "riskReach": len(risk_ids),
+        "domainSpread": len(domains),
+        "domains": sorted(domains),
+        "risks": risks,
+        "rcas": rca_rows,
         "note": "Computed from approved RCA records.",
     }
 

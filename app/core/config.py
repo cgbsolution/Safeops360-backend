@@ -1,7 +1,16 @@
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load `.env` into the process environment as early as possible (import-time).
+# pydantic-settings reads `.env` into the Settings object, but several
+# best-effort integrations (SMTP email, SMS providers) read raw `os.getenv`.
+# Without this, those credentials never reach `os.getenv` and delivery is
+# silently skipped even when `.env` is fully configured. `override=False`
+# keeps real OS env vars (prod/containers) authoritative over `.env`.
+load_dotenv(override=False)
 
 
 class Settings(BaseSettings):
@@ -42,6 +51,15 @@ class Settings(BaseSettings):
     # P2-1 background scheduler. Default off (opt-in) so a shared dev DB isn't
     # mutated by interval jobs; on-prem deployments set SCHEDULER_ENABLED=true.
     scheduler_enabled: bool = False
+
+    # ── Email (SMTP) ────────────────────────────────────────────────────────
+    # Typed access to the same values `.env` exposes. The best-effort email
+    # sender prefers these (falls back to os.getenv for backwards-compat).
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_pass: str | None = None
+    email_from: str | None = None
 
     # AI agents (Anthropic Claude). Optional — when unset, the
     # workflow-rule agents (Pattern A: triage / lessons) log a warning
