@@ -988,7 +988,7 @@ async def risk_tier3_context(rid: str, user: User = Depends(get_current_user), d
                 has_primary = True
                 if c.currentOperatingRating == "DEFICIENT":
                     primary_deficient = True
-            controls_out.append({"controlCode": c.controlCode, "name": c.name, "mitigationStrength": m.mitigationStrength, "operatingRating": c.currentOperatingRating})
+            controls_out.append({"controlId": c.id, "controlCode": c.controlCode, "name": c.name, "mitigationStrength": m.mitigationStrength, "operatingRating": c.currentOperatingRating})
     policies_out, verdict = [], "NOT_ASSESSED"
     if (await can(db, user.id, "INSURANCE.READ", PermissionContext())).allowed:
         pols = (await db.execute(select(InsurancePolicy).where(InsurancePolicy.isDeleted.is_(False)))).scalars().all()

@@ -1266,7 +1266,7 @@ async def create_treatment(
         sourceTypeId=st.id,
         sourceTypeCode="RISK_TREATMENT",
         sourceReferenceId=risk.id,
-        sourceReferenceUrl=f"/erm/risks/{risk.id}",
+        sourceReferenceUrl=f"/erm/register/{risk.id}",  # real risk-detail route (was /erm/risks → 404)
         sourceReferenceSummary=f"{risk.riskCode} — {risk.title}",
         sourceMetadata={
             "treatmentStrategy": body.treatmentStrategy,
