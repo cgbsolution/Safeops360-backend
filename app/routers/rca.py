@@ -439,6 +439,47 @@ async def approve_rca(rca_id: str, body: S.ApproveIn, user: User = Depends(get_c
     rca.approverId = user.id
     rca.approvedAt = _now()
     rca.updatedBy = user.id
+    # Daily Brief outbox: rca.completed → "n corrective actions now active"
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.RCA_COMPLETED,
+        entity_type="RootCauseAnalysis",
+        entity_id=rca.id,
+        entity_ref=rca.rcaCode,
+        site_id=rca.plantId,
+        actor_id=user.id,
+        payload={"from": "PEER_REVIEW", "to": "APPROVED", "title": rca.title},
+    )
+    await db.flush()
+    return await _detail(db, await _load_full(db, rca.id))
+
+
+@router.post("/{rca_id}/reopen", response_model=S.RcaDetail)
+async def reopen_rca(rca_id: str, reason: str = Query(..., min_length=5),
+                     user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Reopen an APPROVED analysis (new evidence / recurrence). New endpoint —
+    no reopen path existed (DECISIONS.md D8); fires the CRITICAL rca.reopened
+    impact rule since live permits may rest on its validated controls."""
+    await _require(db, user, "RCA.APPROVE")
+    rca = await _load_full(db, rca_id)
+    if rca.status != "APPROVED":
+        raise HTTPException(400, f"Only an APPROVED RCA can be reopened (status is {rca.status})")
+    rca.status = "IN_ANALYSIS"
+    rca.approverId = None
+    rca.approvedAt = None
+    rca.updatedBy = user.id
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.RCA_REOPENED,
+        entity_type="RootCauseAnalysis",
+        entity_id=rca.id,
+        entity_ref=rca.rcaCode,
+        site_id=rca.plantId,
+        actor_id=user.id,
+        payload={"from": "APPROVED", "to": "IN_ANALYSIS", "reason": reason, "title": rca.title},
+    )
     await db.flush()
     return await _detail(db, await _load_full(db, rca.id))
 

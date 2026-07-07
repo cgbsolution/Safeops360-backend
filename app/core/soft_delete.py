@@ -89,8 +89,10 @@ def register_default_governed() -> None:
     endpoints have been converted to soft_delete() are registered here — adding a
     model never breaks a live flow.
     """
+    from app.models.alerts import Alert
     from app.models.audit_compliance import ComplianceAudit
     from app.models.capa import Capa
+    from app.models.capture import CaptureSubmission, RcaFieldRequest
     from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
     from app.models.incident import Incident
     from app.models.permit import Permit
@@ -99,6 +101,7 @@ def register_default_governed() -> None:
     register_governed(
         Incident, Capa, Permit, ComplianceAudit, FireEquipment, FireEmergencyPlan, FireDrill,
         RootCauseAnalysis,
+        CaptureSubmission, RcaFieldRequest, Alert,
     )
 
 

@@ -20,12 +20,14 @@ from app.licensing.state import refresh_state
 from app.routers import (
     agents,
     agents_config,
+    alerts,
     anomalies,
     audit_compliance,
     audit_log,
     auth,
     cams,
     capa,
+    capture,
     competency,
     dashboard,
     devices,
@@ -62,8 +64,10 @@ from app.routers import (
     ptw,
     ptw_active,
     rca,
+    rca_field,
     risk_dashboard,
     risk_register,
+    safety_culture,
     sci,
     scr,
     training,
@@ -86,8 +90,8 @@ _ROUTERS = {
     "agents": agents, "agents_config": agents_config, "hira": hira, "capa": capa, "eai": eai,
     "erm": erm, "erm_attachments": erm_attachments, "erm_p2": erm_p2, "erm_p3": erm_p3, "erm_t3": erm_t3, "competency": competency,
     "moc": moc, "risk_register": risk_register, "risk_dashboard": risk_dashboard,
-    "rca": rca, "notifications": notifications,
-    "scr": scr, "sci": sci, "kaizen": kaizen, "ppe": ppe,
+    "rca": rca, "rca_field": rca_field, "notifications": notifications,
+    "scr": scr, "sci": sci, "kaizen": kaizen, "safety_culture": safety_culture, "ppe": ppe,
     "epc_sites": epc_sites, "epc_contractors": epc_contractors, "epc_workers": epc_workers,
     "epc_mobilization": epc_mobilization, "epc_gate": epc_gate, "epc_induction": epc_induction,
     "epc_dashboard": epc_dashboard, "audit_compliance": audit_compliance, "cams": cams,
@@ -98,6 +102,13 @@ _ROUTERS = {
     # module IS registered in the licensing model (registry/editions) — add
     # "fire_safety": "FIRE" to ROUTER_MODULE once a FIRE-inclusive licence is issued.
     "fire_safety": fire_safety,
+    # Guided Field Capture (CAPTURE module) — same dev-licence situation as
+    # fire_safety: registered in the licensing model, mounted ungated until a
+    # CAPTURE-inclusive licence is issued ("capture": "CAPTURE" in ROUTER_MODULE).
+    "capture": capture,
+    # Daily Alert Brief (ALERTS module) — same dev-licence situation; add
+    # "alerts": "ALERTS" to ROUTER_MODULE once a licence including it is issued.
+    "alerts": alerts,
 }
 
 
@@ -170,8 +181,10 @@ def create_app() -> FastAPI:
 
     # Arm the unified audit trail (P1-1): import registers the ORM capture
     # listeners; register the audited entities.
+    from app.models.alerts import Alert
     from app.models.audit_compliance import ComplianceAudit
     from app.models.capa import Capa
+    from app.models.capture import CaptureSubmission, RcaFieldRequest
     from app.models.erm import EnterpriseRisk, RiskAssessment
     from app.models.erm_p2 import LossEvent
     from app.models.erm_t3 import Control
@@ -179,6 +192,12 @@ def create_app() -> FastAPI:
     from app.models.permit import Permit
     from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
     from app.models.rca import RcaIdentifiedCause, RcaRiskLink, RootCauseAnalysis
+    from app.models.safety_culture import (
+        CultureMaturityProfile,
+        LeadershipWalk,
+        PerceptionSurveyTemplate,
+        RecognitionEntry,
+    )
     from app.services.audit_log import register_audited
 
     register_audited(
@@ -186,6 +205,10 @@ def create_app() -> FastAPI:
         Control,
         FireEquipment, FireEmergencyPlan, FireDrill,
         RootCauseAnalysis, RcaIdentifiedCause, RcaRiskLink,
+        CaptureSubmission, RcaFieldRequest, Alert,
+        # Safety Culture — score recalcs, walk logging, survey admin & recognition
+        # awards write to the tamper-evident hash-chain (§Cross-cutting).
+        CultureMaturityProfile, LeadershipWalk, PerceptionSurveyTemplate, RecognitionEntry,
     )
 
     app = FastAPI(

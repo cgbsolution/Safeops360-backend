@@ -519,6 +519,18 @@ async def suspend_permit(
     permit.status = PermitStatus.SUSPENDED
     permit.suspendedAt = datetime.now(timezone.utc)
     permit.suspendedReason = payload.reason
+    # Daily Brief outbox: ptw.suspended → overlapping-permit impact (CRITICAL)
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.PTW_SUSPENDED,
+        entity_type="Permit",
+        entity_id=permit.id,
+        entity_ref=permit.number,
+        site_id=permit.plantId,
+        actor_id=user.id,
+        payload={"from": "ACTIVE", "to": "SUSPENDED", "reason": payload.reason},
+    )
     instance = (
         await db.execute(
             select(WorkflowInstance).where(WorkflowInstance.module == "PTW", WorkflowInstance.recordId == permit_id)
@@ -565,6 +577,17 @@ async def resume_permit(
     permit.status = PermitStatus.ACTIVE
     permit.suspendedAt = None
     permit.suspendedReason = None
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.PTW_RESUMED,
+        entity_type="Permit",
+        entity_id=permit.id,
+        entity_ref=permit.number,
+        site_id=permit.plantId,
+        actor_id=user.id,
+        payload={"from": "SUSPENDED", "to": "ACTIVE"},
+    )
 
     instance = (
         await db.execute(

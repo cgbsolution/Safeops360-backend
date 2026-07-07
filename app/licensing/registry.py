@@ -83,9 +83,13 @@ _PRODUCT: list[ModuleDefinition] = [
     _m("TRAINING", "Training", "People & Competency"),
     _m("COMPETENCY", "Skill Matrix & Competency", "People & Competency"),
     _m("SCI", "Safety Culture Index & Kaizen", "People & Competency"),
+    _m("SAFETY_CULTURE", "Safety Culture Management", "People & Competency"),
     # Assets & Inspection
     _m("PPE", "PPE Management", "Assets & Inspection"),
     _m("INSPECTION", "Inspection Schedule & Findings", "Assets & Inspection"),
+    # Field Operations
+    _m("CAPTURE", "Guided Field Capture", "Operational Safety"),
+    _m("ALERTS", "Daily Alert Brief", "Performance"),
     # Performance
     _m("MANHOURS", "Manhours & KPIs", "Performance"),
     _m("ANOMALIES", "Anomaly Detection", "Performance"),

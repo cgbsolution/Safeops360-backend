@@ -123,6 +123,49 @@ async def _job_treatment_reconcile(db) -> dict:
     return {"reconciled": a.get("reconciled", 0), "escalated": b.get("escalated", 0)}
 
 
+async def _job_capture_voice(db) -> dict:
+    """Guided Field Capture — voice transcription (provider abstraction, stub
+    default) + English translation of any transcript. Never blocks submission."""
+    from app.services.capture_voice import run_capture_voice
+    return await run_capture_voice(db)
+
+
+async def _job_alerts_resolver(db) -> dict:
+    """Daily Alert Brief — consume unprocessed DomainEvents through the impact
+    rule registry and materialise Alert cards (never computed at read time)."""
+    from app.services.alerts import resolve_pending_events
+    return await resolve_pending_events(db)
+
+
+async def _job_ptw_expiry_scan(db) -> dict:
+    """T-24h ptw.expiring events + server-side expiry flip (the lazy /inbox
+    sweep is no longer the only thing that expires permits)."""
+    from app.services.alerts.scans import run_ptw_expiry_scan
+    return await run_ptw_expiry_scan(db)
+
+
+async def _job_capa_overdue_scan(db) -> dict:
+    """Daily capa.overdue events off the query-time overdue predicate, with
+    source-severity enrichment for the alert rule."""
+    from app.services.alerts.scans import run_capa_overdue_scan
+    return await run_capa_overdue_scan(db)
+
+
+async def _job_alert_digest(db) -> dict:
+    """06:00 site-local Daily Brief email digest. Runs every 15 min and fires a
+    subscription only inside its local 06:00-06:29 window (deduped per day)."""
+    from app.services.alerts.digest import run_alert_digest
+    return await run_alert_digest(db)
+
+
+async def _job_culture_recalc(db) -> dict:
+    """Recompute every site's Safety Culture maturity score (five components) +
+    award quality-weighted recognition. The culture KRIs then feed off the
+    refreshed profiles via the hourly kri_module_feeds job."""
+    from app.services.safety_culture import recalculate_all
+    return await recalculate_all(db)
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
@@ -136,6 +179,12 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("fire_equipment_status", "Fire equipment status recompute", 1 * DAY, _job_fire_status),
     Job("compliance_tasks", "Compliance status + task generation", 1 * DAY, _job_compliance),
     Job("audit_trail_integrity", "Audit-trail hash-chain integrity check", 7 * DAY, _job_audit_integrity),
+    Job("capture_voice_pipeline", "Field-capture voice transcription + translation", HOUR // 4, _job_capture_voice),
+    Job("alerts_impact_resolver", "Daily Brief — impact-rule event resolver", 60, _job_alerts_resolver),
+    Job("ptw_expiry_scan", "PTW T-24h expiring events + expiry flip", 1 * HOUR, _job_ptw_expiry_scan),
+    Job("capa_overdue_scan", "CAPA overdue events (daily scan)", 1 * DAY, _job_capa_overdue_scan),
+    Job("alert_digest", "Daily Brief 06:00 site-local email digest", 15 * 60, _job_alert_digest),
+    Job("culture_recalc", "Safety Culture maturity recompute + recognition", 1 * DAY, _job_culture_recalc),
 ]}
 
 

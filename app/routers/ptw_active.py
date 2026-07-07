@@ -263,6 +263,18 @@ async def suspend_active(
     permit.suspendedAt = now
     permit.suspendedReason = payload.reasonDetail or payload.reason
     permit.isCurrentlySuspended = True
+    # Daily Brief outbox: ptw.suspended → overlapping-permit impact (CRITICAL)
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.PTW_SUSPENDED,
+        entity_type="Permit",
+        entity_id=permit.id,
+        entity_ref=permit.number,
+        site_id=permit.plantId,
+        actor_id=user.id,
+        payload={"from": "ACTIVE", "to": "SUSPENDED", "reason": payload.reasonDetail or payload.reason},
+    )
     await db.flush()
     return {"ok": True, "suspensionId": susp.id, "reFlraRequired": payload.reFlraRequired}
 
@@ -321,6 +333,17 @@ async def resume_active(
     permit.suspendedAt = None
     permit.suspendedReason = None
     permit.isCurrentlySuspended = False
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.PTW_RESUMED,
+        entity_type="Permit",
+        entity_id=permit.id,
+        entity_ref=permit.number,
+        site_id=permit.plantId,
+        actor_id=user.id,
+        payload={"from": "SUSPENDED", "to": "ACTIVE", "reFlraEnforced": re_flra_required},
+    )
     await db.flush()
     return {"ok": True, "reFlraEnforced": re_flra_required}
 
@@ -399,6 +422,18 @@ async def decide_extension(
 
     if payload.decision == "APPROVED":
         permit.validTo = ext.newValidTo
+        # Daily Brief outbox: an approved extension is a permit modification
+        from app.services import events as domain_events
+        domain_events.emit(
+            db,
+            event_type=domain_events.PTW_MODIFIED,
+            entity_type="Permit",
+            entity_id=permit.id,
+            entity_ref=permit.number,
+            site_id=permit.plantId,
+            actor_id=user.id,
+            payload={"fields": ["validTo"], "reason": f"validity extended to {ext.newValidTo.isoformat()}"},
+        )
     await db.flush()
     return {"ok": True, "status": ext.status}
 

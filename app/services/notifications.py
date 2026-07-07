@@ -32,7 +32,7 @@ def _env(*names: str) -> str | None:
 # ─── Email (SMTP / nodemailer-compatible) ────────────────────────────
 
 
-def _send_email_sync(to_addrs: list[str], subject: str, body: str) -> bool:
+def _send_email_sync(to_addrs: list[str], subject: str, body: str, html: str | None = None) -> bool:
     # Prefer typed settings (loaded from `.env`), fall back to raw env vars so
     # container deployments that only export OS env vars keep working.
     try:
@@ -52,7 +52,15 @@ def _send_email_sync(to_addrs: list[str], subject: str, body: str) -> bool:
         )
         return False
     port = int((getattr(_s, "smtp_port", None) if _s else None) or _env("SMTP_PORT") or 587)
-    msg = MIMEText(body, "plain", "utf-8")
+    if html:
+        # multipart/alternative: plain-text fallback + HTML (Daily Brief digest)
+        from email.mime.multipart import MIMEMultipart
+
+        msg: MIMEText | MIMEMultipart = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = sender if "<" in sender else f"SafeOps360 <{sender}>"
     msg["To"] = ", ".join(to_addrs)
@@ -72,12 +80,12 @@ def _send_email_sync(to_addrs: list[str], subject: str, body: str) -> bool:
         return False
 
 
-async def send_email(to_addrs: Iterable[str], subject: str, body: str) -> bool:
+async def send_email(to_addrs: Iterable[str], subject: str, body: str, html: str | None = None) -> bool:
     addrs = [a for a in to_addrs if a]
     if not addrs:
         return False
     # smtplib is sync — run in default thread pool to keep the event loop free.
-    return await asyncio.to_thread(_send_email_sync, addrs, subject, body)
+    return await asyncio.to_thread(_send_email_sync, addrs, subject, body, html)
 
 
 # ─── SMS (MSG91 first; Twilio fallback) ──────────────────────────────

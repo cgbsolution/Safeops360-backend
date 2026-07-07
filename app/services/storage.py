@@ -106,3 +106,29 @@ def delete_storage_object(storage_path: str) -> None:
     res = client.storage.from_(settings.supabase_incident_bucket).remove([storage_path])
     if isinstance(res, dict) and res.get("error"):
         raise RuntimeError(f"deleteStorageObject failed: {res['error']}")
+
+
+def download_object(storage_path: str) -> bytes:
+    """Server-side read (transcription pipeline needs the raw audio bytes)."""
+    client = _get_client()
+    try:
+        return client.storage.from_(settings.supabase_incident_bucket).download(storage_path)
+    except Exception as e:
+        raise RuntimeError(f"Supabase download failed for path '{storage_path}': {e}") from e
+
+
+def upload_object(storage_path: str, data: bytes, content_type: str) -> None:
+    """Server-side upload (chunked-upload assembly path — Guided Field Capture).
+    The browser normally PUTs to a signed URL; here the backend has already
+    assembled the bytes, so it pushes directly with the service-role client.
+    file_options values must be strings (supabase-py quirk)."""
+    client = _get_client()
+    try:
+        client.storage.from_(settings.supabase_incident_bucket).upload(
+            storage_path, data, {"content-type": content_type, "upsert": "true"}
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Supabase upload failed for bucket '{settings.supabase_incident_bucket}', "
+            f"path '{storage_path}': {e}"
+        ) from e
