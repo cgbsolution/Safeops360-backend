@@ -21,6 +21,16 @@ class LeadershipWalkCreate(_Base):
     notes: str | None = None
 
 
+class WalkChecklist(_Base):
+    """§Fix 3 structured walk checklist — replaces free-text-only capture."""
+
+    hazardCategories: list[str] = Field(default_factory=list)
+    # [{ count, topic }] — worker interactions logged during the walk
+    workerInteractions: list[dict] = Field(default_factory=list)
+    ppeCompliance: int | None = None  # PPE spot-check %, 0-100
+    housekeepingRating: int | None = None  # 1-5
+
+
 class LeadershipWalkComplete(_Base):
     completedDate: datetime | None = None
     areaVisited: str | None = None
@@ -28,7 +38,18 @@ class LeadershipWalkComplete(_Base):
     observationsRaised: int = 0
     hazardsIdentified: int = 0
     notes: str | None = None
+    checklist: WalkChecklist | None = None
     followUpActionIds: list[str] = Field(default_factory=list)
+
+
+class WalkRaiseObservation(_Base):
+    """§Fix 3 — raise a hazard/observation from a leadership walk into the same BBS
+    closure loop (Logged → Linked → Verified). Optionally spawn a CAPA immediately."""
+
+    description: str
+    category: str = "OTHERS"  # must match the live DB ObservationCategory enum
+    severity: str = "MEDIUM"
+    spawnCapa: bool = True
 
 
 # ── §2 BBS closure loop ──────────────────────────────────────────────────────
@@ -42,6 +63,13 @@ class ObservationLinkAction(_Base):
 class ObservationVerifyClosure(_Base):
     reobservationDate: datetime | None = None
     verified: bool = True
+
+
+# ── §Fix 1 integrity review ──────────────────────────────────────────────────
+class IntegrityReview(_Base):
+    period: str  # YYYY-MM the flag belongs to
+    outcome: str  # "dismiss" (clear) | "uphold" (keep gated)
+    note: str = Field(min_length=1)  # required reviewer note
 
 
 # ── §4 Perception surveys ────────────────────────────────────────────────────

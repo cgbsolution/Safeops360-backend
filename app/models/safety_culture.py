@@ -114,6 +114,43 @@ class CultureObservationClosure(Base, IdMixin):
     )
 
 
+class CultureObserverIntegrity(Base, IdMixin):
+    """Shared integrity gate keyed to (plant, observer, period) — the single source
+    of truth both the BBS Quality Index card and the Recognition leaderboard read,
+    so the two screens can never contradict each other (§Fix 1).
+
+    ``status`` lifecycle:
+      • ``flagged_pending_review``    — gaming-pattern detector raised it; not yet reviewed
+      • ``flagged_reviewed_upheld``   — a human reviewer confirmed the concern (stays gated)
+      • ``flagged_reviewed_dismissed``— a human reviewer cleared it (points un-freeze)
+      • ``clear``                     — never flagged (implicit default; rows only exist once flagged)
+
+    While a period is pending-review or upheld, Recognition freezes that observer's
+    quality-derived points (read-time gate in ``leaderboard``) — reversible, so a
+    dismissal restores rank with no recompute.
+    """
+
+    __tablename__ = "CultureObserverIntegrity"
+
+    plantId: Mapped[str] = mapped_column(String, nullable=False)
+    observerId: Mapped[str] = mapped_column(String, nullable=False)
+    period: Mapped[str] = mapped_column(String, nullable=False)  # YYYY-MM
+    status: Mapped[str] = mapped_column(String, nullable=False, default="flagged_pending_review")
+    reasons: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # pattern snapshot at flag time
+    reviewNote: Mapped[str | None] = mapped_column(Text)
+    reviewedById: Mapped[str | None] = mapped_column(String)
+    reviewedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    flaggedAt: Mapped[datetime] = _created()
+
+    createdAt: Mapped[datetime] = _created()
+    updatedAt: Mapped[datetime] = _updated()
+
+    __table_args__ = (
+        UniqueConstraint("plantId", "observerId", "period", name="uq_CultureObserverIntegrity_key"),
+        Index("ix_CultureObserverIntegrity_plant_period", "plantId", "period"),
+    )
+
+
 # ── §3 Leadership Engagement ─────────────────────────────────────────────────
 class LeadershipWalk(Base, IdMixin):
     __tablename__ = "LeadershipWalk"
@@ -130,7 +167,13 @@ class LeadershipWalk(Base, IdMixin):
     observationsRaised: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     hazardsIdentified: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     notes: Mapped[str | None] = mapped_column(Text)
+    # §3 structured walk checklist (replaces free-text-only capture). Shape:
+    #   { hazardCategories: [str], workerInteractions: [{count, topic}],
+    #     ppeCompliance: int(0-100), housekeepingRating: int(1-5) }
+    checklist: Mapped[dict | None] = mapped_column(JSON)
     followUpActionIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Set when a scheduled walk is auto-flipped to Missed and escalated (§3/§8).
+    escalatedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     createdById: Mapped[str | None] = mapped_column(String)
     createdAt: Mapped[datetime] = _created()
@@ -232,6 +275,7 @@ __all__ = [
     "CultureMaturityProfile",
     "CultureMaturitySnapshot",
     "CultureObservationClosure",
+    "CultureObserverIntegrity",
     "LeadershipWalk",
     "PerceptionSurveyTemplate",
     "PerceptionSurveyResponse",

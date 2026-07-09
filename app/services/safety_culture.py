@@ -30,6 +30,7 @@ from app.models.safety_culture import (
     CultureMaturityProfile,
     CultureMaturitySnapshot,
     CultureObservationClosure,
+    CultureObserverIntegrity,
     LeadershipWalk,
     PerceptionIndexSnapshot,
     PerceptionSurveyResponse,
@@ -332,7 +333,87 @@ async def integrity_flags(db: AsyncSession, plant_id: str, flag_n: int = 5) -> l
                 "framing": "coaching",
             })
     flags.sort(key=lambda f: len(f["patterns"]), reverse=True)
+
+    # Attach the shared integrity status (§Fix 1) so the BBS Quality card can offer
+    # a "Review flag" closure action and show the review outcome. A currently-
+    # detected observer with no stored row yet defaults to pending-review.
+    period = _period_label()
+    stored = await _integrity_map(db, plant_id, period)
+    for f in flags:
+        row = stored.get(f["observerId"])
+        f["period"] = period
+        f["integrityStatus"] = row.status if row else "flagged_pending_review"
+        f["reviewNote"] = row.reviewNote if row else None
+        f["reviewedById"] = row.reviewedById if row else None
+        f["reviewedAt"] = _aware(row.reviewedAt).isoformat() if (row and row.reviewedAt) else None
     return flags
+
+
+# ── §Fix 1: shared integrity gate (persist + review + read-time freeze) ───────
+_INTEGRITY_GATED = ("flagged_pending_review", "flagged_reviewed_upheld")
+
+
+async def _integrity_map(db: AsyncSession, plant_id: str, period: str) -> dict[str, CultureObserverIntegrity]:
+    rows = (
+        await db.execute(
+            select(CultureObserverIntegrity)
+            .where(CultureObserverIntegrity.plantId == plant_id)
+            .where(CultureObserverIntegrity.period == period)
+        )
+    ).scalars().all()
+    return {r.observerId: r for r in rows}
+
+
+async def sync_integrity_flags(db: AsyncSession, plant_id: str) -> int:
+    """Persist a ``flagged_pending_review`` row for each currently-detected observer
+    that has no row yet for the current period. Never auto-clears or downgrades a
+    reviewed row (only a human dismisses/upholds). Called from ``recalculate_all``
+    so Recognition's read-time gate has something to key off. Caller commits."""
+    period = _period_label()
+    flags = await integrity_flags(db, plant_id)
+    existing = await _integrity_map(db, plant_id, period)
+    created = 0
+    for f in flags:
+        oid = f["observerId"]
+        if oid in existing:
+            continue
+        db.add(CultureObserverIntegrity(
+            plantId=plant_id, observerId=oid, period=period,
+            status="flagged_pending_review", reasons=f.get("patterns", []), flaggedAt=_now(),
+        ))
+        created += 1
+    await db.flush()
+    return created
+
+
+async def review_integrity_flag(
+    db: AsyncSession, plant_id: str, observer_id: str, period: str, outcome: str, note: str, reviewer_id: str,
+) -> dict[str, Any]:
+    """Record a human review outcome (§Fix 1). ``outcome`` ∈ {dismiss, uphold}.
+    A dismissal un-freezes the observer's Recognition points automatically (the
+    gate is read-time, so no recompute needed). Caller/endpoint commits."""
+    status = "flagged_reviewed_dismissed" if outcome == "dismiss" else "flagged_reviewed_upheld"
+    row = (
+        await db.execute(
+            select(CultureObserverIntegrity)
+            .where(CultureObserverIntegrity.plantId == plant_id)
+            .where(CultureObserverIntegrity.observerId == observer_id)
+            .where(CultureObserverIntegrity.period == period)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = CultureObserverIntegrity(plantId=plant_id, observerId=observer_id, period=period, flaggedAt=_now())
+        db.add(row)
+    row.status = status
+    row.reviewNote = note
+    row.reviewedById = reviewer_id
+    row.reviewedAt = _now()
+    await db.flush()
+    return {
+        "plantId": plant_id, "observerId": observer_id, "period": period,
+        "integrityStatus": status, "reviewNote": note,
+        "reviewedById": reviewer_id, "reviewedAt": _aware(row.reviewedAt).isoformat(),
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -393,6 +474,110 @@ async def _leading_lagging(db: AsyncSession, plant_id: str, cfg: CultureConfig) 
     }
 
 
+async def _leading_lagging_for_month(db: AsyncSession, plant_id: str, year: int, month: int, cfg: CultureConfig) -> dict[str, Any]:
+    """Leading/lagging counts for a single calendar month — powers the trend line."""
+    from app.models.audit_compliance import ComplianceAudit
+    from app.models.competency_matrix import CompetencyRecord
+    from app.models.incident import Incident
+    from app.models.near_miss import NearMiss
+    from app.models.observation import Observation
+
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    end = start.replace(year=year + (month // 12), month=(month % 12) + 1)
+
+    async def _count(model, date_col, extra=None):
+        stmt = (
+            select(func.count()).select_from(model)
+            .where(model.plantId == plant_id).where(date_col >= start).where(date_col < end)
+        )
+        if extra is not None:
+            stmt = stmt.where(extra)
+        return int((await db.execute(stmt)).scalar() or 0)
+
+    obs_n = await _count(Observation, Observation.createdAt)
+    nm_n = await _count(NearMiss, NearMiss.createdAt)
+    audit_n = await _count(ComplianceAudit, ComplianceAudit.scheduledDate)
+    training_n = await _count(CompetencyRecord, CompetencyRecord.createdAt, CompetencyRecord.state == "validated")
+    leading = obs_n + nm_n + audit_n + training_n
+
+    inc_n = await _count(Incident, Incident.createdAt)
+    lagging_mh = 0
+    try:
+        idx = year * 12 + month
+        row = (
+            await db.execute(
+                text(
+                    'SELECT COALESCE(SUM("ltiCount"),0)+COALESCE(SUM("mtcCount"),0)'
+                    '+COALESCE(SUM("rwcCount"),0)+COALESCE(SUM("fatalityCount"),0) '
+                    'FROM "Manhours" WHERE "plantId" = :p AND (year*12+month) = :i'
+                ),
+                {"p": plant_id, "i": idx},
+            )
+        ).first()
+        lagging_mh = int((row[0] if row else 0) or 0)
+    except Exception:
+        lagging_mh = 0
+
+    lagging = inc_n + lagging_mh
+    ratio = leading / max(1, lagging)
+    return {
+        "period": f"{year:04d}-{month:02d}", "leading": leading, "lagging": lagging,
+        "ratio": round(ratio, 1), "score": round(_clamp(ratio / cfg.leading_lagging_target * 100), 1),
+    }
+
+
+async def leading_lagging_detail(db: AsyncSession, plant_id: str) -> dict[str, Any]:
+    """§Fix 2 — the dedicated Leading/Lagging Ratio drill-down payload: the headline
+    90-day rolling ratio (identical to the Culture Maturity component so the two
+    numbers always match), a 6-month per-calendar-month trend, the site-configurable
+    target, and the under-10:1 under-reporting caveat (SmartQHSE guidance: a mature
+    culture runs ~50-100 near-misses per recordable; a very low ratio is a possible
+    under-reporting signal, not a 'good' score)."""
+    vertical = await _vertical_for_plant(db, plant_id)
+    cfg = config_for(vertical)
+    current = await _leading_lagging(db, plant_id, cfg)
+
+    now = _now()
+    months: list[tuple[int, int]] = []
+    y, m = now.year, now.month
+    for _ in range(6):
+        months.append((y, m))
+        m -= 1
+        if m < 1:
+            y -= 1
+            m = 12
+    months.reverse()
+    trend = [await _leading_lagging_for_month(db, plant_id, yy, mm, cfg) for (yy, mm) in months]
+
+    return {
+        "plantId": plant_id,
+        "industryVertical": vertical,
+        "score": current["score"],
+        "ratio": current["ratio"],
+        "leading": current["leading"],
+        "lagging": current["lagging"],
+        "breakdown": current["breakdown"],
+        "target": cfg.leading_lagging_target,
+        "underReporting": current["ratio"] < 10.0,
+        "trend": trend,
+    }
+
+
+# Exact inputs to the Worker Participation component (§Fix 6 — documented so an
+# ISO-45001 auditor can trace the 20% weight). This measures BREADTH:
+#   participation% = |distinct people who did ≥1 of {logged an observation,
+#                      reported a near-miss, led a safety walk} in the 90d window|
+#                     ÷ site headcount, scored against participation_target_pct.
+# It deliberately does NOT re-use the BBS *quality* signal (weighted points /
+# closure loop) — BBS Quality Index scores the *quality* of the observation
+# stream, this scores the *reach* of participation. The one raw input the two
+# share is "an observation exists" (it lifts both a person's participation and
+# the BBS weighted total); that single overlap is DISCLOSED on the Culture
+# Maturity component tooltip (see ComponentBars in ui.tsx) rather than presented
+# as five fully-independent components. No other raw data point is double-counted.
+WORKER_PARTICIPATION_INPUTS = ["observation reporters", "near-miss reporters", "leadership-walk leaders"]
+
+
 async def _worker_participation(db: AsyncSession, plant_id: str, cfg: CultureConfig) -> float:
     from app.models.near_miss import NearMiss
     from app.models.observation import Observation
@@ -451,7 +636,207 @@ async def leadership_compliance(db: AsyncSession, plant_id: str) -> dict[str, An
         "walkQuality": round(quality, 1),
         "scheduledWalks": scheduled,
         "completedWalks": completed,
+        # §Fix 3 — surface the formulas the UI states verbatim.
+        "formula": {
+            "engagementScore": "complianceToSchedule × 0.6 + walkQuality × 0.4",
+            "walkQuality": "clamp((workersInteracted + hazardsIdentified + observationsRaised) ÷ completedWalks ÷ 12 × 100)",
+        },
     }
+
+
+async def _plant_escalation_recipients(db: AsyncSession, plant_id: str) -> list[Any]:
+    """§Fix 8 — the escalation audience for a site's culture events: plant
+    HSE_MANAGER + PLANT_HEAD, falling back to enterprise CORPORATE_HSE if the site
+    has neither (the User model has no manager FK, so the plant HSE lead is the
+    escalation target)."""
+    from app.services.erm_notifications import _users_with_role
+
+    recips: dict[str, Any] = {}
+    for role in ("HSE_MANAGER", "PLANT_HEAD"):
+        for u in await _users_with_role(db, role, plant_id=plant_id):
+            if u.plantId == plant_id:
+                recips[u.id] = u
+    if not recips:
+        for u in await _users_with_role(db, "CORPORATE_HSE"):
+            recips[u.id] = u
+    return list(recips.values())
+
+
+async def escalate_missed_walks(db: AsyncSession, plant_id: str, grace_days: int = 2) -> int:
+    """§Fix 3 — flip a Scheduled walk that passed its due date (+grace) to Missed and
+    stamp ``escalatedAt`` so the Upcoming list can show a distinct 'Missed / escalated'
+    state. §Fix 8 — on each flip, escalate to the plant HSE lead via an in-app
+    notification (+ best-effort email). The flip itself is the dedup guard (a walk is
+    only selected while still Scheduled). Called per-plant from ``recalculate_all``.
+    Caller commits."""
+    cutoff = _now() - timedelta(days=grace_days)
+    walks = (
+        await db.execute(
+            select(LeadershipWalk)
+            .where(LeadershipWalk.plantId == plant_id)
+            .where(LeadershipWalk.status == "Scheduled")
+            .where(LeadershipWalk.scheduledDate < cutoff)
+        )
+    ).scalars().all()
+    if not walks:
+        return 0
+
+    recipients = await _plant_escalation_recipients(db, plant_id)
+    from app.services.erm_notifications import create_notification
+
+    escalated = 0
+    for w in walks:
+        w.status = "Missed"
+        w.escalatedAt = _now()
+        escalated += 1
+        due = _aware(w.scheduledDate).date().isoformat() if w.scheduledDate else "?"
+        for u in recipients:
+            try:
+                await create_notification(
+                    db, user_id=u.id, type="CULTURE_WALK_MISSED",
+                    title="Leadership safety walk missed",
+                    body=f"A leadership walk scheduled {due} (area: {w.areaVisited or 'TBD'}) "
+                         f"was not completed and has been auto-escalated.",
+                    severity="WARNING", entity_type="LeadershipWalk", entity_id=w.id,
+                    link_url=f"/safety-culture/leadership?plant={plant_id}",
+                )
+            except Exception:
+                pass  # notifications are best-effort — never block the state flip
+    await db.flush()
+    return escalated
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §Fix 8 Automation & escalation layer (scheduler-driven)
+# ════════════════════════════════════════════════════════════════════════════
+_STAGE_ORDER = {"Reactive": 0, "Dependent": 1, "Independent": 2, "Interdependent": 3}
+
+
+async def run_walk_reminders(db: AsyncSession, lead_days: int = 2) -> dict[str, Any]:
+    """§Fix 8 — remind a leader T-`lead_days` days before a scheduled walk. Runs
+    daily; deduped per walk so a leader isn't pinged twice. Scheduler commits."""
+    from app.services.erm_notifications import _recent_notification_exists, create_notification
+
+    lo = _now() + timedelta(days=lead_days - 0.5)
+    hi = _now() + timedelta(days=lead_days + 0.5)
+    walks = (
+        await db.execute(
+            select(LeadershipWalk)
+            .where(LeadershipWalk.status == "Scheduled")
+            .where(LeadershipWalk.scheduledDate >= lo)
+            .where(LeadershipWalk.scheduledDate <= hi)
+        )
+    ).scalars().all()
+    reminded = 0
+    for w in walks:
+        if await _recent_notification_exists(db, type="CULTURE_WALK_REMINDER", entity_id=w.id, within=timedelta(days=3)):
+            continue
+        due = _aware(w.scheduledDate).date().isoformat() if w.scheduledDate else "?"
+        try:
+            await create_notification(
+                db, user_id=w.leaderId, type="CULTURE_WALK_REMINDER",
+                title="Leadership safety walk due in 2 days",
+                body=f"Your scheduled walk on {due} (area: {w.areaVisited or 'TBD'}) is coming up. "
+                     f"Please complete and log it to keep your compliance on track.",
+                severity="INFO", entity_type="LeadershipWalk", entity_id=w.id,
+                link_url=f"/safety-culture/leadership?plant={w.plantId}",
+            )
+            reminded += 1
+        except Exception:
+            pass
+    return {"walksDueSoon": len(walks), "remindersSent": reminded, "flagged": reminded}
+
+
+async def run_survey_launch(db: AsyncSession) -> dict[str, Any]:
+    """§Fix 8 — keep a perception survey window open automatically each cadence
+    period so a site never shows 'No active survey'. Ensures a default active
+    template exists, and notifies enterprise HSE once per quarter that the pulse is
+    open. Scheduler commits."""
+    from app.services.erm_notifications import _recent_notification_exists, _users_with_role, create_notification
+
+    active = (
+        await db.execute(select(PerceptionSurveyTemplate).where(PerceptionSurveyTemplate.isActive.is_(True)).limit(1))
+    ).scalar_one_or_none()
+    created = 0
+    if active is None:
+        active = PerceptionSurveyTemplate(
+            name="Safety Perception Pulse",
+            description="Quarterly anonymous pulse across trust in reporting, psychological safety, "
+                        "management commitment and peer accountability.",
+            questions=[
+                {"id": "q_trust_1", "text": "I can report a safety concern without fear of blame.", "dimension": "TrustInReporting", "scaleType": "likert5"},
+                {"id": "q_psych_1", "text": "I feel safe stopping a job I believe is unsafe.", "dimension": "PsychologicalSafety", "scaleType": "likert5"},
+                {"id": "q_mgmt_1", "text": "Leaders are visibly committed to safety on the floor.", "dimension": "ManagementCommitment", "scaleType": "likert5"},
+                {"id": "q_peer_1", "text": "My colleagues speak up when they see unsafe behaviour.", "dimension": "PeerAccountability", "scaleType": "likert5"},
+            ],
+            isActive=True, cadence="QUARTERLY",
+        )
+        db.add(active)
+        await db.flush()
+        created = 1
+
+    n = _now()
+    quarter = f"{n.year}-Q{(n.month - 1) // 3 + 1}"
+    notified = 0
+    if not await _recent_notification_exists(db, type="CULTURE_SURVEY_LAUNCHED", entity_id=quarter, within=timedelta(days=80)):
+        for u in await _users_with_role(db, "CORPORATE_HSE"):
+            try:
+                await create_notification(
+                    db, user_id=u.id, type="CULTURE_SURVEY_LAUNCHED",
+                    title=f"Perception survey window open — {quarter}",
+                    body=f"The {quarter} anonymous safety-perception pulse is live across all sites. "
+                         f"Encourage participation to unlock dimension scores.",
+                    severity="INFO", entity_type="PerceptionSurveyTemplate", entity_id=quarter,
+                    link_url="/safety-culture/perception",
+                )
+                notified += 1
+            except Exception:
+                pass
+    return {"period": quarter, "templateCreated": created, "hseNotified": notified, "flagged": notified}
+
+
+async def run_band_breach_scan(db: AsyncSession) -> dict[str, Any]:
+    """§Fix 8 — flag a site whose maturity stage-band REGRESSED between its two most
+    recent monthly snapshots (e.g. Independent → Dependent) and escalate to the plant
+    HSE lead. This complements the ERM KRI channel: the numeric ``culture.*`` KRI
+    thresholds already fire owner+CRO+RISK_CHAMPION emails via the hourly
+    kri_module_feeds job (record_reading → _notify_kri_red); this adds the site-level
+    stage-regression signal to the culture programme owners. Scheduler commits."""
+    from app.models.plant import Plant
+    from app.services.erm_notifications import _recent_notification_exists, create_notification
+
+    plant_ids = (await db.execute(select(Plant.id))).scalars().all()
+    breaches = 0
+    for pid in plant_ids:
+        snaps = (
+            await db.execute(
+                select(CultureMaturitySnapshot)
+                .where(CultureMaturitySnapshot.plantId == pid)
+                .order_by(CultureMaturitySnapshot.period.desc()).limit(2)
+            )
+        ).scalars().all()
+        if len(snaps) < 2:
+            continue
+        cur, prev = snaps[0], snaps[1]
+        if _STAGE_ORDER.get(cur.currentStage, 0) >= _STAGE_ORDER.get(prev.currentStage, 0):
+            continue  # no regression
+        if await _recent_notification_exists(db, type="CULTURE_BAND_REGRESSED", entity_id=pid, within=timedelta(days=25)):
+            continue
+        breaches += 1
+        for u in await _plant_escalation_recipients(db, pid):
+            try:
+                await create_notification(
+                    db, user_id=u.id, type="CULTURE_BAND_REGRESSED",
+                    title=f"Safety culture regressed: {prev.currentStage} → {cur.currentStage}",
+                    body=f"This site's culture maturity dropped from {prev.currentStage} to "
+                         f"{cur.currentStage} (score {cur.stageScore}). Review leadership engagement, "
+                         f"reporting quality and perception drivers.",
+                    severity="CRITICAL", entity_type="CultureMaturityProfile", entity_id=pid,
+                    link_url=f"/safety-culture?site={pid}",
+                )
+            except Exception:
+                pass
+    return {"sitesRegressed": breaches, "flagged": breaches}
 
 
 async def leader_scorecard(db: AsyncSession, leader_id: str) -> dict[str, Any]:
@@ -469,6 +854,27 @@ async def leader_scorecard(db: AsyncSession, leader_id: str) -> dict[str, Any]:
     workers = sum(w.workersInteracted for w in walks)
     obs = sum(w.observationsRaised for w in walks)
     quality = _clamp((workers + hazards + obs) / max(1, completed) / 12.0 * 100) if completed else 0.0
+
+    # §Fix 3 — 6-month compliance-to-schedule trend (not just the current snapshot).
+    trend_walks = (
+        await db.execute(
+            select(LeadershipWalk).where(LeadershipWalk.leaderId == leader_id)
+            .where(LeadershipWalk.scheduledDate >= _now() - timedelta(days=186))
+        )
+    ).scalars().all()
+    buckets: dict[str, list[int]] = {}
+    for w in trend_walks:
+        p = _period_label(_aware(w.scheduledDate)) if w.scheduledDate else _period_label()
+        b = buckets.setdefault(p, [0, 0])
+        b[0] += 1
+        if w.status == "Completed":
+            b[1] += 1
+    compliance_trend = [
+        {"period": p, "complianceToSchedule": round(b[1] / b[0] * 100, 1) if b[0] else 0.0,
+         "scheduled": b[0], "completed": b[1]}
+        for p, b in sorted(buckets.items())
+    ]
+
     return {
         "leaderId": leader_id,
         "scheduledWalks": scheduled,
@@ -478,6 +884,7 @@ async def leader_scorecard(db: AsyncSession, leader_id: str) -> dict[str, Any]:
         "workersInteracted": workers,
         "observationsRaised": obs,
         "rollingEngagementScore": round(_clamp(compliance * 0.6 + quality * 0.4), 1),
+        "complianceTrend": compliance_trend,
         "recentWalks": [
             {
                 "id": w.id, "scheduledDate": _aware(w.scheduledDate).isoformat() if w.scheduledDate else None,
@@ -592,6 +999,44 @@ async def _latest_perception_composite(db: AsyncSession, plant_id: str) -> float
     return float(snap.compositeScore) if snap else 0.0
 
 
+async def perception_trend(db: AsyncSession, plant_id: str) -> dict[str, Any]:
+    """§Fix 4 — dimension-level trend across every threshold-met period, plus a
+    directional cross-site benchmark (the average composite across all sites for the
+    latest period). The benchmark is flagged directional-only, not an external
+    dataset, to avoid overstating the comparison."""
+    snaps = (
+        await db.execute(
+            select(PerceptionIndexSnapshot)
+            .where(PerceptionIndexSnapshot.plantId == plant_id)
+            .where(PerceptionIndexSnapshot.thresholdMet.is_(True))
+            .order_by(PerceptionIndexSnapshot.period.asc())
+            .limit(12)
+        )
+    ).scalars().all()
+    series = [
+        {
+            "period": s.period, "compositeScore": s.compositeScore,
+            "dimensionScores": s.dimensionScores or {}, "responseRatePercent": s.responseRatePercent,
+        }
+        for s in snaps
+    ]
+    benchmark: float | None = None
+    if series:
+        latest_period = series[-1]["period"]
+        avg = (
+            await db.execute(
+                select(func.avg(PerceptionIndexSnapshot.compositeScore))
+                .where(PerceptionIndexSnapshot.period == latest_period)
+                .where(PerceptionIndexSnapshot.thresholdMet.is_(True))
+            )
+        ).scalar()
+        benchmark = round(float(avg), 1) if avg is not None else None
+    return {
+        "plantId": plant_id, "series": series,
+        "benchmarkComposite": benchmark, "benchmarkLabel": "Cross-site average (directional)",
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # §1 Culture Maturity Engine — the aggregate everything feeds
 # ════════════════════════════════════════════════════════════════════════════
@@ -670,16 +1115,27 @@ async def recalculate_all(db: AsyncSession) -> dict[str, Any]:
     period = _period_label()
     recalculated = 0
     awarded = 0
+    escalated = 0
     for pid in plant_ids:
         try:
+            await escalate_missed_walks(db, pid)  # §Fix 3: flip past-due walks → Missed first
             await calculate_culture_score(db, pid)
             recalculated += 1
+            await sync_integrity_flags(db, pid)  # §Fix 1: persist pending flags before awarding
             res = await award_recognition(db, pid, period)
             awarded += res.get("awarded", 0)
         except Exception:
             continue
+    # count escalations after the loop from the freshly-marked walks in this window
+    escalated = (
+        await db.execute(
+            select(func.count()).select_from(LeadershipWalk)
+            .where(LeadershipWalk.status == "Missed")
+            .where(LeadershipWalk.escalatedAt >= _now() - timedelta(days=1))
+        )
+    ).scalar() or 0
     await db.commit()
-    return {"plantsRecalculated": recalculated, "recognitionAwarded": awarded, "period": period}
+    return {"plantsRecalculated": recalculated, "recognitionAwarded": awarded, "walksEscalated": int(escalated), "period": period}
 
 
 async def maturity_profile_out(db: AsyncSession, plant_id: str, with_history: bool = True) -> dict[str, Any]:
@@ -851,6 +1307,23 @@ async def leaderboard(db: AsyncSession, plant_id: str, period: str) -> dict[str,
             t["badges"].append(r.badgeAwarded)
         t["streakWeeks"] = max(t["streakWeeks"], r.streakWeeks)
 
+    # §Fix 1 integrity gate (read-time, reversible): an observer under
+    # flagged_pending_review / _upheld has their quality-derived points FROZEN
+    # (effective 0) so they cannot rank while gated — but they stay listed with an
+    # "under integrity review" badge rather than being silently omitted, and the
+    # would-be total is preserved in ``frozenPoints`` so a dismissal restores rank
+    # with no recompute. This makes BBS-integrity and Recognition standing agree.
+    integ = await _integrity_map(db, plant_id, period)
+    for t in totals.values():
+        row = integ.get(t["userId"])
+        if row is None:
+            continue
+        t["integrityStatus"] = row.status
+        if row.status in _INTEGRITY_GATED:
+            t["frozenPoints"] = round(t["points"], 1)
+            t["points"] = 0.0
+            t["pointsFrozen"] = True
+
     # most-improved: delta vs previous period total
     prev = _prev_period(period)
     prev_rows = (
@@ -907,6 +1380,94 @@ async def user_streaks(db: AsyncSession, user_id: str) -> dict[str, Any]:
         "userId": user_id, "currentStreakWeeks": streak, "totalPoints": total_points, "badges": badges,
         "history": [{"period": e.periodEarned, "category": e.category, "points": e.points, "badge": e.badgeAwarded} for e in entries],
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §Fix 7 Multi-site rollups — portfolio comparison for the single-site modules
+# ════════════════════════════════════════════════════════════════════════════
+Plants = list[tuple[str, str, str, str | None]]  # (id, name, code, state)
+
+
+def _site_head(pid: str, name: str, code: str, state: str | None) -> dict[str, Any]:
+    return {"plantId": pid, "plantName": name, "plantCode": code, "state": state}
+
+
+async def walk_compliance_rollup(db: AsyncSession, plants: Plants) -> dict[str, Any]:
+    rows = []
+    for pid, name, code, state in plants:
+        c = await leadership_compliance(db, pid)
+        rows.append({**_site_head(pid, name, code, state),
+                     "complianceToSchedule": c["complianceToSchedule"], "engagementScore": c["engagementScore"],
+                     "walkQuality": c["walkQuality"], "scheduledWalks": c["scheduledWalks"], "completedWalks": c["completedWalks"]})
+    rows.sort(key=lambda r: r["complianceToSchedule"], reverse=True)
+    active = [r for r in rows if r["scheduledWalks"] > 0]
+    avg = round(sum(r["complianceToSchedule"] for r in active) / len(active), 1) if active else 0.0
+    return {"metric": "complianceToSchedule", "metricLabel": "Walk compliance to schedule (%)", "average": avg, "rows": rows}
+
+
+async def bbs_quality_rollup(db: AsyncSession, plants: Plants) -> dict[str, Any]:
+    rows = []
+    for pid, name, code, state in plants:
+        q = await bbs_quality_index(db, pid, config_for(await _vertical_for_plant(db, pid)))
+        rows.append({**_site_head(pid, name, code, state),
+                     "bbsQualityIndex": q["bbsQualityIndex"], "distinctObservers": q["distinctObservers"],
+                     "observationCount": q["observationCount"], "verifiedClosures": q["verifiedClosures"]})
+    rows.sort(key=lambda r: r["bbsQualityIndex"], reverse=True)
+    scored = [r for r in rows if r["observationCount"] > 0]
+    avg = round(sum(r["bbsQualityIndex"] for r in scored) / len(scored), 1) if scored else 0.0
+    return {"metric": "bbsQualityIndex", "metricLabel": "BBS Quality Index (0-100)", "average": avg, "rows": rows}
+
+
+async def leading_lagging_rollup(db: AsyncSession, plants: Plants) -> dict[str, Any]:
+    rows = []
+    for pid, name, code, state in plants:
+        ll = await _leading_lagging(db, pid, config_for(await _vertical_for_plant(db, pid)))
+        rows.append({**_site_head(pid, name, code, state),
+                     "ratio": ll["ratio"], "score": ll["score"], "leading": ll["leading"], "lagging": ll["lagging"],
+                     "underReporting": ll["ratio"] < 10.0})
+    rows.sort(key=lambda r: r["ratio"], reverse=True)
+    return {"metric": "ratio", "metricLabel": "Leading : Lagging ratio", "rows": rows}
+
+
+async def perception_rollup(db: AsyncSession, plants: Plants) -> dict[str, Any]:
+    rows = []
+    for pid, name, code, state in plants:
+        snap = (
+            await db.execute(
+                select(PerceptionIndexSnapshot)
+                .where(PerceptionIndexSnapshot.plantId == pid)
+                .where(PerceptionIndexSnapshot.thresholdMet.is_(True))
+                .order_by(PerceptionIndexSnapshot.period.desc()).limit(1)
+            )
+        ).scalar_one_or_none()
+        rows.append({**_site_head(pid, name, code, state),
+                     "compositeScore": snap.compositeScore if snap else 0.0,
+                     "dimensionScores": snap.dimensionScores if snap else {},
+                     "period": snap.period if snap else None,
+                     "responseRatePercent": snap.responseRatePercent if snap else 0.0,
+                     "hasData": snap is not None})
+    rows.sort(key=lambda r: r["compositeScore"], reverse=True)
+    scored = [r for r in rows if r["hasData"]]
+    avg = round(sum(r["compositeScore"] for r in scored) / len(scored), 1) if scored else 0.0
+    return {"metric": "compositeScore", "metricLabel": "Perception composite (0-100)", "average": avg, "rows": rows}
+
+
+async def recognition_rollup(db: AsyncSession, plants: Plants, period: str) -> dict[str, Any]:
+    """Per-site recognition totals for the period. Respects the §Fix 1 integrity
+    gate (frozen points excluded) by reusing ``leaderboard`` per site."""
+    rows = []
+    for pid, name, code, state in plants:
+        board = await leaderboard(db, pid, period)
+        indiv = board["individual"]
+        top = indiv[0] if indiv else None
+        total = round(sum(e["points"] for e in indiv), 1)
+        rows.append({**_site_head(pid, name, code, state),
+                     "totalPoints": total, "awardedCount": len(indiv),
+                     "topPerformerId": top["userId"] if top else None,
+                     "topPerformerPoints": top["points"] if top else 0.0,
+                     "frozenCount": sum(1 for e in indiv if e.get("pointsFrozen"))})
+    rows.sort(key=lambda r: r["totalPoints"], reverse=True)
+    return {"metric": "totalPoints", "metricLabel": "Recognition points (period)", "period": period, "rows": rows}
 
 
 # ════════════════════════════════════════════════════════════════════════════

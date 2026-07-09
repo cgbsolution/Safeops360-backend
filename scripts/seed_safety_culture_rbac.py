@@ -27,6 +27,7 @@ ACTIONS = [
     ("SURVEY_ADMIN", "Create / edit perception survey templates"),
     ("SURVEY_RESPOND", "Submit an anonymous perception survey response"),
     ("RECALC", "Trigger culture score recalculation + recognition awards"),
+    ("INTEGRITY_REVIEW", "Review a BBS observation-integrity flag (dismiss/uphold) — gates Recognition"),
     ("ADMIN", "Wire culture scores into the ERM KRI engine; module administration"),
 ]
 
@@ -47,7 +48,7 @@ GRANTS: dict[str, tuple[list[str], str]] = {
     "SAFETY_OFFICER": (["READ", "WALK_SCHEDULE", "WALK_LOG", "CLOSURE", "SURVEY_RESPOND"], "OWN_PLANT"),
     # Site HSE owns the culture programme for the plant.
     "HSE_MANAGER": (ALL, "OWN_PLANT"),
-    "PLANT_HEAD": (["READ", "WALK_SCHEDULE", "WALK_LOG", "SURVEY_RESPOND", "RECALC"], "OWN_PLANT"),
+    "PLANT_HEAD": (["READ", "WALK_SCHEDULE", "WALK_LOG", "SURVEY_RESPOND", "RECALC", "INTEGRITY_REVIEW"], "OWN_PLANT"),
     "MAINTENANCE_HEAD": (["READ", "WALK_LOG", "SURVEY_RESPOND"], "OWN_PLANT"),
     "DEPARTMENT_HEAD": (["READ", "WALK_LOG", "SURVEY_RESPOND"], "OWN_DEPARTMENT"),
     # Enterprise EHS / risk leadership see the rollup + wire KRIs.

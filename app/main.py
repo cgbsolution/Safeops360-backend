@@ -194,6 +194,7 @@ def create_app() -> FastAPI:
     from app.models.rca import RcaIdentifiedCause, RcaRiskLink, RootCauseAnalysis
     from app.models.safety_culture import (
         CultureMaturityProfile,
+        CultureObserverIntegrity,
         LeadershipWalk,
         PerceptionSurveyTemplate,
         RecognitionEntry,
@@ -207,8 +208,10 @@ def create_app() -> FastAPI:
         RootCauseAnalysis, RcaIdentifiedCause, RcaRiskLink,
         CaptureSubmission, RcaFieldRequest, Alert,
         # Safety Culture — score recalcs, walk logging, survey admin & recognition
-        # awards write to the tamper-evident hash-chain (§Cross-cutting).
+        # awards write to the tamper-evident hash-chain (§Cross-cutting). The
+        # integrity-review outcome is auditable too (who cleared/upheld a flag).
         CultureMaturityProfile, LeadershipWalk, PerceptionSurveyTemplate, RecognitionEntry,
+        CultureObserverIntegrity,
     )
 
     app = FastAPI(

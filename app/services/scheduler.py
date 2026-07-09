@@ -166,6 +166,24 @@ async def _job_culture_recalc(db) -> dict:
     return await recalculate_all(db)
 
 
+async def _job_culture_walk_reminders(db) -> dict:
+    """§Fix 8 — T-2-day leadership-walk reminders to the leader (deduped)."""
+    from app.services.safety_culture import run_walk_reminders
+    return await run_walk_reminders(db)
+
+
+async def _job_culture_survey_launch(db) -> dict:
+    """§Fix 8 — keep a perception survey window open each cadence period."""
+    from app.services.safety_culture import run_survey_launch
+    return await run_survey_launch(db)
+
+
+async def _job_culture_band_breach(db) -> dict:
+    """§Fix 8 — flag + escalate sites whose maturity stage-band regressed."""
+    from app.services.safety_culture import run_band_breach_scan
+    return await run_band_breach_scan(db)
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
@@ -185,6 +203,9 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("capa_overdue_scan", "CAPA overdue events (daily scan)", 1 * DAY, _job_capa_overdue_scan),
     Job("alert_digest", "Daily Brief 06:00 site-local email digest", 15 * 60, _job_alert_digest),
     Job("culture_recalc", "Safety Culture maturity recompute + recognition", 1 * DAY, _job_culture_recalc),
+    Job("culture_walk_reminders", "Culture — T-2d leadership walk reminders", 1 * DAY, _job_culture_walk_reminders),
+    Job("culture_survey_launch", "Culture — perception survey window launch", 1 * DAY, _job_culture_survey_launch),
+    Job("culture_band_breach", "Culture — stage-band regression escalation", 6 * HOUR, _job_culture_band_breach),
 ]}
 
 

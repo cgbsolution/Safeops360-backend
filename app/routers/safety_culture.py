@@ -25,6 +25,7 @@ from app.models.safety_culture import (
 )
 from app.models.user import User
 from app.schemas.safety_culture import (
+    IntegrityReview,
     LeadershipWalkComplete,
     LeadershipWalkCreate,
     ObservationLinkAction,
@@ -32,6 +33,7 @@ from app.schemas.safety_culture import (
     RecognitionAwardRequest,
     SurveyResponseSubmit,
     SurveyTemplateCreate,
+    WalkRaiseObservation,
 )
 from app.services import safety_culture as svc
 from app.services.permissions import PermissionContext, can, get_accessible_plants
@@ -53,6 +55,19 @@ async def _accessible_or_403(db: AsyncSession, user: User, plant_id: str) -> Non
     plants = await get_accessible_plants(db, user.id)
     if plants is not None and plant_id not in plants:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Plant not in your scope")
+
+
+async def _scoped_plants(db: AsyncSession, user: User) -> list[tuple[str, str, str, str | None]]:
+    """Every plant in the caller's scope as (id, name, code, state) — the shared
+    basis for the §Fix 7 multi-site rollup views. Mirrors maturity_enterprise."""
+    scope = await get_accessible_plants(db, user.id)
+    rows = (await db.execute(select(Plant.id, Plant.name, Plant.code, Plant.state))).all()
+    out: list[tuple[str, str, str, str | None]] = []
+    for pid, pname, pcode, pstate in rows:
+        if scope is not None and pid not in scope:
+            continue
+        out.append((pid, pname, pcode, pstate))
+    return out
 
 
 async def _current_quarter() -> str:
@@ -102,7 +117,9 @@ async def maturity_site(plant_id: str, user: User = Depends(get_current_user), d
 async def maturity_recalc(plant_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
     await _require(db, user, "SAFETY_CULTURE.RECALC", plant_id)
     await _accessible_or_403(db, user, plant_id)
+    await svc.escalate_missed_walks(db, plant_id)
     await svc.calculate_culture_score(db, plant_id)
+    await svc.sync_integrity_flags(db, plant_id)
     period = _now().strftime("%Y-%m")
     await svc.award_recognition(db, plant_id, period)
     await db.commit()
@@ -119,12 +136,42 @@ async def obs_quality_index(plant_id: str, user: User = Depends(get_current_user
     return await svc.bbs_quality_index(db, plant_id, svc.config_for(await svc._vertical_for_plant(db, plant_id)))
 
 
+@router.get("/observations/quality-index-rollup")
+async def obs_quality_rollup(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    """§Fix 7 — BBS Quality Index ranked across every site in the caller's scope."""
+    await _require(db, user, "SAFETY_CULTURE.READ")
+    return await svc.bbs_quality_rollup(db, await _scoped_plants(db, user))
+
+
 @router.get("/observations/integrity-flags/{plant_id}")
 async def obs_integrity(plant_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
     await _require(db, user, "SAFETY_CULTURE.READ", plant_id)
     await _accessible_or_403(db, user, plant_id)
     flags = await svc.integrity_flags(db, plant_id)
     return {"plantId": plant_id, "flaggedCount": len(flags), "flags": flags, "framing": "Coaching opportunities — not punitive. Human review required."}
+
+
+@router.post("/observations/integrity/{observer_id}/review")
+async def obs_integrity_review(
+    observer_id: str, body: IntegrityReview, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> dict:
+    """§Fix 1 — record a human review outcome on an integrity flag (dismiss/uphold)
+    with a required note. Dismissing un-freezes the observer's Recognition points
+    automatically (the gate is read-time). plant_id is passed as a query param."""
+    # The observer's plant drives the scope check; look it up from the User row.
+    obs_user = await db.get(User, observer_id)
+    plant_id = obs_user.plantId if obs_user else None
+    await _require(db, user, "SAFETY_CULTURE.INTEGRITY_REVIEW", plant_id)
+    if plant_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Observer not found or has no plant")
+    await _accessible_or_403(db, user, plant_id)
+    if body.outcome not in ("dismiss", "uphold"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "outcome must be 'dismiss' or 'uphold'")
+    res = await svc.review_integrity_flag(
+        db, plant_id, observer_id, body.period, body.outcome, body.note, user.id
+    )
+    await db.commit()
+    return res
 
 
 @router.get("/observations/closure/{plant_id}")
@@ -254,6 +301,8 @@ async def list_walks(plant_id: str | None = None, leader_id: str | None = None, 
             "status": w.status, "areaVisited": w.areaVisited, "cadence": w.cadence,
             "workersInteracted": w.workersInteracted, "observationsRaised": w.observationsRaised,
             "hazardsIdentified": w.hazardsIdentified, "notes": w.notes,
+            "checklist": w.checklist, "followUpActionIds": w.followUpActionIds,
+            "escalatedAt": svc._aware(w.escalatedAt).isoformat() if w.escalatedAt else None,
         }
         for w in rows
     ]}
@@ -289,6 +338,8 @@ async def complete_walk(walk_id: str, body: LeadershipWalkComplete, user: User =
     walk.hazardsIdentified = body.hazardsIdentified
     if body.notes:
         walk.notes = body.notes
+    if body.checklist is not None:
+        walk.checklist = body.checklist.model_dump()
     walk.followUpActionIds = body.followUpActionIds
     await db.commit()
     # recompute the site's leadership component promptly (§Cross-cutting: webhook-style trigger)
@@ -298,6 +349,73 @@ async def complete_walk(walk_id: str, body: LeadershipWalkComplete, user: User =
     except Exception:
         await db.rollback()
     return {"id": walk.id, "status": walk.status}
+
+
+@router.post("/leadership-walks/{walk_id}/raise-observation", status_code=status.HTTP_201_CREATED)
+async def walk_raise_observation(
+    walk_id: str, body: WalkRaiseObservation, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> dict:
+    """§Fix 3 — raise a hazard logged on a leadership walk as a real Observation so it
+    flows through the SAME BBS closure-loop tracker (Logged → Linked → Verified),
+    optionally spawning a CAPA immediately. Returns the new observation id."""
+    from app.models.observation import (
+        Observation, ObservationCategory, ObservationStatus, ObservationType, Severity,
+    )
+    from sqlalchemy import func as _func
+
+    walk = await db.get(LeadershipWalk, walk_id)
+    if walk is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Walk not found")
+    await _require(db, user, "SAFETY_CULTURE.CLOSURE", walk.plantId)
+    await _accessible_or_403(db, user, walk.plantId)
+
+    plant = await db.get(Plant, walk.plantId)
+    code = plant.code if plant else "NA"
+
+    def _coerce(enum_cls, val, default):
+        try:
+            return enum_cls(val)
+        except Exception:
+            return default
+
+    count = (await db.execute(select(_func.count()).select_from(Observation))).scalar_one()
+    number = f"OBS-{code}-{count + 1:05d}"
+    obs = Observation(
+        number=number, date=_now(),
+        type=ObservationType.UNSAFE_CONDITION,
+        category=_coerce(ObservationCategory, body.category, ObservationCategory.OTHERS),
+        severity=_coerce(Severity, body.severity, Severity.MEDIUM),
+        plantId=walk.plantId, observerId=walk.leaderId, responsiblePersonId=walk.leaderId,
+        description=body.description, status=ObservationStatus.OPEN,
+    )
+    db.add(obs)
+    await db.flush()
+
+    # thread the new observation id onto the walk's follow-ups
+    walk.followUpActionIds = list(walk.followUpActionIds or []) + [obs.id]
+    walk.observationsRaised = (walk.observationsRaised or 0) + 1
+
+    linked_capa_id = None
+    if body.spawnCapa:
+        try:
+            from app.services.capa_spawn import spawn_capa
+
+            capa = await spawn_capa(
+                db, source_code="SAFETY_CULTURE", plant_id=walk.plantId,
+                title=f"Leadership-walk hazard: {obs.number}",
+                problem=body.description or "Hazard identified during a leadership safety walk.",
+                ref_id=obs.id, ref_url=f"/observations/{obs.id}", ref_summary=obs.number,
+                detected_method="LEADERSHIP_WALK", owner_id=walk.leaderId, actor_id=user.id, due_days=30,
+            )
+            if capa:
+                linked_capa_id = capa.id
+                obs.capaId = capa.id
+                db.add(CultureObservationClosure(observationId=obs.id, plantId=walk.plantId, linkedCapaId=capa.id))
+        except Exception:
+            # CAPA source may not be seeded — degrade to a Logged observation.
+            linked_capa_id = None
+    await db.commit()
+    return {"observationId": obs.id, "number": number, "linkedCapaId": linked_capa_id, "walkId": walk_id}
 
 
 @router.get("/leadership-walks/compliance/{plant_id}")
@@ -313,6 +431,30 @@ async def walk_scorecard(leader_id: str, user: User = Depends(get_current_user),
     if leader_id != user.id:
         await _require(db, user, "SAFETY_CULTURE.READ")
     return await svc.leader_scorecard(db, leader_id)
+
+
+@router.get("/leadership-walks/compliance-rollup")
+async def walk_compliance_rollup(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    """§Fix 7 — walk compliance ranked across every site in the caller's scope."""
+    await _require(db, user, "SAFETY_CULTURE.READ")
+    return await svc.walk_compliance_rollup(db, await _scoped_plants(db, user))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# §Fix 2 Leading / Lagging Ratio
+# ════════════════════════════════════════════════════════════════════════════
+@router.get("/leading-lagging-rollup")
+async def leading_lagging_rollup(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    """§Fix 7 — leading:lagging ratio ranked across every site in the caller's scope."""
+    await _require(db, user, "SAFETY_CULTURE.READ")
+    return await svc.leading_lagging_rollup(db, await _scoped_plants(db, user))
+
+
+@router.get("/leading-lagging/{plant_id}")
+async def leading_lagging(plant_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    await _require(db, user, "SAFETY_CULTURE.READ", plant_id)
+    await _accessible_or_403(db, user, plant_id)
+    return await svc.leading_lagging_detail(db, plant_id)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -391,6 +533,23 @@ async def perception_index(plant_id: str, period: str, user: User = Depends(get_
     return result
 
 
+@router.get("/perception-surveys/trend/{plant_id}")
+async def perception_trend(plant_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    """§Fix 4 — dimension-level trend across every threshold-met period + directional
+    cross-site benchmark. Anonymity is preserved: only already-published (threshold-met)
+    snapshots are read, never raw responses."""
+    await _require(db, user, "SAFETY_CULTURE.READ", plant_id)
+    await _accessible_or_403(db, user, plant_id)
+    return await svc.perception_trend(db, plant_id)
+
+
+@router.get("/perception-surveys/rollup")
+async def perception_rollup(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    """§Fix 7 — latest perception composite ranked across every site in scope."""
+    await _require(db, user, "SAFETY_CULTURE.READ")
+    return await svc.perception_rollup(db, await _scoped_plants(db, user))
+
+
 @router.get("/perception-surveys/response-rate/{plant_id}")
 async def perception_rate(plant_id: str, period: str | None = None, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
     await _require(db, user, "SAFETY_CULTURE.READ", plant_id)
@@ -411,6 +570,13 @@ async def recognition_leaderboard(plant_id: str, period: str, user: User = Depen
     await _require(db, user, "SAFETY_CULTURE.READ", plant_id)
     await _accessible_or_403(db, user, plant_id)
     return await svc.leaderboard(db, plant_id, period)
+
+
+@router.get("/recognition/rollup/{period}")
+async def recognition_rollup(period: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+    """§Fix 7 — recognition totals ranked across every site in scope (integrity-gated)."""
+    await _require(db, user, "SAFETY_CULTURE.READ")
+    return await svc.recognition_rollup(db, await _scoped_plants(db, user), period)
 
 
 @router.get("/recognition/streaks/{user_id}")
