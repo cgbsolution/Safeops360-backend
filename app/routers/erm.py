@@ -45,6 +45,7 @@ from app.models.user import User
 from app.schemas import erm as S
 from app.services import erm as svc
 from app.services.access_scope import build_query_scope
+from app.services.capa_spawn import next_capa_number
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -1251,12 +1252,12 @@ async def create_treatment(
         raise HTTPException(400, "No plant available to scope the treatment CAPA.")
 
     year = _q_now().year
-    count = (
-        await db.execute(
-            select(func.count(Capa.id)).where(Capa.plantId == plant.id).where(Capa.sourceCategoryId == st.categoryId)
-        )
-    ).scalar_one() or 0
-    capa_number = f"CAPA-{cat.prefix if cat else 'RTM'}-{year}-{plant.code}-{(count + 1):03d}"
+    # Robust sequence: highest existing suffix + 1 (scans soft-deleted rows too).
+    # The old count()+1 collided with an existing capaNumber after any CAPA delete.
+    capa_number = await next_capa_number(
+        db, prefix=f"CAPA-{cat.prefix if cat else 'RTM'}-{year}-{plant.code}-",
+        plant_id=plant.id, category_id=st.categoryId,
+    )
 
     capa = Capa(
         capaNumber=capa_number,

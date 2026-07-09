@@ -21,6 +21,28 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def next_capa_number(db: AsyncSession, *, prefix: str, plant_id: str, category_id: str) -> str:
+    """Next CAPA number for a (plant, category) sequence = highest existing suffix + 1.
+
+    Scans ALL rows for this prefix INCLUDING soft-deleted ones (the unique key on
+    capaNumber covers soft-deleted rows too), so it never collides. The old
+    `count(rows)+1` broke whenever any CAPA was deleted — the live count no longer
+    matched the highest number, so it re-issued an existing number and 500'd on
+    the duplicate-key constraint.
+    """
+    existing = (
+        await db.execute(
+            select(Capa.capaNumber)
+            .where(Capa.plantId == plant_id)
+            .where(Capa.sourceCategoryId == category_id)
+            .where(Capa.capaNumber.like(prefix + "%"))
+            .execution_options(include_deleted=True)
+        )
+    ).scalars().all()
+    used = {int(n.rsplit("-", 1)[-1]) for n in existing if n.rsplit("-", 1)[-1].isdigit()}
+    return f"{prefix}{(max(used) + 1) if used else 1:03d}"
+
+
 async def spawn_capa(
     db: AsyncSession, *, source_code: str, plant_id: str | None, title: str, problem: str,
     ref_id: str, ref_url: str | None = None, ref_summary: str | None = None,
@@ -39,11 +61,12 @@ async def spawn_capa(
         plant = (await db.execute(select(Plant).order_by(Plant.code).limit(1))).scalar_one_or_none()
     if plant is None:
         raise ValueError("No plant available to scope the CAPA.")
-    count = (
-        await db.execute(select(func.count()).select_from(Capa).where(Capa.plantId == plant.id).where(Capa.sourceCategoryId == st.categoryId))
-    ).scalar() or 0
+    capa_number = await next_capa_number(
+        db, prefix=f"CAPA-{cat.prefix if cat else source_code[:3]}-{_now().year}-{plant.code}-",
+        plant_id=plant.id, category_id=st.categoryId,
+    )
     capa = Capa(
-        capaNumber=f"CAPA-{cat.prefix if cat else source_code[:3]}-{_now().year}-{plant.code}-{(count + 1):03d}",
+        capaNumber=capa_number,
         title=title[:200], plantId=plant.id, sourceCategoryId=st.categoryId, sourceTypeId=st.id, sourceTypeCode=source_code,
         sourceReferenceId=ref_id, sourceReferenceUrl=ref_url, sourceReferenceSummary=ref_summary, sourceMetadata=metadata or {},
         problemDescription=problem, detectionMethod=detected_method, detectedAt=_now(), detectedByUserId=actor_id,
