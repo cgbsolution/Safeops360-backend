@@ -122,6 +122,27 @@ class SuggestCategoryBody(BaseModel):
     lang: str = "hi"
 
 
+class GuidedAnswer(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    q: str = Field(max_length=200)
+    a: str = Field(min_length=1, max_length=1000)
+
+
+class DraftDescriptionBody(BaseModel):
+    """AI 'help me write' request — a few guided-question answers → a drafted,
+    FACT-ONLY report description (guided draft, spec §7c). The reporter always
+    accepts/edits the result; it is never auto-applied."""
+    model_config = ConfigDict(extra="ignore")
+
+    reportType: str = "observation"
+    lang: str = "hi"
+    categoryLabel: str | None = Field(default=None, max_length=300)
+    location: str | None = Field(default=None, max_length=300)
+    severity: str | None = None
+    answers: list[GuidedAnswer] = Field(min_length=1, max_length=8)
+
+
 class RejectBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

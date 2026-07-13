@@ -253,6 +253,66 @@ async def suggest_category_from_text(
         return None
 
 
+_DRAFT_SYSTEM = """You help a factory field worker in India turn a few short answers into a clear \
+safety-report description. Write the description as 1-3 short, factual sentences in LANG, plus an \
+English version.
+STRICT RULES — you are ASSEMBLING the worker's facts, NOT investigating:
+- Use ONLY the facts in the answers and the given context (report type, category, location, severity). \
+Do NOT invent causes, injuries, numbers, equipment, people, or any detail the worker did not provide.
+- Do NOT state or inflate severity beyond what is given; keep a neutral, factual reporting tone \
+("A ... was observed ...", "The worker reported that ...").
+- Keep every machine name, equipment code, area name, number and measurement exactly as written.
+- Write naturally in the worker's language (Hindi stays Hindi, English stays English).
+- If the answers contain too little to describe anything, return empty strings.
+Respond ONLY with a JSON object: {"description": "<in LANG>", "descriptionEn": "<in English>"}."""
+
+
+async def draft_description(
+    *,
+    report_type: str,
+    category_label: str | None,
+    location: str | None,
+    severity: str | None,
+    answers: list[dict[str, str]],
+    lang: str,
+) -> dict[str, str] | None:
+    """Guided-question answers → a drafted, FACT-ONLY report description in the
+    reporter's language (+ English). Fact-preserving by construction (see system
+    prompt) — the caller always shows it for accept/edit, never auto-applies.
+    Fail-soft to None so the wizard falls back to plain typing."""
+    facts = [
+        f"- {(qa.get('q') or '').strip()}: {(qa.get('a') or '').strip()}"
+        for qa in answers
+        if (qa.get("a") or "").strip()
+    ]
+    if not facts:
+        return None
+    from app.services.ai.anthropic_client import complete_json
+
+    context = "\n".join(
+        line
+        for line in [
+            f"Report type: {report_type}",
+            f"Category: {category_label}" if category_label else "",
+            f"Location: {location}" if location else "",
+            f"Reporter-felt severity: {severity}" if severity else "",
+        ]
+        if line
+    )
+    res = await complete_json(
+        system=_DRAFT_SYSTEM,
+        user=f"LANG={lang}\n{context}\nWorker's answers:\n" + "\n".join(facts),
+        max_tokens=500,
+        temperature=0.2,
+    )
+    if not res:
+        return None
+    description = str(res.get("description") or "").strip()
+    if not description:
+        return None
+    return {"description": description, "descriptionEn": str(res.get("descriptionEn") or "").strip()}
+
+
 __all__ = [
     "TranscriptResult",
     "VisionSuggestion",
@@ -266,4 +326,5 @@ __all__ = [
     "get_vision_provider",
     "cleanup_text",
     "suggest_category_from_text",
+    "draft_description",
 ]

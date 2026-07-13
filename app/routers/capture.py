@@ -34,6 +34,7 @@ from app.models.user import User
 from app.schemas.capture import (
     CleanupTextBody,
     ConvertBody,
+    DraftDescriptionBody,
     RejectBody,
     SubmissionCreate,
     SuggestCategoryBody,
@@ -309,6 +310,36 @@ async def suggest_category_endpoint(
         "l2": {"id": l2.id, "code": l2.code, "labels": l2.labels, "iconKey": l2.iconKey} if l2 else None,
         "confidence": suggestion["confidence"],
     }
+
+
+# ── AI text assist: guided answers → drafted description (guided draft) ───────
+@router.post("/ai/draft-description")
+async def draft_description_endpoint(
+    body: DraftDescriptionBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """A few guided-question answers → a drafted report description the reporter
+    accepts or edits (never auto-applied). Fact-only by construction so AI can't
+    invent detail. Fail-soft to {ok:false} → the wizard falls back to plain
+    typing. Gated by features.aiCaptureAssist."""
+    await _require(db, user, _CREATE)
+    if not _features()["aiCaptureAssist"]:
+        return {"ok": False, "reason": "ai_disabled"}
+
+    from app.services.ai.capture_providers import draft_description
+
+    draft = await draft_description(
+        report_type=body.reportType,
+        category_label=body.categoryLabel,
+        location=body.location,
+        severity=body.severity,
+        answers=[{"q": a.q, "a": a.a} for a in body.answers],
+        lang=body.lang,
+    )
+    if not draft or not draft.get("description"):
+        return {"ok": False, "reason": "no_result"}
+    return {"ok": True, "description": draft["description"], "descriptionEn": draft.get("descriptionEn", "")}
 
 
 # ── Taxonomy (precacheable; 304 on version match) ─────────────────────────────
