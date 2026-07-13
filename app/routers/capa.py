@@ -71,6 +71,7 @@ from app.services.permissions import (
     can,
     get_accessible_plants_for,
 )
+from app.services.capa_spawn import next_capa_number
 from app.services.user_directory import resolve_user_directory
 
 router = APIRouter(prefix="/api/capa", tags=["capa"])
@@ -420,16 +421,17 @@ async def create_capa(
             await db.execute(select(CapaSubCategory).where(CapaSubCategory.code == payload.subCategoryCode))
         ).scalar_one_or_none()
 
-    # Capa number — per D4: CAPA-{prefix}-YYYY-PLT-NNN
+    # Capa number — per D4: CAPA-{prefix}-YYYY-PLT-NNN. Uses the shared
+    # max()+1 helper (which scans soft-deleted rows too) so it never re-issues
+    # a number after a delete. The old count(rows)+1 collided on the capaNumber
+    # unique key whenever any CAPA in the sequence had been soft-deleted.
     year = datetime.now(timezone.utc).year
-    count = (
-        await db.execute(
-            select(func.count(Capa.id))
-            .where(Capa.plantId == payload.plantId)
-            .where(Capa.sourceCategoryId == category.id)
-        )
-    ).scalar_one() or 0
-    capa_number = f"CAPA-{category.prefix}-{year}-{plant.code}-{(count + 1):03d}"
+    capa_number = await next_capa_number(
+        db,
+        prefix=f"CAPA-{category.prefix}-{year}-{plant.code}-",
+        plant_id=payload.plantId,
+        category_id=category.id,
+    )
 
     # Apply SLA profile (severity-specific if available, else source default, else global)
     sla = (

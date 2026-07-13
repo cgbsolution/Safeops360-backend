@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # mutated by interval jobs; on-prem deployments set SCHEDULER_ENABLED=true.
     scheduler_enabled: bool = False
 
+    # Security: echo the password-reset OTP back in the forgot-password response
+    # for QA when there is no email gateway. OFF by default and must be opted in
+    # explicitly — so even a misconfigured APP_ENV can never leak an OTP. Never
+    # enable in any internet-reachable environment.
+    expose_dev_otp: bool = False
+
     # ── Email (SMTP) ────────────────────────────────────────────────────────
     # Typed access to the same values `.env` exposes. The best-effort email
     # sender prefers these (falls back to os.getenv for backwards-compat).

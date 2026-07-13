@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SubmissionType = Literal["observation", "near_miss", "unsafe_condition", "incident"]
+SubmissionType = Literal["observation", "near_miss", "unsafe_condition", "incident", "ptw", "flra"]
 SelfSeverity = Literal["low", "medium", "high"]
 
 
@@ -86,12 +86,40 @@ class TriageBody(BaseModel):
 class ConvertBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    target: Literal["observation", "near_miss", "incident"]
+    target: Literal["observation", "near_miss", "incident", "ptw", "flra"]
     # officer can override/complete the narrative before conversion; when
     # absent a description is synthesised from category labels + transcript.
     description: str | None = None
     # incident conversions must classify the initial type (existing Phase-1 contract)
     incidentType: str | None = None
+
+    # ── PTW conversion: the authorisation-chain fields a field technician
+    # cannot supply — the officer completes them at triage (spec §8.2). ──
+    permitType: str | None = None
+    validFrom: datetime | None = None
+    validTo: datetime | None = None
+    issuerId: str | None = None
+    receiverId: str | None = None
+
+    # ── FLRA conversion: crew + toolbox-talk the officer supplies. ──
+    teamMemberIds: list[str] = Field(default_factory=list)
+    toolboxTalkById: str | None = None
+
+
+class CleanupTextBody(BaseModel):
+    """AI grammar/clarity cleanup request (spec §7a)."""
+    model_config = ConfigDict(extra="ignore")
+
+    text: str = Field(min_length=1, max_length=4000)
+    lang: str = "hi"
+
+
+class SuggestCategoryBody(BaseModel):
+    """Text → hazard category suggestion request (spec §7b)."""
+    model_config = ConfigDict(extra="ignore")
+
+    text: str = Field(min_length=1, max_length=4000)
+    lang: str = "hi"
 
 
 class RejectBody(BaseModel):

@@ -1,8 +1,9 @@
 """MOC (Management of Change) router. Mounts at /api/moc.
 
-Phase 1 vertical slice — the change-request register + lifecycle. Reads are
-open (like the EAI/Skill-Matrix reads); writes (create / transition / approve)
-require an authenticated user.
+Phase 1 vertical slice — the change-request register + lifecycle. Every
+endpoint requires an authenticated user; reads are scoped to the caller's
+MOC.READ plants and writes/approvals are authorised per-record via can()
+(MOC.CREATE / MOC.UPDATE / MOC.APPROVE) against the change request's plant.
 
 Endpoints:
   GET  /api/moc/metrics                         — landing aggregates for a plant
@@ -31,7 +32,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, require_permission_with_context
 from app.models.moc import (
     ChangeRequest,
     MocApprovalStep,
@@ -42,6 +43,7 @@ from app.models.moc import (
 )
 from app.models.plant import Plant
 from app.models.user import User
+from app.services.access_scope import build_query_scope
 
 router = APIRouter(prefix="/api/moc", tags=["moc"])
 
@@ -158,11 +160,50 @@ def _cr_list_item(cr: ChangeRequest) -> dict:
     }
 
 
+async def _require_moc_read(db: AsyncSession, user: User, plant_id: str | None) -> None:
+    """Authorise a MOC read against a specific plant (or plant-agnostic when
+    plant_id is None). Uses the permission-specific plant scope so an
+    OWN_DEPARTMENT MOC.READ grant can't read another plant's register — fail
+    closed for OWN_DEPARTMENT/OWN_RECORDS, unlike can(plant_id=…)."""
+    scope = await build_query_scope(db, user.id, "MOC.READ")
+    if plant_id is None:
+        if scope.all_plants or scope.plant_ids:
+            return
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
+    if not scope.allows_plant(plant_id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied for this plant")
+
+
+async def _fire_moc_hira_review(db: AsyncSession, cr: ChangeRequest) -> None:
+    """Cascade an approved change into HIRA re-review cycles for the registers
+    it touches (spec §6 — MOC→HIRA). The receiver is debounced, so calling this
+    on both the transition and approval paths is safe."""
+    from app.services.hira_moc_receiver import trigger_hira_review_for_moc
+
+    await trigger_hira_review_for_moc(
+        db,
+        moc_id=cr.id,
+        change_scope={
+            "plant_id": cr.plantId,
+            "department_id": cr.departmentId,
+            "area_ids": list(cr.affectedLocations or []),
+            "equipment_ids": list(cr.affectedEquipmentIds or []),
+            "process_codes": list(cr.affectedProcesses or []),
+            "implementation_date": cr.proposedImplementationDate or cr.targetCompletionDate,
+        },
+    )
+
+
 # ─── Reads ────────────────────────────────────────────────────────────
 
 
 @router.get("/metrics")
-async def metrics(plantId: str = Query(...), db: AsyncSession = Depends(get_db)) -> dict:
+async def metrics(
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    await _require_moc_read(db, user, plantId)
     rows = (
         await db.execute(select(ChangeRequest).where(ChangeRequest.plantId == plantId))
     ).scalars().all()
@@ -212,7 +253,9 @@ async def list_change_requests(
     classification: str | None = Query(None),
     q: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict:
+    await _require_moc_read(db, user, plantId)
     stmt = select(ChangeRequest).where(ChangeRequest.plantId == plantId)
     if status_:
         stmt = stmt.where(ChangeRequest.status == status_)
@@ -234,10 +277,15 @@ async def list_change_requests(
 
 
 @router.get("/change-requests/{cr_id}")
-async def get_change_request(cr_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+async def get_change_request(
+    cr_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
     cr = await db.get(ChangeRequest, cr_id)
     if cr is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Change request not found")
+    await _require_moc_read(db, user, cr.plantId)
 
     steps = (
         await db.execute(
@@ -353,8 +401,11 @@ async def get_change_request(cr_id: str, db: AsyncSession = Depends(get_db)) -> 
 
 @router.get("/freezes")
 async def list_freezes(
-    plantId: str | None = Query(None), db: AsyncSession = Depends(get_db)
+    plantId: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> list[dict]:
+    await _require_moc_read(db, user, plantId)
     rows = (
         await db.execute(select(MocFreeze).where(MocFreeze.isActive.is_(True)))
     ).scalars().all()
@@ -388,6 +439,7 @@ async def create_change_request(
     plant = await db.get(Plant, payload.plantId)
     if plant is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plant not found")
+    await require_permission_with_context("MOC.CREATE", user, db, plant_id=payload.plantId)
 
     # Block submission (not draft) when an active freeze covers this plant.
     if payload.submit:
@@ -459,6 +511,12 @@ async def transition(
     cr = await db.get(ChangeRequest, cr_id)
     if cr is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Change request not found")
+    await require_permission_with_context("MOC.UPDATE", user, db, plant_id=cr.plantId)
+    # Segregation of duties: reaching the approved state through a raw transition
+    # still requires approval authority — otherwise a MOC.UPDATE-only holder could
+    # bypass MOC.APPROVE and the approval workflow entirely.
+    if payload.toStatus == "approved_pending_implementation":
+        await require_permission_with_context("MOC.APPROVE", user, db, plant_id=cr.plantId)
     if cr.status in CLOSED_STATES:
         raise HTTPException(status.HTTP_409_CONFLICT, f"Change request is closed ({cr.status})")
 
@@ -493,6 +551,8 @@ async def transition(
     if payload.toStatus == "approved_pending_implementation":
         from app.services.capa_spawn import spawn_moc_capas
         moc_capa = await spawn_moc_capas(db, cr, user.id)
+        # MOC→HIRA cascade: flag affected HIRA entries for re-review (spec §6).
+        await _fire_moc_hira_review(db, cr)
 
     if payload.toStatus == "implementation_in_progress" and cr.actualImplementationDate is None:
         cr.actualImplementationDate = datetime.now(timezone.utc)
@@ -537,6 +597,14 @@ async def approve(
     cr = await db.get(ChangeRequest, cr_id)
     if cr is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Change request not found")
+    await require_permission_with_context("MOC.APPROVE", user, db, plant_id=cr.plantId)
+
+    # NOTE: spec §5 wants a mandatory impact/risk assessment before approval, but
+    # there is currently no runtime path that CREATES a MocImpactAssessment (it is
+    # only produced by prisma/seed-moc.ts). Hard-gating approval on it here would
+    # make every app-created change request un-approvable. The gate is therefore
+    # deferred until an assessment-create endpoint + UI exist — tracked as a known
+    # gap, not enforced, to avoid blocking the live approval flow.
 
     steps = (
         await db.execute(
@@ -575,6 +643,12 @@ async def approve(
                 rationale=f"Approval step {pending.sequence} {payload.decision}",
             )
         )
+        # Final approval reached → spawn the implementation-tracking CAPA (I-18,
+        # parity with the /transition path) and cascade HIRA re-reviews (spec §6).
+        if new_status == "approved_pending_implementation":
+            from app.services.capa_spawn import spawn_moc_capas
+            await spawn_moc_capas(db, cr, user.id)
+            await _fire_moc_hira_review(db, cr)
     await db.commit()
     return {"id": cr.id, "status": cr.status, "stepDecision": payload.decision}
 
@@ -592,6 +666,10 @@ async def update_dependent_record(
     dep = await db.get(MocDependentRecord, dep_id)
     if dep is None or dep.changeRequestId != cr_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dependent record not found")
+    cr = await db.get(ChangeRequest, cr_id)
+    if cr is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Change request not found")
+    await require_permission_with_context("MOC.UPDATE", user, db, plant_id=cr.plantId)
     dep.updateStatus = payload.updateStatus
     dep.updateEvidence = payload.updateEvidence
     dep.updatedByUserId = user.id
@@ -602,19 +680,27 @@ async def update_dependent_record(
 
 @router.get("/active-for-equipment")
 async def active_for_equipment(
-    equipmentId: str = Query(...), db: AsyncSession = Depends(get_db)
+    equipmentId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Active (non-closed) change requests affecting a given equipment id.
 
     The PTW module calls this at permit creation — equipment under an active
     MOC should warn the issuer / require elevated authorisation (spec §6.6).
+    Results are scoped to the caller's MOC.READ plants.
     """
+    scope = await build_query_scope(db, user.id, "MOC.READ")
     rows = (
         await db.execute(
             select(ChangeRequest).where(~ChangeRequest.status.in_(CLOSED_STATES))
         )
     ).scalars().all()
-    matches = [cr for cr in rows if equipmentId in (cr.affectedEquipmentIds or [])]
+    matches = [
+        cr
+        for cr in rows
+        if equipmentId in (cr.affectedEquipmentIds or []) and scope.allows_plant(cr.plantId)
+    ]
     implementing = any(cr.status == "implementation_in_progress" for cr in matches)
     return {
         "equipmentId": equipmentId,
@@ -628,7 +714,12 @@ async def active_for_equipment(
 
 
 @router.get("/export.csv")
-async def export_csv(plantId: str = Query(...), db: AsyncSession = Depends(get_db)) -> Response:
+async def export_csv(
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    await _require_moc_read(db, user, plantId)
     rows = (
         await db.execute(
             select(ChangeRequest)

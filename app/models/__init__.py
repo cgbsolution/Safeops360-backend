@@ -181,6 +181,16 @@ from app.models.incident import (
     IncidentStatus,
     IncidentType,
 )
+from app.models.incident_intel import (
+    CompetencyMapping,
+    GoldenThreadLink,
+    PlantCostConfig,
+    StatutoryFormInstance,
+    StatutoryTemplate,
+    WhatsappInboundLog,
+    WhatsappSender,
+    WhatsappTemplate,
+)
 from app.models.licensing import FactoryModuleEntitlement, LicenceInstallation
 from app.models.manhours import Manhours
 from app.models.masters import Department, MasterItem

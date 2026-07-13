@@ -202,10 +202,18 @@ async def forgot_password(
     otp = f"{secrets.randbelow(900_000) + 100_000}"  # 6-digit
     if row is not None:
         _OTP_STORE[email] = {"otp": otp, "expiresAt": time.time() + _OTP_TTL_SECONDS}
-        log.info("Password-reset OTP issued for %s: %s (dev mode)", email, otp)
-    # Dev convenience: surface the OTP in the response body in non-production
-    # so QA can complete the flow without an email gateway. Strip in prod.
-    dev_otp = otp if (row is not None and not settings.is_production) else None
+        # Never write the OTP value to logs (logs persist and may be shipped);
+        # record only that an OTP was issued, and only outside production.
+        if not settings.is_production:
+            log.info("Password-reset OTP issued for %s", email)
+    # Dev convenience: surface the OTP in the response body ONLY when explicitly
+    # opted in via EXPOSE_DEV_OTP (off by default). Gating on APP_ENV alone was
+    # unsafe — the deployed env runs as 'development', which would leak the OTP.
+    dev_otp = (
+        otp
+        if (row is not None and settings.expose_dev_otp and not settings.is_production)
+        else None
+    )
     return ForgotPasswordResponse(ok=True, dev_otp=dev_otp)
 
 
@@ -218,7 +226,7 @@ async def verify_otp(payload: VerifyOtpRequest) -> VerifyOtpResponse:
     if entry["expiresAt"] < time.time():
         _OTP_STORE.pop(email, None)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "OTP expired")
-    if entry["otp"] != payload.otp:
+    if not secrets.compare_digest(str(entry["otp"]), str(payload.otp)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid OTP")
 
     # Burn the OTP so it can't be reused.

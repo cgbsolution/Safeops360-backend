@@ -53,6 +53,7 @@ from app.routers import (
     incidents,
     inspections,
     jobs,
+    whatsapp,
     kaizen,
     licensing,
     manhours,
@@ -109,6 +110,10 @@ _ROUTERS = {
     # Daily Alert Brief (ALERTS module) — same dev-licence situation; add
     # "alerts": "ALERTS" to ROUTER_MODULE once a licence including it is issued.
     "alerts": alerts,
+    # WhatsApp-native capture (Incident Intelligence Slice 2, Feature 6) — a new
+    # input adapter into the existing incident workflow. Mounted ungated; the
+    # webhook is public (Meta/BSP calls it) and self-guards via sender identity.
+    "whatsapp": whatsapp,
 }
 
 
@@ -189,6 +194,7 @@ def create_app() -> FastAPI:
     from app.models.erm_p2 import LossEvent
     from app.models.erm_t3 import Control
     from app.models.incident import Incident
+    from app.models.incident_intel import GoldenThreadLink, StatutoryFormInstance, WhatsappSender
     from app.models.permit import Permit
     from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
     from app.models.rca import RcaIdentifiedCause, RcaRiskLink, RootCauseAnalysis
@@ -207,6 +213,9 @@ def create_app() -> FastAPI:
         FireEquipment, FireEmergencyPlan, FireDrill,
         RootCauseAnalysis, RcaIdentifiedCause, RcaRiskLink,
         CaptureSubmission, RcaFieldRequest, Alert,
+        # Incident Intelligence Slice 2 — golden-thread links, generated statutory
+        # forms, and WhatsApp sender identity are all audit-worthy.
+        GoldenThreadLink, StatutoryFormInstance, WhatsappSender,
         # Safety Culture — score recalcs, walk logging, survey admin & recognition
         # awards write to the tamper-evident hash-chain (§Cross-cutting). The
         # integrity-review outcome is auditable too (who cleared/upheld a flag).

@@ -21,6 +21,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi import HTTPException, status
+
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.models.competency_matrix import (
@@ -30,9 +32,26 @@ from app.models.competency_matrix import (
     RoleDefinition,
 )
 from app.models.user import User
+from app.services.access_scope import build_query_scope
 from app.services.competency_state import sync_plant_from_training
 
 router = APIRouter(prefix="/api/skill-matrix", tags=["skill-matrix"])
+
+
+async def _require_skill_matrix_read(db: AsyncSession, user: User, plant_id: str | None = None) -> None:
+    """Authorise a Skill-Matrix read. The matrix carries employee competency
+    PII, so this is the P0 gate. Uses the permission-SPECIFIC plant scope
+    (build_query_scope), which fails CLOSED for OWN_DEPARTMENT / OWN_RECORDS
+    grants — unlike can(plant_id=…), which only enforces plant for OWN_PLANT
+    and would let a WORKER read any plant's matrix."""
+    scope = await build_query_scope(db, user.id, "SKILL_MATRIX.READ")
+    if plant_id is None:
+        # Catalog read (no plant axis): require holding SKILL_MATRIX.READ at all.
+        if scope.all_plants or scope.plant_ids:
+            return
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
+    if not scope.allows_plant(plant_id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied for this plant")
 
 
 @router.post("/sync-from-training")
@@ -46,6 +65,7 @@ async def sync_from_training(
     with unchanged training is a no-op. Each cell that moves writes an audit
     version row.
     """
+    await _require_skill_matrix_read(db, user, plantId)
     stats = await sync_plant_from_training(db, plant_id=plantId, actor_user_id=user.id)
     return {"plantId": plantId, **stats}
 
@@ -56,7 +76,9 @@ async def list_competencies(
     q: str | None = Query(None, description="Free-text search on name/code"),
     limit: int = Query(300, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> list[dict]:
+    await _require_skill_matrix_read(db, user)
     stmt = select(Competency).where(Competency.isActive.is_(True))
     if category:
         stmt = stmt.where(Competency.category == category)
@@ -85,7 +107,11 @@ async def list_competencies(
 
 
 @router.get("/role-definitions")
-async def list_role_definitions(db: AsyncSession = Depends(get_db)) -> list[dict]:
+async def list_role_definitions(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    await _require_skill_matrix_read(db, user)
     rows = (
         await db.execute(
             select(RoleDefinition)
@@ -126,6 +152,7 @@ async def get_matrix(
     plantId: str = Query(..., description="Plant to scope the matrix to"),
     category: str | None = Query(None, description="Restrict columns to one category"),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Person × competency grid for a plant.
 
@@ -133,6 +160,7 @@ async def get_matrix(
     (optionally filtered to one category); rows are the people who hold any
     record. Each cell carries the lifecycle state so the UI can RAG-colour it.
     """
+    await _require_skill_matrix_read(db, user, plantId)
     records = (
         await db.execute(
             select(CompetencyRecord).where(CompetencyRecord.plantId == plantId)

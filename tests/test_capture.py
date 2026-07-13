@@ -118,3 +118,119 @@ def test_synth_description_prefers_english_transcript():
 def test_synth_description_falls_back_to_original_transcript():
     sub = _sub(transcriptOriginal="कटिंग मशीन 3 पर गार्ड नहीं है")
     assert "कटिंग मशीन 3" in svc.synth_description(sub)
+
+
+# ── Mobile Field Capture layer: 5 flows routed through triage (spec §2/§8.2) ──
+def test_submission_create_accepts_all_five_flow_types():
+    from app.schemas.capture import SubmissionCreate
+
+    for flow in ("observation", "near_miss", "unsafe_condition", "incident", "ptw", "flra"):
+        m = SubmissionCreate(clientSubmissionId="abcd1234", type=flow)
+        assert m.type == flow
+
+
+def test_submission_create_rejects_unknown_type():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.schemas.capture import SubmissionCreate
+
+    with pytest.raises(ValidationError):
+        SubmissionCreate(clientSubmissionId="abcd1234", type="banana")
+
+
+def test_convert_body_carries_ptw_authorisation_fields():
+    from datetime import datetime, timezone
+
+    from app.schemas.capture import ConvertBody
+
+    b = ConvertBody(
+        target="ptw",
+        permitType="HOT_WORK",
+        validFrom=datetime(2026, 7, 11, 10, tzinfo=timezone.utc),
+        validTo=datetime(2026, 7, 11, 14, tzinfo=timezone.utc),
+        issuerId="u1",
+        receiverId="u2",
+    )
+    assert b.target == "ptw" and b.issuerId == "u1" and b.receiverId == "u2"
+
+
+def test_convert_body_carries_flra_crew_and_toolbox():
+    from app.schemas.capture import ConvertBody
+
+    b = ConvertBody(target="flra", teamMemberIds=["u1", "u2"], toolboxTalkById="u3")
+    assert b.target == "flra" and b.teamMemberIds == ["u1", "u2"] and b.toolboxTalkById == "u3"
+
+
+def test_convert_body_defaults_and_rejects_unknown_target():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.schemas.capture import ConvertBody
+
+    base = ConvertBody(target="observation")
+    assert base.teamMemberIds == [] and base.permitType is None and base.toolboxTalkById is None
+    with pytest.raises(ValidationError):
+        ConvertBody(target="permit")  # not one of the five targets
+
+
+def test_ai_request_bodies_validate_length():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.schemas.capture import CleanupTextBody, SuggestCategoryBody
+
+    assert CleanupTextBody(text="guard missing").lang == "hi"  # default lang
+    with pytest.raises(ValidationError):
+        CleanupTextBody(text="")
+    with pytest.raises(ValidationError):
+        SuggestCategoryBody(text="x" * 4001)
+
+
+# ── AI text assist: fail-soft + fact-preserving guards (spec §7) ──────────────
+async def test_cleanup_text_guards_reject_short_and_long_input():
+    from app.services.ai.capture_providers import cleanup_text
+
+    assert await cleanup_text("ab", "hi") is None      # too short — no API call
+    assert await cleanup_text("x" * 4001, "hi") is None  # too long — no API call
+
+
+async def test_cleanup_text_fails_soft_when_ai_unavailable(monkeypatch):
+    import app.services.ai.anthropic_client as ac
+
+    async def _none(**_kwargs):
+        return None
+
+    monkeypatch.setattr(ac, "complete_json", _none)
+    from app.services.ai.capture_providers import cleanup_text
+
+    assert await cleanup_text("guard missing on press 3 for two days", "en") is None
+
+
+async def test_cleanup_text_returns_cleaned_when_available(monkeypatch):
+    import app.services.ai.anthropic_client as ac
+
+    async def _clean(**_kwargs):
+        return {"cleaned": "The guard is missing on press 3."}
+
+    monkeypatch.setattr(ac, "complete_json", _clean)
+    from app.services.ai.capture_providers import cleanup_text
+
+    assert await cleanup_text("guard missing press 3", "en") == "The guard is missing on press 3."
+
+
+async def test_suggest_category_from_text_guards_and_maps(monkeypatch):
+    from app.services.ai.capture_providers import suggest_category_from_text
+
+    assert await suggest_category_from_text("ab", [], "hi") is None  # too short — no API call
+
+    import app.services.ai.anthropic_client as ac
+
+    async def _cat(**_kwargs):
+        return {"l1Code": "electrical", "l2Code": None, "confidence": 0.9}
+
+    monkeypatch.setattr(ac, "complete_json", _cat)
+    out = await suggest_category_from_text(
+        "sparks from the panel", [{"code": "electrical", "labels": {"en": "Electrical"}}], "en"
+    )
+    assert out is not None and out["l1Code"] == "electrical" and out["confidence"] == 0.9

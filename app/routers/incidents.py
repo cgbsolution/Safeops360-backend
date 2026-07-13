@@ -31,8 +31,11 @@ from app.models.permit import Permit
 from app.models.plant import Plant
 from app.models.user import User
 from app.schemas.incident import (
+    AiSuggestionDecision,
+    AiSummaryDecision,
     AttachmentInit,
     AttachmentOut,
+    CauseAnalysisPatch,
     CommentInput,
     CommentOut,
     DocumentReviewInput,
@@ -50,13 +53,22 @@ from app.schemas.incident import (
     IncidentUpdate,
     PersonOut,
     PersonUpdate,
+    SeverityScoreRequest,
     StatutorySubmissionUpdate,
     TimelineEventInput,
     TimelineEventOut,
     WitnessStatementOut,
     WitnessStatementUpdate,
 )
-from app.services import workflow_engine
+from app.services import (
+    golden_thread,
+    incident_ai,
+    incident_severity,
+    incident_similarity,
+    statutory_forms,
+    workflow_engine,
+)
+from app.services.audit_log import record_event
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -444,6 +456,14 @@ async def create_incident(
             nm.promotedAt = datetime.now(timezone.utc)
             await db.flush()
 
+    # Feature 3 → 5 — a new incident raises the recurrence count for prior
+    # open incidents in the same equipment category; re-score them so their
+    # likelihood/escalation stays current. Best-effort, never blocks creation.
+    try:
+        await incident_severity.recompute_affected_by(db, incident, actor_id=user.id)
+    except Exception:  # noqa: BLE001
+        pass
+
     return IncidentOut.model_validate(incident)
 
 
@@ -627,6 +647,27 @@ async def classify_incident(
             )
         )
 
+    # ─── Feature 5 — numeric 5×5 severity scoring + escalation. Runs before
+    # the workflow approve so the derived band flows into the CHECKER
+    # record_data (Plant Head review condition, slaBySeverity, etc.). When the
+    # classifier sends consequenceScore the score drives the label; otherwise
+    # it floors at the label they picked and never downgrades it. ───
+    await incident_severity.apply_severity_scoring(
+        db,
+        incident,
+        consequence_score=payload.consequenceScore,
+        likelihood_override=payload.likelihoodOfRecurrence,
+        linked_risk_id=payload.linkedRiskRegisterId,
+        actor_id=user.id,
+    )
+
+    # ─── Feature 4 — determine statutory obligation at classification (Checker
+    # stage). A non-reportable, property-damage-only incident yields zero forms. ───
+    try:
+        incident.statutoryObligation = await statutory_forms.determine_obligation(db, incident)
+    except Exception:  # noqa: BLE001
+        pass
+
     await db.flush()
     await db.refresh(incident)
 
@@ -661,6 +702,425 @@ async def classify_incident(
         ) from e
 
     return IncidentOut.model_validate(incident)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Incident Intelligence (Slice 1) — Features 1 (RCA canvas), 2 (AI chips),
+#  5 (numeric severity). Every AI-touched field is marked in `aiAssist` and
+#  requires human acceptance; every AI/scoring action writes to the audit
+#  trail. AI endpoints are fail-soft (200 + null on provider failure).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _load_incident_for_update(
+    db: AsyncSession, incident_id: str, user: User, permission: str = "INCIDENT.UPDATE"
+) -> Incident:
+    incident = await db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
+    record = {"reporterId": incident.reporterId, "investigationTeamLead": incident.investigationTeamLead}
+    result = await can(
+        db, user.id, permission,
+        PermissionContext(record_id=incident.id, plant_id=incident.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    return incident
+
+
+@router.post("/{incident_id}/severity", response_model=IncidentOut)
+async def score_severity(
+    incident_id: str,
+    payload: SeverityScoreRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> IncidentOut:
+    """Feature 5 — (re)compute the numeric severity score + run escalation.
+    Called from the investigation UI, and automatically when a new similar
+    incident changes the recurrence likelihood."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    await incident_severity.apply_severity_scoring(
+        db, incident,
+        consequence_score=payload.consequenceScore,
+        likelihood_override=payload.likelihoodOfRecurrence,
+        linked_risk_id=payload.linkedRiskRegisterId,
+        actor_id=user.id,
+    )
+    await db.flush()
+    await db.refresh(incident)
+    return IncidentOut.model_validate(incident)
+
+
+@router.patch("/{incident_id}/cause-analysis", response_model=IncidentOut)
+async def patch_cause_analysis(
+    incident_id: str,
+    payload: CauseAnalysisPatch,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> IncidentOut:
+    """Feature 1 — method-agnostic upsert of the RCA canvas. Both the Fishbone
+    and 5-Why views write the same `rootCauseData`; the denormalised cause
+    arrays + plain-English summary are re-derived here."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    if payload.rootCauseMethod is not None:
+        incident.rootCauseMethod = normalise_rca_method(payload.rootCauseMethod)
+    if payload.rootCauseData is not None:
+        incident.rootCauseData = payload.rootCauseData or None
+        method = normalise_rca_method(incident.rootCauseMethod)
+        incident.rootCauseSummary = (
+            generate_rca_summary(method, payload.rootCauseData) if method else None
+        )
+    # Feature 1 — the shared canvas model. Persist it and derive the queryable
+    # `rootCauses` array from the nodes flagged isRootCause, so switching between
+    # Fishbone and 5-Why (which write the same `causes[]`) never loses data.
+    if payload.causeAnalysis is not None:
+        ca = dict(payload.causeAnalysis)
+        ca["lastEditedBy"] = user.id
+        ca["lastEditedAt"] = datetime.now(timezone.utc).isoformat()
+        incident.causeAnalysis = ca
+        causes = ca.get("causes") or []
+        derived_roots = [c.get("text") for c in causes if c.get("isRootCause") and c.get("text")]
+        if derived_roots:
+            incident.rootCauses = derived_roots
+    for fld in ("immediateCauses", "underlyingCauses", "rootCauses", "contributingFactors"):
+        v = getattr(payload, fld)
+        if v is not None:
+            setattr(incident, fld, v or None)
+    await db.flush()
+    await db.refresh(incident)
+    return IncidentOut.model_validate(incident)
+
+
+@router.post("/{incident_id}/cause-analysis/suggest")
+async def suggest_root_cause_endpoint(
+    incident_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 2 — AI root-cause suggestion with COMPUTED confidence. Fail-soft:
+    returns {suggestion: null} (never 500) when the provider is unavailable."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    suggestion = await incident_ai.suggest_root_cause(db, incident)
+    if suggestion is None:
+        return {"suggestion": None, "available": incident_ai.available(), "reason": "AI suggestion unavailable"}
+    rec = {
+        **suggestion,
+        "source": "ai_suggested",
+        "status": "pending",
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    incident.aiAssist = {**(incident.aiAssist or {}), "rootCauseSuggestion": rec}
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="AI_ROOT_CAUSE_SUGGESTED",
+        after={"confidence": rec["confidence"], "basedOnIncidentIds": rec["basedOnIncidentIds"]},
+    )
+    await db.flush()
+    return {"suggestion": rec}
+
+
+@router.post("/{incident_id}/cause-analysis/suggestion/accept")
+async def accept_root_cause_suggestion(
+    incident_id: str,
+    payload: AiSuggestionDecision,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 2 — accept (optionally edited) an AI root-cause suggestion."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    ai = dict(incident.aiAssist or {})
+    rec = dict(ai.get("rootCauseSuggestion") or {})
+    if not rec:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No AI suggestion to accept.")
+    edited = bool(payload.text and payload.text.strip() and payload.text.strip() != rec.get("text"))
+    if payload.text and payload.text.strip():
+        rec["text"] = payload.text.strip()
+    rec["status"] = "edited" if edited else "accepted"
+    rec["acceptedById"] = user.id
+    rec["acceptedAt"] = datetime.now(timezone.utc).isoformat()
+    ai["rootCauseSuggestion"] = rec
+    incident.aiAssist = ai
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="AI_ROOT_CAUSE_ACCEPTED",
+        after={"status": rec["status"], "text": rec["text"]},
+    )
+    await db.flush()
+    return {"suggestion": rec}
+
+
+@router.post("/{incident_id}/cause-analysis/suggestion/reject")
+async def reject_root_cause_suggestion(
+    incident_id: str,
+    payload: AiSuggestionDecision,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 2 — reject an AI suggestion, logging the reason to the audit
+    trail (optional free text, per spec)."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    ai = dict(incident.aiAssist or {})
+    rec = dict(ai.get("rootCauseSuggestion") or {})
+    if not rec:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No AI suggestion to reject.")
+    rec["status"] = "rejected"
+    rec["rejectedById"] = user.id
+    rec["rejectedAt"] = datetime.now(timezone.utc).isoformat()
+    rec["rejectionReason"] = payload.reason
+    ai["rootCauseSuggestion"] = rec
+    incident.aiAssist = ai
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="AI_ROOT_CAUSE_REJECTED",
+        after={"status": "rejected"}, reason=payload.reason,
+    )
+    await db.flush()
+    return {"suggestion": rec}
+
+
+@router.post("/{incident_id}/ai/summary")
+async def draft_ai_summary(
+    incident_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 2 — draft an AI incident summary. Marked `ai_drafted` until a
+    human accepts. Fail-soft (200 + null when unavailable)."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    result = await incident_ai.draft_summary(db, incident)
+    if result is None:
+        return {"summary": None, "available": incident_ai.available(), "reason": "AI summary unavailable"}
+    incident.aiAssist = {
+        **(incident.aiAssist or {}),
+        "summary": result["summary"],
+        "summarySource": "ai_drafted",
+        "summaryGeneratedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="AI_SUMMARY_DRAFTED",
+    )
+    await db.flush()
+    return {"summary": result["summary"], "summarySource": "ai_drafted"}
+
+
+@router.post("/{incident_id}/ai/summary/accept")
+async def accept_ai_summary(
+    incident_id: str,
+    payload: AiSummaryDecision,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 2 — accept (optionally edited) the AI summary → human_confirmed."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    ai = dict(incident.aiAssist or {})
+    text = ((payload.text or ai.get("summary")) or "").strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No summary to accept.")
+    ai["summary"] = text
+    ai["summarySource"] = "human_confirmed"
+    ai["summaryConfirmedById"] = user.id
+    ai["summaryConfirmedAt"] = datetime.now(timezone.utc).isoformat()
+    incident.aiAssist = ai
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="AI_SUMMARY_ACCEPTED",
+    )
+    await db.flush()
+    return {"summary": text, "summarySource": "human_confirmed"}
+
+
+@router.get("/{incident_id}/similar")
+async def similar_incidents_endpoint(
+    incident_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 3 — trend tie-back. Rule-based similar-incident matches (0-100
+    score, 40-pt floor), powering the "N similar incidents this quarter" chip.
+    Only returns when at least one match clears the floor."""
+    incident = await db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
+    record = {"reporterId": incident.reporterId, "investigationTeamLead": incident.investigationTeamLead}
+    result = await can(
+        db, user.id, "INCIDENT.READ",
+        PermissionContext(record_id=incident.id, plant_id=incident.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    matches = await incident_similarity.similar_incidents(db, incident, only_closed=False, limit=10)
+    quarter_cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    quarter_count = sum(1 for m in matches if (m.get("date") or "") >= quarter_cutoff)
+    return {"matches": matches, "count": len(matches), "quarterCount": quarter_count}
+
+
+@router.get("/{incident_id}/downstream-impact")
+async def downstream_impact_endpoint(
+    incident_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 7 — everything this incident touched (risk / training / audit /
+    capa), for the "Downstream impact" panel."""
+    incident = await db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
+    result = await can(
+        db, user.id, "INCIDENT.READ",
+        PermissionContext(record_id=incident.id, plant_id=incident.plantId, record={"reporterId": incident.reporterId}),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    return {"links": await golden_thread.downstream_impact(db, incident_id)}
+
+
+@router.get("/provenance/{target_type}/{target_id}")
+async def golden_thread_provenance(
+    target_type: str,
+    target_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Feature 7 — provenance lookup: which incident(s) touched this downstream
+    record. Powers the "Updated from INC-…" tags on risk/training/audit modules."""
+    return {"sources": await golden_thread.links_for_target(db, target_type, target_id)}
+
+
+@router.post("/{incident_id}/reopen", response_model=IncidentOut)
+async def reopen_incident(
+    incident_id: str,
+    payload: AiSuggestionDecision,  # reuse {reason}
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> IncidentOut:
+    """Feature 7 — reopen a closed incident and walk back the golden thread
+    (cancel still-open triggered training, mark links reversed). Minimal reopen:
+    flips status back to INVESTIGATION; a fresh investigation/closure re-runs the
+    normal flow."""
+    incident = await _load_incident_for_update(db, incident_id, user, permission="INCIDENT.APPROVE")
+    if incident.status != IncidentStatus.CLOSED:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only a closed incident can be reopened.")
+    incident.status = IncidentStatus.INVESTIGATION
+    incident.closedAt = None
+    incident.closedById = None
+    reversed_n = await golden_thread.reverse_for_incident(db, incident_id, actor_id=user.id)
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="REOPENED", reason=payload.reason,
+        after={"reversedLinks": reversed_n},
+    )
+    try:
+        from app.services import events
+
+        events.emit(db, event_type="incident.reopened", entity_type="Incident",
+                    entity_id=incident.id, entity_ref=incident.number, site_id=incident.plantId,
+                    actor_id=user.id, payload={"reversedLinks": reversed_n})
+    except Exception:  # noqa: BLE001
+        pass
+    await db.flush()
+    await db.refresh(incident)
+    return IncidentOut.model_validate(incident)
+
+
+# ─── Feature 4 — Statutory form generation ──────────────────────────────────
+
+
+@router.post("/{incident_id}/generate-statutory-form/{form_type}")
+async def generate_statutory_form(
+    incident_id: str,
+    form_type: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Generate an immutable filled statutory form (new version each call)."""
+    incident = await _load_incident_for_update(db, incident_id, user)
+    if incident.statutoryObligation is None:
+        incident.statutoryObligation = await statutory_forms.determine_obligation(db, incident)
+    inst = await statutory_forms.generate_form(db, incident, form_type, actor_id=user.id)
+    await record_event(
+        db, entity_type="Incident", entity_id=incident.id, entity_code=incident.number,
+        plant_id=incident.plantId, action="STATUTORY_FORM_GENERATED",
+        after={"formType": form_type, "version": inst.version, "instanceId": inst.id},
+    )
+    await db.flush()
+    return {
+        "id": inst.id, "formType": inst.formType, "version": inst.version,
+        "fileName": inst.fileName, "jurisdiction": inst.jurisdiction,
+    }
+
+
+@router.get("/{incident_id}/statutory-forms")
+async def list_statutory_forms(
+    incident_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """List generated statutory forms + the determined obligation."""
+    from app.models.incident_intel import StatutoryFormInstance
+
+    incident = await db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
+    result = await can(
+        db, user.id, "INCIDENT.READ",
+        PermissionContext(record_id=incident.id, plant_id=incident.plantId, record={"reporterId": incident.reporterId}),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    rows = (
+        await db.execute(
+            select(StatutoryFormInstance)
+            .where(StatutoryFormInstance.incidentId == incident_id)
+            .order_by(StatutoryFormInstance.createdAt.desc())
+        )
+    ).scalars().all()
+    return {
+        "obligation": incident.statutoryObligation or {"required": False, "forms": []},
+        "instances": [
+            {
+                "id": r.id, "formType": r.formType, "version": r.version, "fileName": r.fileName,
+                "jurisdiction": r.jurisdiction, "isCurrent": r.isCurrent,
+                "createdAt": r.createdAt.isoformat() if r.createdAt else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/{incident_id}/statutory-forms/{instance_id}/download")
+async def download_statutory_form(
+    incident_id: str,
+    instance_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview/download a generated form. Re-renders deterministically from the
+    immutable fieldData snapshot."""
+    import io
+
+    from fastapi.responses import StreamingResponse
+
+    from app.models.incident_intel import StatutoryFormInstance
+
+    incident = await db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
+    result = await can(
+        db, user.id, "INCIDENT.READ",
+        PermissionContext(record_id=incident.id, plant_id=incident.plantId, record={"reporterId": incident.reporterId}),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    inst = await db.get(StatutoryFormInstance, instance_id)
+    if inst is None or inst.incidentId != incident_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Form not found")
+    pdf_bytes = statutory_forms.rerender_instance(inst)
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{inst.fileName}"'},
+    )
 
 
 # ─── CAPA CRUD ───────────────────────────────────────────────────────────
@@ -730,6 +1190,7 @@ async def create_capa(
         description=payload.description,
         type=payload.type,
         rootCauseAddressed=payload.rootCauseAddressed,
+        linkedCauseId=payload.linkedCauseId,
         ownerId=payload.ownerId,
         targetDate=payload.targetDate,
         status="PENDING",

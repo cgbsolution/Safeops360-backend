@@ -128,6 +128,20 @@ DEFINITIONS: list[dict[str, Any]] = [
         ],
     },
     {
+        "module": "PTW",
+        "recordType": "LIFTING",
+        "name": "PTW — Lifting Operations",
+        "description": "Issuer → Safety Officer → Plant Head → Receiver + FLRA → Closure",
+        "steps": [
+            {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
+            {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
+            {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
+            {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
+            {"sequence": 5, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA", "approverField": "RECEIVER", "slaHours": 4},
+            {"sequence": 6, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+        ],
+    },
+    {
         "module": "INCIDENT",
         "recordType": None,
         "name": "Incident Investigation",

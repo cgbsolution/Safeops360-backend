@@ -40,6 +40,12 @@ class VisionSuggestion(TypedDict):
     confidence: float  # 0..1
 
 
+class CategorySuggestion(TypedDict):
+    l1Code: str | None
+    l2Code: str | None
+    confidence: float  # 0..1
+
+
 # ── Transcription ─────────────────────────────────────────────────────────────
 class ITranscriptionProvider(Protocol):
     name: str
@@ -167,9 +173,90 @@ def get_vision_provider(enabled: bool) -> IVisionSuggestProvider:
     return StubVisionProvider()
 
 
+# ── Text assist (spec §7: grammar cleanup + text→category suggestion) ─────────
+# Both reuse the platform's single Anthropic seam (complete_json) and fail soft
+# to None so the wizard degrades to "keep what the worker said / pick manually".
+
+_CLEANUP_SYSTEM = """You clean up short workplace-safety notes dictated or typed by a low-literacy \
+factory field worker in India. Fix grammar, spelling and clarity so the note reads as one or two \
+complete sentences.
+STRICT RULES — this is cleanup, NOT rewriting:
+- Do NOT add facts, causes, detail, or severity words that are not already in the note.
+- Do NOT remove any fact the worker stated.
+- Keep every machine name, equipment code, number, area name and measurement exactly as written.
+- Preserve the worker's meaning and their language (Hindi stays Hindi, English stays English).
+- If the note is already clear, return it unchanged.
+Respond ONLY with a JSON object: {"cleaned": "<the cleaned note>"}."""
+
+
+async def cleanup_text(text: str, lang: str) -> str | None:
+    """Grammar/clarity cleanup of a voice transcript or typed note (spec §7a).
+    Fact-preserving by construction (see system prompt). Returns None on any
+    failure so the caller keeps the original text."""
+    text = (text or "").strip()
+    if len(text) < 3 or len(text) > 4000:
+        return None
+    from app.services.ai.anthropic_client import complete_json
+
+    res = await complete_json(
+        system=_CLEANUP_SYSTEM,
+        user=f"LANG={lang}\nNote:\n{text}",
+        max_tokens=500,
+        temperature=0.1,
+    )
+    if not res:
+        return None
+    cleaned = str(res.get("cleaned") or "").strip()
+    # guard against a degenerate/empty answer — never return something shorter
+    # than a plausible cleanup of the input's first few words
+    return cleaned or None
+
+
+_TEXT_CAT_SYSTEM = """You are a factory-safety triage assistant for an Indian garment manufacturer.
+Given a short hazard note from a field worker and the hazard taxonomy (level-1 codes and their \
+level-2 children, each with an English label), pick the single best matching category.
+Respond ONLY with a JSON object:
+{"l1Code": <best level-1 code or null>, "l2Code": <best child code of that l1 or null>,
+ "confidence": <0..1 — how sure you are about l1Code>}.
+If the note matches no category, use nulls and confidence 0."""
+
+
+async def suggest_category_from_text(
+    text: str, taxonomy: list[dict[str, Any]], lang: str
+) -> CategorySuggestion | None:
+    """Text → suggested hazard category (spec §7b). Mirrors the vision provider
+    but keyed off the description text instead of a photo. Fail-soft to None."""
+    text = (text or "").strip()
+    if len(text) < 3 or len(text) > 4000:
+        return None
+    from app.services.ai.anthropic_client import complete_json
+
+    tax_lines = [
+        {"code": n.get("code"), "parent": n.get("parentCode"), "label": (n.get("labels") or {}).get("en")}
+        for n in taxonomy
+    ]
+    res = await complete_json(
+        system=_TEXT_CAT_SYSTEM,
+        user="Taxonomy:\n" + json.dumps(tax_lines, ensure_ascii=False) + f"\nLANG={lang}\nNote:\n{text}",
+        max_tokens=200,
+        temperature=0.1,
+    )
+    if not res:
+        return None
+    try:
+        return CategorySuggestion(
+            l1Code=res.get("l1Code"),
+            l2Code=res.get("l2Code"),
+            confidence=max(0.0, min(1.0, float(res.get("confidence") or 0))),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
 __all__ = [
     "TranscriptResult",
     "VisionSuggestion",
+    "CategorySuggestion",
     "ITranscriptionProvider",
     "IVisionSuggestProvider",
     "StubTranscriptionProvider",
@@ -177,4 +264,6 @@ __all__ = [
     "AnthropicVisionProvider",
     "get_transcription_provider",
     "get_vision_provider",
+    "cleanup_text",
+    "suggest_category_from_text",
 ]

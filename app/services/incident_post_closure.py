@@ -344,6 +344,132 @@ async def _rule_hira_review_trigger(db: AsyncSession, incident: Incident) -> dic
     }
 
 
+async def _rule_push_severity_to_risk(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """Feature 5 → golden-thread seed. On closure, if this incident is linked
+    to an enterprise risk (`severityDetail.linkedRiskRegisterId`), push its
+    likelihood/consequence back into that risk register entry as a data point,
+    so the incident's real-world outcome informs the risk's scoring — no manual
+    re-entry. Recorded on the risk's tamper-evident audit trail.
+
+    (Full bidirectional golden-thread propagation ships with Feature 7; this is
+    the first concrete integration hook, built now per spec.)"""
+    detail = incident.severityDetail or {}
+    risk_id = detail.get("linkedRiskRegisterId")
+    if not risk_id:
+        return {"ruleName": "Risk-register data point", "fired": False, "reason": "No linked enterprise risk."}
+
+    from app.models.erm import EnterpriseRisk
+    from app.services.audit_log import record_event
+
+    risk = await db.get(EnterpriseRisk, risk_id)
+    if risk is None:
+        return {"ruleName": "Risk-register data point", "fired": False, "reason": "Linked risk not found."}
+
+    data_point = {
+        "sourceIncidentId": incident.id,
+        "sourceIncidentNumber": incident.number,
+        "likelihoodOfRecurrence": detail.get("likelihoodOfRecurrence"),
+        "consequenceScore": detail.get("consequenceScore"),
+        "score": detail.get("score"),
+        "closedAt": (incident.closedAt or datetime.now(timezone.utc)).isoformat(),
+    }
+    try:
+        await record_event(
+            db,
+            entity_type="EnterpriseRisk",
+            entity_id=risk.id,
+            entity_code=getattr(risk, "riskCode", None) or getattr(risk, "code", None),
+            plant_id=incident.plantId,
+            action="INCIDENT_DATA_POINT",
+            after=data_point,
+            reason=f"Incident {incident.number} closed — recurrence/consequence data point.",
+        )
+    except Exception:  # noqa: BLE001 — the SAVEPOINT wrapper isolates this rule anyway
+        pass
+
+    from app.services import golden_thread
+
+    await golden_thread.propagate_risk(db, incident)
+    return {
+        "ruleName": "Risk-register data point",
+        "fired": True,
+        "reason": (
+            f"Pushed L={data_point['likelihoodOfRecurrence']}/C={data_point['consequenceScore']} "
+            f"(score {data_point['score']}) into risk {risk.id}."
+        ),
+    }
+
+
+async def _rule_gt_training(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """Feature 7 — create training assignments where a root cause maps to a
+    competency an involved operator lacks."""
+    from app.services import golden_thread
+
+    res = await golden_thread.propagate_training(db, incident)
+    return {
+        "ruleName": "Golden thread — training",
+        "fired": res.get("created", 0) > 0,
+        "reason": (
+            f"Created {res['created']} training assignment(s)."
+            if res.get("created")
+            else f"No training assignment created ({res.get('reason', 'no match')})."
+        ),
+    }
+
+
+async def _rule_gt_audit(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """Feature 7 — add a checkpoint to the next scheduled audit at this plant
+    against the control that failed."""
+    from app.services import golden_thread
+
+    res = await golden_thread.propagate_audit(db, incident)
+    return {
+        "ruleName": "Golden thread — audit checkpoint",
+        "fired": res.get("created", 0) > 0,
+        "reason": (
+            f"Added a checkpoint to audit {res.get('auditId')}."
+            if res.get("created")
+            else f"No audit checkpoint added ({res.get('reason', 'n/a')})."
+        ),
+    }
+
+
+async def _rule_cost_impact(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """Feature 8 — derive the cost-of-unsafety breakdown on closure using the
+    plant's cost config, so the plant rollup picks it up."""
+    from app.services import incident_cost
+
+    detail = await incident_cost.compute_cost_impact(db, incident)
+    return {
+        "ruleName": "Cost-of-unsafety",
+        "fired": _num(detail.get("totalCost")) > 0,
+        "reason": (
+            f"Total cost {detail.get('currency', 'INR')} {detail.get('totalCost', 0):,.0f} "
+            f"({detail.get('costConfidence')})."
+        ),
+    }
+
+
+def _num(v) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _rule_gt_capa(db: AsyncSession, incident: Incident) -> dict[str, Any]:
+    """Feature 7 — record traceability links for every CAPA on the incident so
+    they surface on the downstream-impact panel + stay linked to their cause."""
+    from app.services import golden_thread
+
+    res = await golden_thread.propagate_capa(db, incident)
+    return {
+        "ruleName": "Golden thread — CAPA links",
+        "fired": res.get("created", 0) > 0,
+        "reason": f"Linked {res.get('created', 0)} of {res.get('total', 0)} CAPA(s).",
+    }
+
+
 _ALL_RULES = [
     _rule_contractor_score,
     _rule_observation_crosslink,
@@ -352,6 +478,11 @@ _ALL_RULES = [
     _rule_effectiveness_review,
     _rule_training_trigger,
     _rule_hira_review_trigger,
+    _rule_push_severity_to_risk,
+    _rule_gt_training,
+    _rule_gt_audit,
+    _rule_gt_capa,
+    _rule_cost_impact,
 ]
 
 

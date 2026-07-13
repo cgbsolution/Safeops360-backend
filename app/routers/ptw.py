@@ -46,6 +46,7 @@ REQUIRED_TRAINING_CODES: dict[str, str] = {
     "CONFINED_SPACE": "TR-CSE-01",
     "WORK_AT_HEIGHT": "TR-WAH-01",
     "ELECTRICAL_LOTO": "TR-LOTO-01",
+    "LIFTING": "TR-LIFT-01",
 }
 
 PERMIT_TYPE_CODE: dict[str, str] = {
@@ -54,6 +55,7 @@ PERMIT_TYPE_CODE: dict[str, str] = {
     "WORK_AT_HEIGHT": "WAH",
     "EXCAVATION": "EXC",
     "ELECTRICAL_LOTO": "ELE",
+    "LIFTING": "LIFT",
     "GENERAL_COLD": "GC",
 }
 

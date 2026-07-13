@@ -14,12 +14,13 @@ job; an overdue job runs once (not N times).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.db import AsyncSessionLocal
 
@@ -220,14 +221,48 @@ async def _last_success(db, job_id: str) -> datetime | None:
     return row[0] if row and row[0] else None
 
 
-async def run_job(job_id: str, trigger: str = "MANUAL") -> dict[str, Any]:
-    """Execute one job in its own session + JobRun record. Never raises."""
-    from app.core.audit_context import set_system_actor
-    from app.models.job_run import JobRun
+def _advisory_key(job_id: str) -> int:
+    """Stable 63-bit signed int key for a Postgres advisory lock, per job_id."""
+    return int.from_bytes(hashlib.sha256(job_id.encode()).digest()[:8], "big", signed=True)
 
+
+async def run_job(job_id: str, trigger: str = "MANUAL") -> dict[str, Any]:
+    """Execute one job in its own session + JobRun record. Never raises.
+
+    Leader election for SCHEDULED runs: when several app replicas each run their
+    own supervisor loop, only ONE may execute a given job at a time — otherwise
+    escalation/digest emails double-send. We take a session-level Postgres
+    advisory lock keyed by job_id and hold its transaction OPEN for the whole
+    run (never committing the lock session), which pins the server backend so
+    the lock survives PgBouncer transaction pooling. MANUAL/API triggers bypass
+    the lock so an operator can always force a run.
+    """
     job = JOBS.get(job_id)
     if job is None:
         return {"error": f"unknown job {job_id}"}
+
+    if trigger != "SCHEDULED":
+        return await _execute_job(job_id, job, trigger)
+
+    key = _advisory_key(job_id)
+    async with AsyncSessionLocal() as lock_db:
+        got = (await lock_db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": key})).scalar()
+        if not got:
+            log.info("job %s skipped — advisory lock held by another instance", job_id)
+            return {"jobId": job_id, "status": "SKIPPED", "reason": "locked by another instance"}
+        try:
+            return await _execute_job(job_id, job, trigger)
+        finally:
+            try:
+                await lock_db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _execute_job(job_id: str, job: Job, trigger: str) -> dict[str, Any]:
+    from app.core.audit_context import set_system_actor
+    from app.models.job_run import JobRun
+
     set_system_actor(job_id)
     started = datetime.now(timezone.utc).replace(tzinfo=None)
     run_id = None

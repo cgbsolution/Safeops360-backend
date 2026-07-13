@@ -28,9 +28,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
 from app.models.capture import CaptureAttachment, CaptureSubmission, CaptureTaxonomy
+from app.models.equipment import Equipment
 from app.models.plant import Area, Plant
 from app.models.user import User
-from app.schemas.capture import ConvertBody, RejectBody, SubmissionCreate, TriageBody
+from app.schemas.capture import (
+    CleanupTextBody,
+    ConvertBody,
+    RejectBody,
+    SubmissionCreate,
+    SuggestCategoryBody,
+    TriageBody,
+)
 from app.services import capture as svc
 from app.services import events
 from app.services.access_scope import build_query_scope
@@ -101,15 +109,33 @@ async def bootstrap(user: User = Depends(get_current_user), db: AsyncSession = D
     await _require(db, user, _CREATE)
     plant = await db.get(Plant, user.plantId) if user.plantId else None
     areas: list[Area] = []
+    equipment: list[Equipment] = []
     if plant is not None:
         areas = list((
             await db.execute(select(Area).where(Area.plantId == plant.id).order_by(Area.name.asc()))
+        ).scalars().all())
+        # Compact plant-scoped asset directory so a scanned QR equipment token
+        # resolves to a name in the Context Banner *on-device* — the wizard
+        # caches this bootstrap in IndexedDB, so QR asset resolution keeps
+        # working with zero connectivity (the offline-first QR decision).
+        equipment = list((
+            await db.execute(
+                select(Equipment)
+                .where(Equipment.plantId == plant.id)
+                .where(Equipment.active.is_(True))
+                .order_by(Equipment.name.asc())
+                .limit(1000)
+            )
         ).scalars().all())
     settings_features = _features()
     return {
         "user": {"id": user.id, "name": user.name, "plantId": user.plantId},
         "plant": {"id": plant.id, "code": plant.code, "name": plant.name} if plant else None,
         "areas": [{"id": a.id, "name": a.name} for a in areas],
+        "equipment": [
+            {"id": e.id, "code": e.code, "name": e.name, "location": e.location}
+            for e in equipment
+        ],
         "taxonomyVersion": await svc.taxonomy_version(db),
         "features": settings_features,
     }
@@ -214,6 +240,77 @@ async def vision_suggest(
     }
 
 
+# ── AI text assist: grammar cleanup (spec §7a) ───────────────────────────────
+@router.post("/ai/cleanup-text")
+async def cleanup_text_endpoint(
+    body: CleanupTextBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Grammar/clarity cleanup of a voice transcript or typed note. Returns
+    BOTH the original and the cleaned text so the wizard can show the diff and
+    require the technician to actively accept (spec §7a — never silently
+    replaces what they said). Fail-soft: ok:false → wizard keeps the original."""
+    await _require(db, user, _CREATE)
+    if not _features()["aiCaptureAssist"]:
+        return {"ok": False, "reason": "ai_disabled", "original": body.text}
+
+    from app.services.ai.capture_providers import cleanup_text
+
+    cleaned = await cleanup_text(body.text, body.lang)
+    if cleaned is None:
+        return {"ok": False, "reason": "no_result", "original": body.text}
+    return {"ok": True, "original": body.text, "cleaned": cleaned}
+
+
+# ── AI text assist: text → category suggestion (spec §7b) ────────────────────
+@router.post("/ai/suggest-category")
+async def suggest_category_endpoint(
+    body: SuggestCategoryBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Description text → suggested hazard category. Presented as a pre-selected
+    'suggested' chip the technician confirms or changes (spec §7b — never
+    auto-applied). Reuses the same HAZARD taxonomy as manual selection so no
+    new vocabulary is invented. Fail-soft to {ok:false}."""
+    await _require(db, user, _CREATE)
+    if not _features()["aiCaptureAssist"]:
+        return {"ok": False, "reason": "ai_disabled"}
+
+    nodes = (
+        await db.execute(
+            select(CaptureTaxonomy)
+            .where(CaptureTaxonomy.kind == "HAZARD")
+            .where(CaptureTaxonomy.active.is_(True))
+        )
+    ).scalars().all()
+    by_id = {n.id: n for n in nodes}
+    taxonomy = [
+        {"code": n.code, "parentCode": by_id[n.parentId].code if n.parentId and n.parentId in by_id else None,
+         "labels": n.labels}
+        for n in nodes
+    ]
+
+    from app.services.ai.capture_providers import suggest_category_from_text
+
+    suggestion = await suggest_category_from_text(body.text, taxonomy, body.lang)
+    if suggestion is None or not suggestion.get("l1Code"):
+        return {"ok": False, "reason": "no_suggestion"}
+
+    l1 = await svc.resolve_code(db, "HAZARD", suggestion["l1Code"]) if suggestion.get("l1Code") else None
+    l2 = await svc.resolve_code(db, "HAZARD", suggestion["l2Code"]) if suggestion.get("l2Code") else None
+    if l1 is None or suggestion["confidence"] < 0.35:
+        return {"ok": False, "reason": "low_confidence"}
+
+    return {
+        "ok": True,
+        "l1": {"id": l1.id, "code": l1.code, "labels": l1.labels, "iconKey": l1.iconKey},
+        "l2": {"id": l2.id, "code": l2.code, "labels": l2.labels, "iconKey": l2.iconKey} if l2 else None,
+        "confidence": suggestion["confidence"],
+    }
+
+
 # ── Taxonomy (precacheable; 304 on version match) ─────────────────────────────
 @router.get("/taxonomy")
 async def get_taxonomy(
@@ -262,6 +359,16 @@ async def create_submission(
         if area is None or area.plantId != plant_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Area does not belong to your plant")
 
+    # Asset (equipment) from a scanned QR token — validate against the plant.
+    # Field-first: a re-pointed or retired sticker must never BLOCK a report,
+    # so an unresolvable/foreign token is dropped (the report still lands,
+    # just without a linked asset) rather than 400-ing a low-literacy user.
+    equipment_id = payload.location.equipmentId
+    if equipment_id:
+        equip = await db.get(Equipment, equipment_id)
+        if equip is None or equip.plantId != plant_id or not equip.active:
+            equipment_id = None
+
     # Category: ids preferred; stable codes resolved (alias-aware) for
     # offline clients with a stale taxonomy cache.
     l1: CaptureTaxonomy | None = None
@@ -299,7 +406,7 @@ async def create_submission(
         areaId=area_id,
         mapPinX=payload.location.mapPinX,
         mapPinY=payload.location.mapPinY,
-        equipmentId=payload.location.equipmentId,
+        equipmentId=equipment_id,
         qrScanned=payload.location.qrScanned,
         categoryL1Id=l1.id if l1 else None,
         categoryL2Id=l2.id if l2 else None,
@@ -598,6 +705,71 @@ async def convert_submission(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot map field report to an incident: {e.errors()[0].get('msg', 'invalid data')}") from e
         created = await create_incident(payload, user, db)
         entity_type, entity_id, entity_ref = "Incident", created.id, created.number
+
+    elif body.target == "ptw":
+        # The authorisation chain (permit type, validity window, issuer,
+        # receiver) is the officer's to supply at triage — a field technician
+        # cannot (spec §8.2). scopeOfWork carries the captured narrative; the
+        # existing create_permit handler then runs its normal approval workflow.
+        from app.routers.ptw import create_permit
+        from app.schemas.permit import PermitCreate
+
+        if not body.permitType:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "permitType is required to convert to a permit")
+        if not (body.validFrom and body.validTo and body.issuerId and body.receiverId):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "validFrom, validTo, issuerId and receiverId are required to convert to a permit",
+            )
+        area_name = None
+        if sub.areaId:
+            area = await db.get(Area, sub.areaId)
+            area_name = area.name if area else None
+        try:
+            payload = PermitCreate(
+                type=body.permitType,
+                plantId=sub.plantId,
+                location=area_name or "Reported from field",
+                scopeOfWork=description,
+                validFrom=body.validFrom,
+                validTo=body.validTo,
+                issuerId=body.issuerId,
+                receiverId=body.receiverId,
+                areaId=sub.areaId,
+            )
+        except ValidationError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot map field report to a permit: {e.errors()[0].get('msg', 'invalid data')}") from e
+        created = await create_permit(payload, user, db)
+        entity_type, entity_id, entity_ref = "Permit", created.id, created.number
+
+    elif body.target == "flra":
+        # Crew + toolbox-talk are the officer's to supply; jobDescription
+        # carries the captured narrative. The existing create_flra handler runs
+        # its crew-signoff workflow from there.
+        from app.routers.flra import create_flra
+        from app.schemas.flra import FLRACreate
+
+        if not body.teamMemberIds:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "teamMemberIds is required to convert to an FLRA")
+        if not body.toolboxTalkById:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "toolboxTalkById is required to convert to an FLRA")
+        area_name = None
+        if sub.areaId:
+            area = await db.get(Area, sub.areaId)
+            area_name = area.name if area else None
+        try:
+            payload = FLRACreate(
+                plantId=sub.plantId,
+                date=when,
+                location=area_name or "Reported from field",
+                jobDescription=description,
+                teamMemberIds=body.teamMemberIds,
+                toolboxTalkById=body.toolboxTalkById,
+            )
+        except ValidationError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot map field report to an FLRA: {e.errors()[0].get('msg', 'invalid data')}") from e
+        created = await create_flra(payload, user, db)
+        entity_type, entity_id, entity_ref = "FLRA", created.id, created.number
 
     else:  # pragma: no cover — pydantic Literal guards this
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown conversion target")
