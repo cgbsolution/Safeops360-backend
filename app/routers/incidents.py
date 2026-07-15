@@ -572,6 +572,58 @@ async def update_incident(
     return IncidentOut.model_validate(incident)
 
 
+@router.delete("/{incident_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_incident(
+    incident_id: str,
+    reason: str | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Soft-delete an incident (governed entity — never hard-deleted; the ORM
+    guard in app.core.soft_delete blocks a hard delete). Per the RBAC matrix
+    INCIDENT.DELETE is held by HSE_MANAGER, CORPORATE_HSE, and SYSTEM_ADMIN —
+    the permission service enforces the scope (ALL_PLANTS / OWN_PLANT / …), so
+    an HSE Manager granted ALL_PLANTS can delete an incident raised by any user
+    at any plant.
+
+    A soft-delete is an UPDATE, so the FK ondelete=CASCADE on the child tables
+    (persons, witnesses, evidence, timeline, equipment, CAPAs, comments,
+    attachments, investigation members) does NOT fire — the full investigation
+    record is preserved and hidden behind the invisible soft-delete filter, and
+    a SYSTEM_ADMIN can restore() it within the 30-day window. Only the workflow
+    instance is removed so the incident drops out of live inboxes/task lists; it
+    doesn't FK-cascade from Incident, so we delete it explicitly."""
+    incident = await db.get(Incident, incident_id)
+    if incident is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    record = {"reporterId": incident.reporterId}
+    result = await can(
+        db, user.id, "INCIDENT.DELETE",
+        PermissionContext(record_id=incident.id, plant_id=incident.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    from app.models.workflow import WorkflowInstance
+
+    inst_rows = (
+        await db.execute(
+            select(WorkflowInstance).where(
+                WorkflowInstance.module == "INCIDENT",
+                WorkflowInstance.recordId == incident_id,
+            )
+        )
+    ).scalars().all()
+    for inst in inst_rows:
+        await db.delete(inst)
+
+    from app.core.soft_delete import soft_delete
+
+    soft_delete(incident, user.id, reason or "Incident removed by authorised user via delete endpoint")
+    await db.flush()
+    return None
+
+
 # ─── Phase 2 Classification ─────────────────────────────────────────────
 
 

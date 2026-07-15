@@ -139,7 +139,13 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "HSE_MANAGER": [
-        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
+        # View / edit / delete of raised records are elevated to ALL_PLANTS so HSE
+        # leadership can act on any originator's record group-wide (any plant).
+        # The workflow verbs (approve/execute/verify/close) + create/export stay
+        # OWN_PLANT — cross-plant workflow ownership sits with CORPORATE_HSE.
+        {"module": m, "actions": ["READ", "UPDATE", "DELETE"], "scope": "ALL_PLANTS"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
+    ] + [
+        {"module": m, "actions": ["CREATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
     ] + [
         {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"},
