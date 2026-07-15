@@ -112,6 +112,7 @@ class PermitCreate(BaseModel):
 
     # ─── Legacy fields (kept for back-compat with single-page form) ───
     contractorName: str | None = None
+    contractorCompanyId: str | None = None  # structured contractor link
     isolationsRequired: str | None = None  # CSV
     ppeChecklist: str | None = None        # JSON string
     gasTestRequired: bool = False
@@ -137,6 +138,7 @@ class PermitOut(BaseModel):
     issuerId: str | None
     receiverId: str | None
     contractorName: str | None
+    contractorCompanyId: str | None = None
     status: PermitStatus
     issuerApprovedAt: datetime | None
     safetyApprovedAt: datetime | None

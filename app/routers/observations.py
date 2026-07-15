@@ -163,6 +163,7 @@ async def create_observation(
         areaId=payload.areaId,
         observerId=user.id,
         responsiblePersonId=payload.responsiblePersonId,
+        contractorCompanyId=payload.contractorCompanyId,
         description=payload.description,
         qualityScore=_qscore,
         antecedent=getattr(payload, "antecedent", None),

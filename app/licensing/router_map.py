@@ -59,6 +59,7 @@ ROUTER_MODULE: dict[str, str | None] = {
     # ── Assets & Inspection ──
     "ppe": "PPE",
     "inspections": "INSPECTION",
+    "inspection_findings": "INSPECTION",
     # ── Performance ──
     "manhours": "MANHOURS",
     "anomalies": "ANOMALIES",

@@ -189,6 +189,7 @@ async def create_permit(
         issuerId=payload.issuerId,
         receiverId=payload.receiverId,
         contractorName=payload.contractorName,
+        contractorCompanyId=payload.contractorCompanyId,
 
         # ─── Wizard Step 1/2 additions ───
         validityHours=validity_hours,

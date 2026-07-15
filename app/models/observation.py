@@ -81,6 +81,10 @@ class Observation(Base, IdMixin):
 
     observerId: Mapped[str] = mapped_column(ForeignKey("User.id"), nullable=False)
     responsiblePersonId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))
+    # Contractor traceability — when the unsafe act/condition involves a
+    # contractor. Header-level link (mirrors NearMiss.contractorCompanyId);
+    # nullable, added by apply-contractor-links-ddl.ts before backend restart.
+    contractorCompanyId: Mapped[str | None] = mapped_column(ForeignKey("ContractorCompany.id"), index=True)
 
     description: Mapped[str] = mapped_column(Text, nullable=False)
     # P3-1 BBS — quality score (0..3 specificity) + optional ABC (antecedent→

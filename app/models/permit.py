@@ -71,6 +71,9 @@ class Permit(Base, IdMixin, SoftDeleteMixin):
     issuerId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))
     receiverId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))
     contractorName: Mapped[str | None] = mapped_column(String)
+    # Structured contractor link (kept alongside the legacy free-text
+    # contractorName). Nullable FK; added by apply-contractor-links-ddl.ts.
+    contractorCompanyId: Mapped[str | None] = mapped_column(ForeignKey("ContractorCompany.id"), index=True)
 
     isolationsRequired: Mapped[str | None] = mapped_column(Text)
     ppeChecklist: Mapped[str | None] = mapped_column(Text)

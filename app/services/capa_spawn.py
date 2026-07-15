@@ -84,6 +84,46 @@ async def existing_capas_for(db: AsyncSession, source_code: str, ref_id: str) ->
     ).scalars().all()
 
 
+# FindingSeverity → (CAPA severity, closure-target days). Aligns with the seeded
+# INSPECTION_FINDING SLA intent (default 60d) but tightens for high-severity.
+_FINDING_SEVERITY_MAP = {
+    "CRITICAL": ("CRITICAL", 30),
+    "HIGH": ("HIGH", 45),
+    "MEDIUM": ("MODERATE", 60),
+    "LOW": ("LOW", 90),
+}
+
+
+async def spawn_inspection_finding_capa(
+    db: AsyncSession, finding, plant_id: str | None, actor_id: str | None
+) -> dict[str, Any]:
+    """Promote an inspection finding into the UNIVERSAL Capa register
+    (source INSPECTION_FINDING) so it gets SLA, escalation, audit-chain and the
+    unified dashboards — bridging the Node-side per-finding CAPA into the
+    platform CAPA engine. Idempotent: one universal CAPA per finding."""
+    existing = await existing_capas_for(db, "INSPECTION_FINDING", finding.id)
+    if existing:
+        return {
+            "created": 0,
+            "capaIds": [c.id for c in existing],
+            "capaNumbers": [c.capaNumber for c in existing],
+            "skipped": "already exists",
+        }
+    sev, due = _FINDING_SEVERITY_MAP.get((finding.severity or "MEDIUM").upper(), ("MODERATE", 60))
+    capa = await spawn_capa(
+        db, source_code="INSPECTION_FINDING", plant_id=plant_id,
+        title=f"Inspection finding: {finding.title}",
+        problem=f"Finding {finding.findingNumber}: {(finding.description or '')[:500]}",
+        ref_id=finding.id, ref_url=f"/inspections/findings/{finding.id}",
+        ref_summary=f"{finding.findingNumber} — {finding.title}",
+        metadata={"findingNumber": finding.findingNumber, "inspectionId": finding.inspectionId,
+                  "findingSeverity": finding.severity, "isCritical": finding.isCritical},
+        severity=sev, detected_method="INSPECTION_FINDING", owner_id=finding.ownerId,
+        actor_id=actor_id, due_days=due,
+    )
+    return {"created": 1, "capaIds": [capa.id], "capaNumbers": [capa.capaNumber]}
+
+
 async def spawn_moc_capas(db: AsyncSession, cr, actor_id: str | None) -> dict[str, Any]:
     """I-18 — on MOC approval, spawn an implementation-tracking CAPA (MOC_ACTION).
     Idempotent: skips if a MOC CAPA already exists for this change request."""

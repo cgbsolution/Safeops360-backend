@@ -51,6 +51,7 @@ from app.routers import (
     flra,
     hira,
     incidents,
+    inspection_findings,
     inspections,
     jobs,
     whatsapp,
@@ -86,7 +87,7 @@ log = logging.getLogger("safeops360")
 _ROUTERS = {
     "auth": auth, "users": users, "observations": observations, "near_miss": near_miss,
     "ptw": ptw, "ptw_active": ptw_active, "flra": flra, "incidents": incidents,
-    "training": training, "inspections": inspections, "manhours": manhours,
+    "training": training, "inspections": inspections, "inspection_findings": inspection_findings, "manhours": manhours,
     "workflow": workflow, "workflow_definitions": workflow_definitions, "anomalies": anomalies,
     "agents": agents, "agents_config": agents_config, "hira": hira, "capa": capa, "eai": eai,
     "erm": erm, "erm_attachments": erm_attachments, "erm_p2": erm_p2, "erm_p3": erm_p3, "erm_t3": erm_t3, "competency": competency,

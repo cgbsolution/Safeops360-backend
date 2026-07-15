@@ -32,6 +32,8 @@ class ObservationCreate(BaseModel):
     # CHECKER step, not by the observer at creation time. Kept optional
     # here so direct API callers can still set it if they want to.
     responsiblePersonId: str | None = None
+    # Contractor traceability — set when the observation involves a contractor.
+    contractorCompanyId: str | None = None
     targetDate: datetime | None = None
     date: datetime
 
@@ -56,6 +58,7 @@ class ObservationOut(BaseModel):
     areaId: str | None
     observerId: str
     responsiblePersonId: str | None
+    contractorCompanyId: str | None = None
     description: str
     immediateAction: str | None
     targetDate: datetime | None
