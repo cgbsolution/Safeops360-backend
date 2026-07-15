@@ -805,6 +805,30 @@ async def convert_submission(
     else:  # pragma: no cover — pydantic Literal guards this
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown conversion target")
 
+    # Attribute the converted record to the ORIGINAL field reporter (the
+    # technician who raised the report) — NOT the officer who reviewed and
+    # converted it. The create handlers stamp the API caller (the officer) as
+    # observer/reporter; override it here so the record shows e.g. "Rajesh
+    # Sharma", not the approving manager. Skipped for anonymous reports
+    # (there is no identity to attribute) and for PTW/FLRA (the officer is the
+    # legitimate originator/leader there — the worker cannot authorise a permit).
+    if sub.reporterId and not sub.isAnonymous:
+        if entity_type == "Observation":
+            from app.models.observation import Observation
+            _rec = await db.get(Observation, entity_id)
+            if _rec is not None:
+                _rec.observerId = sub.reporterId
+        elif entity_type == "NearMiss":
+            from app.models.near_miss import NearMiss
+            _rec = await db.get(NearMiss, entity_id)
+            if _rec is not None:
+                _rec.reporterId = sub.reporterId
+        elif entity_type == "Incident":
+            from app.models.incident import Incident
+            _rec = await db.get(Incident, entity_id)
+            if _rec is not None:
+                _rec.reporterId = sub.reporterId
+
     sub.convertedEntityType = entity_type
     sub.convertedEntityId = entity_id
     sub.convertedById = user.id
