@@ -73,7 +73,7 @@ DEFINITION: dict[str, Any] = {
 # Statuses where the permit covers active work. Pre-approval (DRAFT,
 # AWAITING_*) and post-completion (CLOSED, EXPIRED, REJECTED) are
 # excluded — only "approved, in validity window" counts as covering.
-_ACTIVE_STATUSES = ("ACTIVE", "PLANT_HEAD_APPROVED", "SUSPENDED")
+_ACTIVE_STATUSES = ("ACTIVE", "ISSUED", "PLANT_HEAD_APPROVED", "SUSPENDED")
 
 
 async def handle(

@@ -52,6 +52,22 @@ class Settings(BaseSettings):
     # mutated by interval jobs; on-prem deployments set SCHEDULER_ENABLED=true.
     scheduler_enabled: bool = False
 
+    # ─── PTW closed-loop: FLRA policy ────────────────────────────────────
+    # FLRA is an optional sub-flow per permit (closed-loop rebuild). Instance-
+    # level config matches the per-customer-instance deployment model:
+    #   PTW_FLRA_REQUIRED_DEFAULT=true       → every permit requires an FLRA
+    #   PTW_FLRA_REQUIRED_TYPES=HOT_WORK,CONFINED_SPACE
+    #                                        → only these types require it
+    # The resolved value is snapshotted onto Permit.flraRequired at creation.
+    ptw_flra_required_default: bool = False
+    ptw_flra_required_types: str = ""
+
+    def ptw_flra_required_for(self, permit_type: str) -> bool:
+        types = {t.strip().upper() for t in self.ptw_flra_required_types.split(",") if t.strip()}
+        if types:
+            return permit_type.upper() in types
+        return self.ptw_flra_required_default
+
     # Security: echo the password-reset OTP back in the forgot-password response
     # for QA when there is no email gateway. OFF by default and must be opted in
     # explicitly — so even a misconfigured APP_ENV can never leak an OTP. Never

@@ -28,6 +28,8 @@ ROUTER_MODULE: dict[str, str | None] = {
     "near_miss": "NEAR_MISS",
     "ptw": "PTW",
     "ptw_active": "PTW",
+    "ptw_lifecycle": "PTW",
+    "ptw_reports": "PTW",
     "flra": "FLRA",
     "incidents": "INCIDENT",
     # ── Risk Management ──

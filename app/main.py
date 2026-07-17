@@ -65,6 +65,8 @@ from app.routers import (
     ppe,
     ptw,
     ptw_active,
+    ptw_lifecycle,
+    ptw_reports,
     rca,
     rca_field,
     risk_dashboard,
@@ -86,7 +88,8 @@ log = logging.getLogger("safeops360")
 # Order only affects OpenAPI grouping.
 _ROUTERS = {
     "auth": auth, "users": users, "observations": observations, "near_miss": near_miss,
-    "ptw": ptw, "ptw_active": ptw_active, "flra": flra, "incidents": incidents,
+    "ptw": ptw, "ptw_active": ptw_active, "ptw_lifecycle": ptw_lifecycle,
+    "ptw_reports": ptw_reports, "flra": flra, "incidents": incidents,
     "training": training, "inspections": inspections, "inspection_findings": inspection_findings, "manhours": manhours,
     "workflow": workflow, "workflow_definitions": workflow_definitions, "anomalies": anomalies,
     "agents": agents, "agents_config": agents_config, "hira": hira, "capa": capa, "eai": eai,
@@ -196,7 +199,16 @@ def create_app() -> FastAPI:
     from app.models.erm_t3 import Control
     from app.models.incident import Incident
     from app.models.incident_intel import GoldenThreadLink, StatutoryFormInstance, WhatsappSender
-    from app.models.permit import Permit
+    from app.models.permit import (
+        Permit,
+        PermitActionEvidence,
+        PermitAttachment,
+        PermitCrewMember,
+        PermitExtension,
+        PermitGasTestReading,
+        PermitIsolation,
+        PermitSuspension,
+    )
     from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
     from app.models.rca import RcaIdentifiedCause, RcaRiskLink, RootCauseAnalysis
     from app.models.safety_culture import (
@@ -211,6 +223,11 @@ def create_app() -> FastAPI:
     register_audited(
         Incident, Capa, ComplianceAudit, Permit, EnterpriseRisk, RiskAssessment, LossEvent,
         Control,
+        # PTW closed-loop: every safety-critical permit child table joins the
+        # hash-chain — evidence rows, attachments, isolations, gas readings,
+        # suspensions, extensions, and crew changes are all tamper-evident.
+        PermitActionEvidence, PermitAttachment, PermitIsolation, PermitGasTestReading,
+        PermitSuspension, PermitExtension, PermitCrewMember,
         FireEquipment, FireEmergencyPlan, FireDrill,
         RootCauseAnalysis, RcaIdentifiedCause, RcaRiskLink,
         CaptureSubmission, RcaFieldRequest, Alert,

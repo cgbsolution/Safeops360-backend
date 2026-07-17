@@ -193,7 +193,8 @@ async def dashboard_overview(
     obs_open = sum(1 for o in obs_rows if o.status != "CLOSED")
     obs_closed = sum(1 for o in obs_rows if o.status == "CLOSED")
     active_permits = sum(
-        1 for p in permit_rows if p.status in ("ACTIVE", "SAFETY_APPROVED")
+        1 for p in permit_rows
+        if p.status in ("ACTIVE", "ISSUED", "APPROVED", "SAFETY_APPROVED")
     )
 
     total_lti = sum(int(r[0] or 0) for r in manhours)

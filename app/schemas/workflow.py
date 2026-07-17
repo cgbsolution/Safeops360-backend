@@ -3,6 +3,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.schemas.permit import PtwEvidenceInput
+
 
 class ApproveRequest(BaseModel):
     taskId: str
@@ -10,12 +12,19 @@ class ApproveRequest(BaseModel):
     attachments: list[str] | None = None
     recordData: dict[str, Any] | None = None
     plantId: str | None = None
+    # PTW closed-loop: approvals on permit tasks REQUIRE field evidence
+    # (GPS + photo + signature). Ignored for non-PTW modules. The router
+    # validates via app/services/ptw_evidence.py and 422s when missing.
+    evidence: PtwEvidenceInput | None = None
 
 
 class RejectRequest(BaseModel):
     taskId: str
     reason: str = Field(min_length=1)
     comments: str | None = None
+    # Optional for PTW — a rejection may happen off-site; whatever the
+    # device can provide is still recorded on the evidence trail.
+    evidence: PtwEvidenceInput | None = None
 
 
 class SubmitExecutionRequest(BaseModel):

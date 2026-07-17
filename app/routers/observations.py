@@ -303,6 +303,30 @@ async def update_observation(
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
 
+    # ─── Core-detail edit ("edit while open"). A CLOSED observation is a
+    #     finalised record — its facts can't be edited (workflow status changes
+    #     still go through their own panels). ───
+    core_edit = any(
+        v is not None
+        for v in (payload.type, payload.category, payload.severity, payload.description, payload.areaId)
+    )
+    if core_edit and obs.status == ObservationStatus.CLOSED:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot edit a closed observation.")
+    if payload.type is not None:
+        obs.type = payload.type
+    if payload.category is not None:
+        obs.category = payload.category
+    if payload.severity is not None:
+        obs.severity = payload.severity
+    if payload.description is not None:
+        obs.description = payload.description
+    if payload.areaId is not None:
+        obs.areaId = payload.areaId or None
+    if payload.responsiblePersonId is not None:
+        obs.responsiblePersonId = payload.responsiblePersonId or None
+    if payload.targetDate is not None:
+        obs.targetDate = payload.targetDate
+
     if payload.status is not None:
         obs.status = payload.status
         if payload.status == ObservationStatus.CLOSED:

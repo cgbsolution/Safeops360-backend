@@ -683,6 +683,29 @@ async def update_near_miss(
         if target < datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target closure date cannot be in the past.")
         nm.targetDate = target
+
+    # ─── Core-detail edit ("edit while open"). The CLOSED guard above already
+    #     blocks edits on a finalised near miss; these apply the descriptive
+    #     fields a user would correct. ───
+    if payload.description is not None:
+        nm.description = payload.description
+    if payload.potentialSeverity is not None:
+        nm.potentialSeverity = payload.potentialSeverity
+    if payload.areaId is not None:
+        nm.areaId = payload.areaId or None
+    if payload.location is not None:
+        nm.location = payload.location or None
+    if payload.specificLocation is not None:
+        nm.specificLocation = payload.specificLocation or None
+    if payload.hazardCategory is not None:
+        nm.hazardCategory = payload.hazardCategory or None
+    if payload.energySource is not None:
+        nm.energySource = payload.energySource or None
+    if payload.activityBeingPerformed is not None:
+        nm.activityBeingPerformed = payload.activityBeingPerformed or None
+    if payload.immediateAction is not None:
+        nm.immediateAction = payload.immediateAction or None
+
     await db.flush()
     await db.refresh(nm)
     return NearMissOut.model_validate(nm)

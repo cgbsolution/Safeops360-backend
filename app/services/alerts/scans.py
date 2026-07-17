@@ -52,8 +52,14 @@ async def _already_emitted_today(db: AsyncSession, event_type: str, entity_id: s
 async def run_ptw_expiry_scan(db: AsyncSession) -> dict:
     now = datetime.now(timezone.utc)
     warn_until = now + timedelta(hours=EXPIRY_WARN_HOURS)
+    # Closed-loop rebuild: an ISSUED permit that was never accepted also
+    # dies at its validTo — otherwise it lingers acceptable forever.
     active = (
-        await db.execute(select(Permit).where(Permit.status == PermitStatus.ACTIVE))
+        await db.execute(
+            select(Permit).where(
+                Permit.status.in_((PermitStatus.ACTIVE, PermitStatus.ISSUED))
+            )
+        )
     ).scalars().all()
 
     warned = expired = 0

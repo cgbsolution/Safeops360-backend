@@ -56,6 +56,100 @@ def _bad_request(e: WorkflowError) -> HTTPException:
     return HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
 
+async def _ptw_task_context(
+    db: AsyncSession, task_id: str
+) -> tuple[str, Any] | None:
+    """(recordId, step-row) for a PTW task, or None for non-PTW/missing.
+
+    Scalar-column queries only — loading the WorkflowTask entity here would
+    poison the identity map for the engine's `_load_task_with_definition`
+    (see the note in approve() below)."""
+    row = (
+        await db.execute(
+            select(WorkflowTask.module, WorkflowTask.recordId, WorkflowTask.stepId)
+            .where(WorkflowTask.id == task_id)
+        )
+    ).first()
+    if row is None or row.module != "PTW":
+        return None
+    step = (
+        await db.execute(
+            select(
+                WorkflowStep.stepType,
+                WorkflowStep.approverField,
+                WorkflowStep.approverRole,
+                WorkflowStep.name,
+            ).where(WorkflowStep.id == row.stepId)
+        )
+    ).first()
+    return row.recordId, step
+
+
+def _ptw_evidence_action_for_step(step: Any):
+    """Map an approval step to its PermitEvidenceAction."""
+    from app.models.permit import PermitEvidenceAction
+
+    if step is not None:
+        step_type = (
+            step.stepType.value if hasattr(step.stepType, "value") else str(step.stepType)
+        )
+        if step_type == StepType.CLOSURE.value:
+            return PermitEvidenceAction.CLOSE
+        if step.approverField == "ISSUER":
+            return PermitEvidenceAction.APPROVE_ISSUER
+        if step.approverRole == "SAFETY_OFFICER":
+            return PermitEvidenceAction.APPROVE_SAFETY
+        if step.approverRole == "PLANT_HEAD":
+            return PermitEvidenceAction.APPROVE_PLANT_HEAD
+    return PermitEvidenceAction.APPROVE
+
+
+async def _record_ptw_workflow_evidence(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    user_id: str,
+    evidence,
+    comments: str | None,
+    action_override=None,
+    enforce: bool = True,
+) -> None:
+    """Validate + persist the field-evidence row for a PTW workflow action.
+    Raises HTTP 422 with the full missing-element list when the policy for
+    the action isn't met. No-op for non-PTW tasks."""
+    ctx = await _ptw_task_context(db, task_id)
+    if ctx is None:
+        return
+    record_id, step = ctx
+
+    from app.models.permit import Permit
+    from app.services.ptw_evidence import EvidenceError, record_action_evidence
+
+    permit = await db.get(Permit, record_id)
+    if permit is None:
+        return
+
+    action = action_override or _ptw_evidence_action_for_step(step)
+    ev = evidence
+    try:
+        await record_action_evidence(
+            db,
+            permit=permit,
+            action=action,
+            actor_id=user_id,
+            gps_latitude=ev.gpsLatitude if ev else None,
+            gps_longitude=ev.gpsLongitude if ev else None,
+            gps_accuracy_meters=ev.gpsAccuracyMeters if ev else None,
+            signature_image=ev.signatureImageBase64 if ev else None,
+            declaration_text=ev.declarationText if ev else None,
+            comments=comments,
+            photo_attachment_ids=ev.photoAttachmentIds if ev else None,
+            enforce=enforce,
+        )
+    except EvidenceError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+
+
 @router.post("/approve")
 async def approve(
     payload: ApproveRequest,
@@ -92,6 +186,19 @@ async def approve(
                     obs.responsiblePersonId = rp_id
                     await db.flush()
 
+        # PTW closed-loop: every permit approval (issuer / safety officer /
+        # plant head / closure) must carry field evidence — GPS + signature,
+        # photo per policy. Validated + persisted BEFORE the engine advances;
+        # a WorkflowError afterwards rolls the evidence row back with the
+        # rest of the transaction. Non-PTW modules are untouched.
+        await _record_ptw_workflow_evidence(
+            db,
+            task_id=payload.taskId,
+            user_id=user.id,
+            evidence=payload.evidence,
+            comments=payload.comments,
+        )
+
         return await workflow_engine.approve(
             db,
             task_id=payload.taskId,
@@ -112,6 +219,21 @@ async def reject(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     try:
+        # PTW: record whatever evidence the device provided (policy for
+        # REJECT is fully optional — a rejection may happen off-site).
+        if payload.evidence is not None:
+            from app.models.permit import PermitEvidenceAction
+
+            await _record_ptw_workflow_evidence(
+                db,
+                task_id=payload.taskId,
+                user_id=user.id,
+                evidence=payload.evidence,
+                comments=payload.reason,
+                action_override=PermitEvidenceAction.REJECT,
+                enforce=False,
+            )
+
         return await workflow_engine.reject(
             db,
             task_id=payload.taskId,

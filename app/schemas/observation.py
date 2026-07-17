@@ -45,6 +45,14 @@ class ObservationUpdate(BaseModel):
     closingRemark: str | None = None
     responsiblePersonId: str | None = None
     targetDate: datetime | None = None
+    # ─── Editable core details ("edit while open"). All optional; only the
+    #     keys the client sends are applied. The router blocks these once the
+    #     observation is CLOSED and enforces OBSERVATION.UPDATE. ───
+    type: ObservationType | None = None
+    category: ObservationCategory | None = None
+    severity: Severity | None = None
+    description: str | None = Field(default=None, min_length=10)
+    areaId: str | None = None
 
 
 class ObservationOut(BaseModel):

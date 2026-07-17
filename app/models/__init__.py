@@ -223,7 +223,11 @@ from app.models.observation import (
 )
 from app.models.permit import (
     Permit,
+    PermitActionEvidence,
+    PermitAttachment,
     PermitCrewMember,
+    PermitEvidenceAction,
+    PermitOutcome,
     PermitStatus,
     PermitType,
 )
@@ -429,7 +433,11 @@ __all__ = [
     "ObservationType",
     "Permission",
     "Permit",
+    "PermitActionEvidence",
+    "PermitAttachment",
     "PermitCrewMember",
+    "PermitEvidenceAction",
+    "PermitOutcome",
     "PermitStatus",
     "PermitType",
     "Plant",

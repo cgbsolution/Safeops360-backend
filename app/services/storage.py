@@ -56,6 +56,15 @@ def build_control_storage_path(*, control_id: str, category: str, file_name: str
     return f"controls/{control_id}/{category.lower()}/{short_id}-{safe}"
 
 
+def build_permit_storage_path(*, permit_id: str, category: str, file_name: str) -> str:
+    """PTW closed-loop attachments (drawings, action-evidence photos,
+    return/verification photos)."""
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"permits/{permit_id}/{category.lower()}/{short_id}-{safe}"
+
+
 def create_signed_upload_url(storage_path: str) -> dict[str, str]:
     """60-second window for the browser to PUT directly. Defensive against
     different supabase-py versions that have used `signed_url` (snake_case)

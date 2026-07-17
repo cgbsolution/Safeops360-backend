@@ -146,7 +146,12 @@ async def can_ptw_transition_to_active(
     except Exception:
         pass  # competency module absent → degrade gracefully (gate doesn't block on it)
 
-    # ─── 2. FLRA gate ─────────────────────────────────────────────────
+    # ─── 2. FLRA gate — CONDITIONAL (closed-loop rebuild) ─────────────
+    # FLRA is an optional sub-flow: it blocks activation only when the
+    # permit was created with flraRequired (instance config / wizard
+    # override, snapshotted on the row). When an FLRA exists anyway on a
+    # non-required permit, its state is still surfaced for the UI but
+    # never blocks.
     flra_stmt = (
         select(FLRA)
         .where(FLRA.permitId == permit_id)
@@ -156,15 +161,17 @@ async def can_ptw_transition_to_active(
         .limit(1)
     )
     flra = (await db.execute(flra_stmt)).scalar_one_or_none()
+    flra_required = bool(permit.flraRequired)
 
     if flra is None:
-        status.ok = False
-        status.blockers.append(
-            GateBlocker(
-                code="FLRA_MISSING",
-                message="A completed FLRA is required before activation. Crew must sign at the worksite.",
+        if flra_required:
+            status.ok = False
+            status.blockers.append(
+                GateBlocker(
+                    code="FLRA_MISSING",
+                    message="A completed FLRA is required before activation. Crew must sign at the worksite.",
+                )
             )
-        )
     else:
         status.flra_id = flra.id
         status.flra_number = flra.number
@@ -184,11 +191,13 @@ async def can_ptw_transition_to_active(
                 ).scalars().all()
                 names_by_id = {u.id: u.name for u in u_rows}
                 names = [names_by_id.get(s.userId, s.userId) for s in unsigned]
-                status.ok = False
+                if flra_required:
+                    status.ok = False
                 status.blockers.append(
                     GateBlocker(
                         code="FLRA_UNSIGNED",
                         message=f"FLRA awaiting sign-off from: {', '.join(names)}.",
+                        severity="ERROR" if flra_required else "WARN",
                     )
                 )
             if refused:
@@ -199,7 +208,8 @@ async def can_ptw_transition_to_active(
                 ).scalars().all()
                 names_by_id = {u.id: u.name for u in u_rows}
                 names = [names_by_id.get(s.userId, s.userId) for s in refused]
-                status.ok = False
+                if flra_required:
+                    status.ok = False
                 status.blockers.append(
                     GateBlocker(
                         code="FLRA_REFUSED",
@@ -207,6 +217,7 @@ async def can_ptw_transition_to_active(
                             f"Crew refused to sign: {', '.join(names)}. "
                             "Supervisor must replace them and re-do the FLRA."
                         ),
+                        severity="ERROR" if flra_required else "WARN",
                     )
                 )
 

@@ -46,6 +46,8 @@ class Action(str, enum.Enum):
     ESCALATED = "ESCALATED"
     COMMENTED = "COMMENTED"
     SUSPENDED = "SUSPENDED"
+    # PTW closed-loop: operational cancellation (DB column is plain String).
+    CANCELLED = "CANCELLED"
 
 
 class WorkflowDefinition(Base, IdMixin):

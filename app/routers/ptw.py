@@ -27,6 +27,7 @@ from app.schemas.permit import (
     AdminResetRequest,
     PermitCreate,
     PermitOut,
+    PermitUpdate,
     ResumeRequest,
     SuspendRequest,
 )
@@ -62,6 +63,7 @@ PERMIT_TYPE_CODE: dict[str, str] = {
 
 @router.get("")
 async def list_permits(
+    include_archived: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -70,6 +72,10 @@ async def list_permits(
         raise HTTPException(status.HTTP_403_FORBIDDEN, read_check.reason or "Access denied")
     plants = await get_accessible_plants(db, user.id)
     stmt = select(Permit)
+    # Archived permits (retention flag on CLOSED) are hidden from the
+    # default register; ?include_archived=true surfaces them.
+    if not include_archived:
+        stmt = stmt.where(Permit.isArchived.is_(False))
     if plants is None:
         pass
     elif not plants:
@@ -176,6 +182,17 @@ async def create_permit(
     needs_fire_watch = payload.type.value == "HOT_WORK"
     validity_hours = int((payload.validTo - payload.validFrom).total_seconds() / 3600.0)
 
+    # FLRA policy (closed-loop rebuild): explicit wizard override wins, else
+    # instance config (PTW_FLRA_REQUIRED_DEFAULT / PTW_FLRA_REQUIRED_TYPES).
+    # Snapshotted per permit so the workflow + activation gate are auditable.
+    from app.core.config import get_settings
+
+    flra_required = (
+        payload.flraRequired
+        if payload.flraRequired is not None
+        else get_settings().ptw_flra_required_for(payload.type.value)
+    )
+
     permit = Permit(
         number=number,
         type=payload.type,
@@ -198,7 +215,11 @@ async def create_permit(
         gpsLatitude=payload.gpsLatitude,
         gpsLongitude=payload.gpsLongitude,
         workOrderNumber=payload.workOrderNumber,
-        attachedDrawingIds=payload.attachedDrawingIds or None,
+        # attachedDrawingIds is DEPRECATED (dangling ids) — drawings are now
+        # uploaded post-create via POST /api/ptw/{id}/attachments.
+
+        # ─── Closed-loop rebuild ───
+        flraRequired=flra_required,
 
         # ─── Wizard Step 3 additions ───
         fireWatchPersonId=payload.fireWatchPersonId,
@@ -330,6 +351,8 @@ async def create_permit(
                     "originatorId": permit.originatorId,
                     "issuerId": permit.issuerId,
                     "receiverId": permit.receiverId,
+                    # Conditional FLRA step keys off this (conditionExpr).
+                    "flraRequired": bool(permit.flraRequired),
                 },
                 initiator_id=user.id,
                 plant_id=permit.plantId,
@@ -405,6 +428,7 @@ async def get_activation_gate(
     gate = await can_ptw_transition_to_active(db, permit_id)
     return {
         "ok": gate.ok,
+        "flraRequired": bool(permit.flraRequired),
         "blockers": [
             {"code": b.code, "message": b.message, "severity": b.severity}
             for b in gate.blockers
@@ -499,6 +523,56 @@ async def admin_reset(
     return PermitOut.model_validate(permit)
 
 
+@router.patch("/{permit_id}/details", response_model=PermitOut)
+async def update_permit_details(
+    permit_id: str,
+    payload: PermitUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PermitOut:
+    """Edit a permit's core details while it is still open (DRAFT / SUBMITTED —
+    before any approval). Once approved / active / terminal, its scope, validity
+    and location are locked. Child collections (crew, isolations, gas plan,
+    tools) are managed by the create wizard / active-phase panels, not here.
+    Enforces PTW.UPDATE + scope."""
+    permit = await db.get(Permit, permit_id)
+    if permit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Permit not found")
+    if permit.status not in (PermitStatus.DRAFT, PermitStatus.SUBMITTED):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A permit can only be edited before it is approved (current status: "
+            f"{permit.status.value.replace('_', ' ').title()}).",
+        )
+    record = {
+        "originatorId": permit.originatorId,
+        "issuerId": permit.issuerId,
+        "receiverId": permit.receiverId,
+    }
+    result = await can(
+        db, user.id, "PTW.UPDATE",
+        PermissionContext(record_id=permit.id, plant_id=permit.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    data = payload.model_dump(exclude_unset=True)
+    for field in (
+        "type", "location", "scopeOfWork", "validFrom", "validTo", "departmentId",
+        "areaId", "specificLocation", "workOrderNumber", "weatherConditionsAtIssue",
+        "windSpeedKmh", "contractorName", "contractorCompanyId",
+    ):
+        if field in data:
+            setattr(permit, field, data[field])
+
+    if permit.validFrom and permit.validTo and permit.validTo <= permit.validFrom:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Valid-to must be after valid-from.")
+
+    await db.flush()
+    await db.refresh(permit)
+    return PermitOut.model_validate(permit)
+
+
 @router.post("/{permit_id}/suspend")
 async def suspend_permit(
     permit_id: str,
@@ -518,6 +592,27 @@ async def suspend_permit(
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     if permit.status != PermitStatus.ACTIVE:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Only ACTIVE permits can be suspended (current: {permit.status.value}).")
+
+    # Closed-loop rebuild: suspension is a lifecycle action → field evidence.
+    from app.models.permit import PermitEvidenceAction
+    from app.services.ptw_evidence import EvidenceError, record_action_evidence
+
+    try:
+        await record_action_evidence(
+            db,
+            permit=permit,
+            action=PermitEvidenceAction.SUSPEND,
+            actor_id=user.id,
+            gps_latitude=payload.evidence.gpsLatitude if payload.evidence else None,
+            gps_longitude=payload.evidence.gpsLongitude if payload.evidence else None,
+            gps_accuracy_meters=payload.evidence.gpsAccuracyMeters if payload.evidence else None,
+            signature_image=payload.evidence.signatureImageBase64 if payload.evidence else None,
+            declaration_text=payload.evidence.declarationText if payload.evidence else None,
+            comments=payload.reason,
+            photo_attachment_ids=payload.evidence.photoAttachmentIds if payload.evidence else None,
+        )
+    except EvidenceError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
 
     permit.status = PermitStatus.SUSPENDED
     permit.suspendedAt = datetime.now(timezone.utc)
@@ -577,6 +672,28 @@ async def resume_permit(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Only SUSPENDED permits can be resumed (current: {permit.status.value}).")
     if permit.validTo.timestamp() < datetime.now(timezone.utc).timestamp():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Validity window has expired. Request an extension before resuming.")
+
+    # Closed-loop rebuild: resumption is a lifecycle action → field evidence.
+    from app.models.permit import PermitEvidenceAction
+    from app.services.ptw_evidence import EvidenceError, record_action_evidence
+
+    try:
+        await record_action_evidence(
+            db,
+            permit=permit,
+            action=PermitEvidenceAction.RESUME,
+            actor_id=user.id,
+            gps_latitude=payload.evidence.gpsLatitude if payload.evidence else None,
+            gps_longitude=payload.evidence.gpsLongitude if payload.evidence else None,
+            gps_accuracy_meters=payload.evidence.gpsAccuracyMeters if payload.evidence else None,
+            signature_image=payload.evidence.signatureImageBase64 if payload.evidence else None,
+            declaration_text=payload.evidence.declarationText if payload.evidence else None,
+            comments=payload.comments,
+            photo_attachment_ids=payload.evidence.photoAttachmentIds if payload.evidence else None,
+        )
+    except EvidenceError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+
     permit.status = PermitStatus.ACTIVE
     permit.suspendedAt = None
     permit.suspendedReason = None
@@ -624,10 +741,14 @@ async def eligible_for_flra(
     """Permits the caller can attach a fresh FLRA to. Drives the FLRA form's
     linked-permit picker."""
     eligible_statuses = [
+        # Closed-loop states: FLRA is prepared between issue and acceptance.
+        PermitStatus.APPROVED,
+        PermitStatus.ISSUED,
+        PermitStatus.ACTIVE,
+        # Deprecated intermediate statuses — kept for pre-rebuild rows.
         PermitStatus.ISSUER_APPROVED,
         PermitStatus.SAFETY_APPROVED,
         PermitStatus.PLANT_HEAD_APPROVED,
-        PermitStatus.ACTIVE,
     ]
     stmt = select(Permit).where(Permit.status.in_(eligible_statuses))
     if q:
