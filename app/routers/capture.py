@@ -649,6 +649,24 @@ async def convert_submission(
     from pydantic import ValidationError
 
     description = (body.description or "").strip() or svc.synth_description(sub)
+    # At-risk observations (UNSAFE_ACT / UNSAFE_CONDITION) are gated at >=50
+    # chars by the BBS quality rule (bbs_quality.validate_quality). A terse
+    # officer note — or a capture where the worker typed nothing — would 400 on
+    # convert. Enrich it with the captured context instead of rejecting it.
+    if len(description) < 50:
+        snap = sub.categorySnapshot or {}
+        l1 = ((snap.get("l1") or {}).get("labels") or {}).get("en")
+        l2 = ((snap.get("l2") or {}).get("labels") or {}).get("en")
+        extras: list[str] = []
+        if l1 and l1.lower() not in description.lower():
+            extras.append(f"Hazard: {l1}{' — ' + l2 if l2 else ''}.")
+        if sub.severitySelfReported:
+            extras.append(f"Reporter-assessed severity: {sub.severitySelfReported}.")
+        transcript = sub.transcriptEnglish or sub.transcriptOriginal
+        if transcript and transcript.strip() and transcript.strip() not in description:
+            extras.append(f'Reporter said: "{transcript.strip()}".')
+        extras.append(f"Captured via guided field capture ({sub.number}); see the field report for evidence.")
+        description = " ".join([description, *extras]).strip()
     if len(description) < 10:
         description = description + " (field report)"
     module_severity = (
