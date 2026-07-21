@@ -65,6 +65,29 @@ def build_permit_storage_path(*, permit_id: str, category: str, file_name: str) 
     return f"permits/{permit_id}/{category.lower()}/{short_id}-{safe}"
 
 
+def build_moc_storage_path(*, moc_id: str, category: str, file_name: str) -> str:
+    """MOC supporting documents (drawings, P&IDs, vendor specs, risk docs)."""
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"moc/{moc_id}/{category.lower()}/{short_id}-{safe}"
+
+
+def build_evidence_storage_path(
+    *, entity_type: str, entity_id: str, category: str, file_name: str
+) -> str:
+    """Generic path for the shared Evidence Attachment layer (Stream B §5).
+    One builder for every attachable entity, replacing the per-parent
+    build_*_storage_path clones for new surfaces:
+        evidence/{entityType}/{entityId}/{category}/{shortid}-{safe}
+    """
+    safe_type = re.sub(r"[^A-Za-z0-9_-]", "_", entity_type)[:40]
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"evidence/{safe_type}/{entity_id}/{category.lower()}/{short_id}-{safe}"
+
+
 def create_signed_upload_url(storage_path: str) -> dict[str, str]:
     """60-second window for the browser to PUT directly. Defensive against
     different supabase-py versions that have used `signed_url` (snake_case)

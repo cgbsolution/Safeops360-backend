@@ -115,6 +115,16 @@ async def _job_treatment_overdue(db) -> dict:
     return await run_treatment_overdue_escalations(db)
 
 
+async def _job_moc_temp_expiry(db) -> dict:
+    from app.services.moc_notifications import run_moc_temp_expiry_reminders
+    return await run_moc_temp_expiry_reminders(db)
+
+
+async def _job_moc_approval_escalations(db) -> dict:
+    from app.services.moc_notifications import run_moc_approval_escalations
+    return await run_moc_approval_escalations(db)
+
+
 async def _job_treatment_reconcile(db) -> dict:
     """Auto-reconcile closed treatments (§7d) — measure achieved-vs-expected residual
     reduction and escalate overdue treatments up the ladder."""
@@ -190,6 +200,8 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
     Job("treatment_overdue_escalations", "Risk treatment overdue escalations", 6 * HOUR, _job_treatment_overdue),
     Job("treatment_reconcile", "Treatment residual reconcile + escalation ladder", 6 * HOUR, _job_treatment_reconcile),
+    Job("moc_temp_expiry_reminders", "MOC temporary-change expiry reminders", 1 * DAY, _job_moc_temp_expiry),
+    Job("moc_approval_escalations", "MOC approval SLA escalations", 6 * HOUR, _job_moc_approval_escalations),
     Job("loss_auto_feed", "Incident → Loss Event auto-feed", 2 * HOUR, _job_loss_auto_feed),
     Job("erm_rollup", "HIRA/EAI → CRR → ERM rollup", 4 * HOUR, _job_rollup),
     Job("appetite_eval", "Risk appetite breach evaluation", 4 * HOUR, _job_appetite_eval),

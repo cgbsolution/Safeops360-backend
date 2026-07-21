@@ -22,6 +22,7 @@ from app.routers import (
     agents_config,
     alerts,
     anomalies,
+    attachments,
     audit_compliance,
     audit_log,
     auth,
@@ -51,6 +52,7 @@ from app.routers import (
     flra,
     hira,
     incidents,
+    insights,
     inspection_findings,
     inspections,
     jobs,
@@ -102,6 +104,14 @@ _ROUTERS = {
     "epc_dashboard": epc_dashboard, "audit_compliance": audit_compliance, "cams": cams,
     "factory": factory, "factory_ext": factory_ext, "devices": devices, "plants": plants,
     "dashboard": dashboard, "licensing": licensing, "audit_log": audit_log, "jobs": jobs,
+    # AI Insights engine (Stream A) — deterministic, airgap-safe insight layer
+    # over the list screens. Mounted ungated (read-only, computed from records
+    # the caller can already see; auth-gated via get_current_user).
+    "insights": insights,
+    # Shared Evidence Attachment layer (Stream B) — generic /api/evidence upload
+    # for any registered entity. Mounted ungated; each endpoint re-checks the
+    # entity's own read/write permission via the evidence registry.
+    "attachments": attachments,
     # Fire Safety (FIRE module). Mounted always-on in dev: the unsigned dev licence
     # predates the FIRE code, so gating it via ROUTER_MODULE would 403 it. The FIRE
     # module IS registered in the licensing model (registry/editions) — add
@@ -191,6 +201,7 @@ def create_app() -> FastAPI:
     # Arm the unified audit trail (P1-1): import registers the ORM capture
     # listeners; register the audited entities.
     from app.models.alerts import Alert
+    from app.models.attachment import Attachment
     from app.models.audit_compliance import ComplianceAudit
     from app.models.capa import Capa
     from app.models.capture import CaptureSubmission, RcaFieldRequest
@@ -239,6 +250,9 @@ def create_app() -> FastAPI:
         # integrity-review outcome is auditable too (who cleared/upheld a flag).
         CultureMaturityProfile, LeadershipWalk, PerceptionSurveyTemplate, RecognitionEntry,
         CultureObserverIntegrity,
+        # Shared Evidence Attachment layer — compliance evidence is tamper-evident
+        # (upload / supersede / soft-delete all write to the hash-chain).
+        Attachment,
     )
 
     app = FastAPI(
