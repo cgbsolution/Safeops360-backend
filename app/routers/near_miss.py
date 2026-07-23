@@ -442,6 +442,17 @@ async def create_near_miss(
     # stays True for CRITICAL severity here so the workflow tracker UI
     # can show "will be promoted on Joint Review approval".
 
+    # Training & Competency Engine — stage a trigger event so the background
+    # resolver evaluates severity (SIF / potentialSeverity) + threshold rules.
+    # Best-effort SAVEPOINT — never blocks near-miss creation.
+    try:
+        async with db.begin_nested():
+            from app.services.training_engine import emit_training_trigger
+
+            await emit_training_trigger(db, "NEAR_MISS", nm)
+    except Exception as e:  # noqa: BLE001
+        print(f"Training trigger emit failed: {e}", file=sys.stderr)
+
     await db.refresh(nm)
     return NearMissOut.model_validate(nm)
 

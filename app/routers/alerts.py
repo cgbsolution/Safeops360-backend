@@ -31,8 +31,9 @@ from app.models.capa import Capa
 from app.models.plant import Area, Plant
 from app.models.rca import RootCauseAnalysis
 from app.models.user import User
-from app.services.access_scope import build_query_scope
+from app.services.access_scope import QueryScope, build_query_scope
 from app.services.permissions import PermissionContext, can
+from app.services.sentinel.score import role_lens_keep, score_alert
 
 router = APIRouter(prefix="/api", tags=["alerts"])
 
@@ -42,9 +43,33 @@ _MUTE = "ALERT.MUTE"
 
 SEVERITY_ORDER = {"critical": 0, "attention": 1, "info": 2}
 
+# The three Daily-Brief lenses (spec §3) and how a user's standing role maps to a
+# default lens. Executive is entitled only to a caller with all-plants scope.
+VALID_LENSES = ("executive", "hse_manager", "site_lead")
+_ROLE_LENS = {
+    "CORPORATE_HSE": "executive",
+    "ADMIN": "executive",
+    "SYSTEM_ADMIN": "executive",
+    "HSE_MANAGER": "hse_manager",
+    "PLANT_HEAD": "site_lead",
+    "DEPARTMENT_HEAD": "site_lead",
+    "SUPERVISOR": "site_lead",
+    "SAFETY_OFFICER": "site_lead",
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _resolve_role(user: User, scope: QueryScope, requested: str | None) -> str:
+    """The effective Daily-Brief lens (spec §3). Defaults from the caller's
+    standing role; a requested lens is honoured only when the caller is entitled
+    — a plant-scoped user can never pull the all-sites executive lens."""
+    role = requested if requested in VALID_LENSES else _ROLE_LENS.get(user.role or "", "hse_manager")
+    if role == "executive" and not scope.all_plants:
+        role = "hse_manager"  # not entitled to the cross-site rollup
+    return role
 
 
 async def _require(db: AsyncSession, user: User, perm: str, plant_id: str | None = None) -> None:
@@ -54,7 +79,7 @@ async def _require(db: AsyncSession, user: User, perm: str, plant_id: str | None
 
 
 def _alert_out(a: Alert) -> dict[str, Any]:
-    return {
+    out = {
         "id": a.id,
         "siteId": a.siteId,
         "severity": a.severity,
@@ -74,6 +99,23 @@ def _alert_out(a: Alert) -> dict[str, Any]:
         "createdAt": a.createdAt.isoformat() if a.createdAt else None,
         "updatedAt": a.updatedAt.isoformat() if a.updatedAt else None,
     }
+    # Brief Priority Score + tier + inspectable components (spec §1.2). Computed
+    # at read time for BOTH sentinel insight cards and reactive event cards, so
+    # both rank together in one unified feed.
+    sc = score_alert(out)
+    out["priorityScore"] = sc["score"]
+    out["scoreComponents"] = sc["components"]
+    out["tier"] = sc["tier"]
+    out["earlySignal"] = sc["earlySignal"]
+    return out
+
+
+def _rank_and_lens(cards: list[dict[str, Any]], role: str) -> list[dict[str, Any]]:
+    """Apply the role lens (spec §3) then rank by Brief Priority Score — the most
+    consequential card is #1 regardless of source module; ties break most-recent."""
+    kept = [c for c in cards if role_lens_keep(c, role)]
+    kept.sort(key=lambda c: (c["priorityScore"], c["updatedAt"] or ""), reverse=True)
+    return kept
 
 
 def _feed_stmt(scope, site_id: str | None, window_hours: int, severity: str | None,
@@ -106,21 +148,21 @@ async def list_alerts(
     status_filter: str | None = Query(None, alias="status"),
     site_id: str | None = Query(None, alias="siteId"),
     window: str = Query("24h"),
+    role: str | None = Query(None),
     limit: int = Query(100, ge=1, le=300),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     await _require(db, user, _READ)
     scope = await build_query_scope(db, user.id, _READ)
+    lens = _resolve_role(user, scope, role)
     window_hours = 24 * 7 if window == "7d" else 24
     stmt = _feed_stmt(scope, site_id, window_hours, severity, status_filter, since)
     rows = (await db.execute(stmt.order_by(Alert.updatedAt.desc()).limit(limit))).scalars().all()
-    items = sorted(
-        (_alert_out(a) for a in rows),
-        key=lambda x: (SEVERITY_ORDER.get(x["severity"], 3), x["updatedAt"] or ""),
-    )
+    # Rank by Brief Priority Score (unified event + insight feed) then role-lens.
+    items = _rank_and_lens([_alert_out(a) for a in rows], lens)
     cursor = max((r.updatedAt for r in rows), default=None)
-    return {"items": items, "total": len(items), "cursor": cursor.isoformat() if cursor else None}
+    return {"items": items, "total": len(items), "cursor": cursor.isoformat() if cursor else None, "role": lens}
 
 
 @router.post("/alerts/{alert_id}/ack")
@@ -183,15 +225,12 @@ async def _count(db: AsyncSession, stmt) -> int:
     return (await db.execute(stmt)).scalar_one()
 
 
-@router.get("/dashboard/daily-brief")
-async def daily_brief(
-    site_id: str | None = Query(None, alias="siteId"),
-    window: str = Query("24h"),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+async def _daily_brief_payload(
+    db: AsyncSession, user: User, *, site_id: str | None, window: str, role: str | None
 ) -> dict[str, Any]:
     await _require(db, user, _READ)
     scope = await build_query_scope(db, user.id, _READ)
+    lens = _resolve_role(user, scope, role)
     now = _now()
     window_hours = 24 * 7 if window == "7d" else 24
     window_start = now - timedelta(hours=window_hours)
@@ -207,13 +246,43 @@ async def daily_brief(
     sites = [{"id": p.id, "code": p.code, "name": p.name} for p in plants]
     effective_site = site_id or (sites[0]["id"] if len(sites) == 1 else None)
 
-    # ── the feed ──
+    # ── the feed (unified event + sentinel cards, ranked by Brief Priority Score,
+    #    then lensed to the caller's role — spec §1.2 / §3) ──
     feed_stmt = _feed_stmt(scope, effective_site, window_hours, None, None, None)
     alerts = (await db.execute(feed_stmt.order_by(Alert.updatedAt.desc()).limit(200))).scalars().all()
-    feed = sorted(
-        (_alert_out(a) for a in alerts),
-        key=lambda x: (SEVERITY_ORDER.get(x["severity"], 3), (x["updatedAt"] or "")),
+    feed = _rank_and_lens([_alert_out(a) for a in alerts], lens)
+
+    # ── site-comparison strip (executive rollup — "where to look" — spec §3) ──
+    comp_rows = (
+        await db.execute(
+            scope.apply(
+                select(Alert.siteId, Alert.severity, func.count())
+                .where(Alert.isDeleted.is_(False))
+                .where(Alert.status.in_(("new", "acknowledged")))
+                .where(Alert.createdAt >= window_start)
+                .group_by(Alert.siteId, Alert.severity),
+                Alert,
+                plant_attr="siteId",
+            )
+        )
+    ).all()
+    comp_map: dict[str, dict[str, int]] = {}
+    for sid, sev, n in comp_rows:
+        comp_map.setdefault(sid or "", {})[sev] = n
+    site_comparison = sorted(
+        (
+            {
+                "siteId": p.id,
+                "code": p.code,
+                "name": p.name.split("—")[0].strip(),
+                "critical": comp_map.get(p.id, {}).get("critical", 0),
+                "attention": comp_map.get(p.id, {}).get("attention", 0),
+            }
+            for p in plants
+        ),
+        key=lambda s: (-s["critical"], -s["attention"]),
     )
+
     ack_week = await _count(
         db,
         scope.apply(
@@ -226,10 +295,16 @@ async def daily_brief(
     )
 
     # ── today's numbers + deltas (windowed event/record counts) ──
-    def _sited(stmt, model, attr="plantId"):
+    # `include_null` keeps rows whose plant column is NULL when a single site is
+    # in view — RootCourseAnalysis.plantId is nullable, so without this an
+    # unassigned-but-open RCA silently drops and the tile reads a misleading 0
+    # next to real open work (spec §5). The RBAC boundary (scope.apply) still
+    # holds: a plant-scoped user never gains null rows they aren't entitled to.
+    def _sited(stmt, model, attr="plantId", include_null: bool = False):
         stmt = scope.apply(stmt, model, plant_attr=attr)
         if effective_site:
-            stmt = stmt.where(getattr(model, attr) == effective_site)
+            col = getattr(model, attr)
+            stmt = stmt.where((col == effective_site) | col.is_(None)) if include_null else stmt.where(col == effective_site)
         return stmt
 
     async def _windowed(model, attr, time_col, extra=None) -> tuple[int, int]:
@@ -255,7 +330,7 @@ async def daily_brief(
         select(func.count()).select_from(RootCauseAnalysis)
         .where(RootCauseAnalysis.isDeleted.is_(False))
         .where(RootCauseAnalysis.status.in_(("DRAFT", "IN_ANALYSIS", "PEER_REVIEW"))),
-        RootCauseAnalysis))
+        RootCauseAnalysis, include_null=True))
 
     from app.models.permit import Permit, PermitStatus
     active_ptw = await _count(db, _sited(
@@ -296,7 +371,7 @@ async def daily_brief(
             _sited(
                 select(CaptureSubmission.areaId, func.count())
                 .where(CaptureSubmission.isDeleted.is_(False))
-                .where(CaptureSubmission.createdAt >= now - timedelta(hours=24))
+                .where(CaptureSubmission.createdAt >= window_start)
                 .group_by(CaptureSubmission.areaId),
                 CaptureSubmission,
             )
@@ -315,7 +390,7 @@ async def daily_brief(
     pulse_base = (
         select(func.count()).select_from(CaptureSubmission)
         .where(CaptureSubmission.isDeleted.is_(False))
-        .where(CaptureSubmission.createdAt >= now - timedelta(hours=24))
+        .where(CaptureSubmission.createdAt >= window_start)
     )
     pulse_total = await _count(db, _sited(pulse_base, CaptureSubmission))
     pulse_voice = await _count(db, _sited(pulse_base.where(CaptureSubmission.voiceLangCode.is_not(None)), CaptureSubmission))
@@ -329,7 +404,7 @@ async def daily_brief(
                 .where(RootCauseAnalysis.isDeleted.is_(False))
                 .where(RootCauseAnalysis.status.in_(("DRAFT", "IN_ANALYSIS", "PEER_REVIEW")))
                 .order_by(RootCauseAnalysis.createdAt.asc()).limit(5),
-                RootCauseAnalysis,
+                RootCauseAnalysis, include_null=True,
             )
         )
     ).scalars().all()
@@ -366,12 +441,15 @@ async def daily_brief(
     return {
         "generatedAt": now.isoformat(),
         "window": window,
+        "role": lens,
         "sites": sites,
         "siteId": effective_site,
+        "siteComparison": site_comparison,
         "feed": feed,
         "acknowledgedThisWeek": ack_week,
         "numbers": numbers,
         "fieldPulse": {
+            "windowHours": window_hours,
             "total": pulse_total,
             "voicePct": round(100 * pulse_voice / pulse_total) if pulse_total else 0,
             "offlinePct": round(100 * pulse_offline / pulse_total) if pulse_total else 0,
@@ -379,3 +457,31 @@ async def daily_brief(
         },
         "agingWatch": aging,
     }
+
+
+@router.get("/dashboard/daily-brief")
+async def daily_brief(
+    site_id: str | None = Query(None, alias="siteId"),
+    window: str = Query("24h"),
+    role: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await _daily_brief_payload(db, user, site_id=site_id, window=window, role=role)
+
+
+@router.get("/daily-brief")
+async def daily_brief_sentinel(
+    scope: str = Query("all", description="all | plant:<plantId>"),
+    role: str | None = Query(None, description="executive | hse_manager | site_lead"),
+    window: str = Query("since_yesterday", description="since_yesterday | last_7d"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Executive Sentinel brief (spec §1.1). The severity-ranked, role-lensed,
+    cross-module rollup of the same Alert pool as /api/dashboard/daily-brief.
+    `scope` = all | plant:<id>; `window` accepts the spec's since_yesterday /
+    last_7d (and the 24h / 7d aliases)."""
+    site_id = scope.split("plant:", 1)[1] if scope.startswith("plant:") else None
+    win = "7d" if window in ("last_7d", "7d") else "24h"
+    return await _daily_brief_payload(db, user, site_id=site_id, window=win, role=role)

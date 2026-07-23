@@ -25,6 +25,26 @@ from app.models.user import Role, User, UserRole
 SEVERITY_ORDER = {"critical": 0, "attention": 1, "info": 2}
 SEVERITY_MIN_RANK = {"critical": 0, "attention": 1, "info": 2}
 _MX = {"navy": "#0B1F4D", "gold": "#C9A961", "ice": "#E8EEF7", "red": "#C0392B", "green": "#2E7D5B"}
+_TIER_FROM_SEV = {"critical": "CRITICAL", "attention": "ATTENTION", "info": "WATCH"}
+
+
+def _tier_label(a: Alert) -> str:
+    """Tier chip for the digest (spec §4 content: headline + tier + refs + link).
+    Sentinel cards carry an explicit tier in bodyParams; event cards derive it."""
+    t = (a.bodyParams or {}).get("tier")
+    return (t or _TIER_FROM_SEV.get(a.severity, "INFO")).upper()
+
+
+def _app_base() -> str:
+    return (os.getenv("APP_BASE_URL") or os.getenv("NEXT_PUBLIC_APP_URL") or "").rstrip("/")
+
+
+def _deep_link(a: Alert) -> str:
+    """Absolute deep link back into the platform. Sensitive specifics stay behind
+    this authenticated link, not in the email body (spec §4 privacy)."""
+    base = _app_base()
+    path = a.deepLink or "/dashboard/daily"
+    return f"{base}{path}" if base else ""
 
 
 def _digest_enabled() -> bool:
@@ -50,13 +70,19 @@ def render_digest_html(site_name: str, date_str: str, alerts: list[Alert]) -> st
             f'padding:2px 8px;margin:2px 4px 2px 0;font:12px monospace;color:{_MX["navy"]}">{e.get("ref") or e.get("label")}</span>'
             for e in (a.impactedEntities or [])[:6]
         )
-        badge = f'<span style="background:{color};color:#fff;border-radius:10px;padding:2px 8px;font-size:11px;font-weight:700">{a.severity.upper()}</span>'
+        badge = f'<span style="background:{color};color:#fff;border-radius:10px;padding:2px 8px;font-size:11px;font-weight:700">{_tier_label(a)}</span>'
         count = f' <b>×{a.count}</b>' if a.count > 1 else ""
+        link = _deep_link(a)
+        link_html = (
+            f'<br/><a href="{link}" style="color:{_MX["navy"]};font-size:12px;font-weight:700;text-decoration:none">Open in SafeOps360 →</a>'
+            if link
+            else ""
+        )
         rows.append(
             f'<tr><td style="padding:14px 18px;border-left:4px solid {color};background:#fff">'
             f'{badge}{count}<br/>'
             f'<b style="color:{_MX["navy"]};font-size:15px">{a.title}</b><br/>'
-            f'<span style="color:#37415a;font-size:13px">{a.bodyText}</span><br/>{pills}</td></tr>'
+            f'<span style="color:#37415a;font-size:13px">{a.bodyText}</span><br/>{pills}{link_html}</td></tr>'
             '<tr><td style="height:10px"></td></tr>'
         )
     body = "".join(rows) or (
@@ -80,11 +106,14 @@ def render_digest_text(site_name: str, date_str: str, alerts: list[Alert]) -> st
     if not alerts:
         lines.append("No new impacts since yesterday. Have a safe day.")
     for a in alerts:
-        lines.append(f"[{a.severity.upper()}]{' x' + str(a.count) if a.count > 1 else ''} {a.title}")
+        lines.append(f"[{_tier_label(a)}]{' x' + str(a.count) if a.count > 1 else ''} {a.title}")
         lines.append(f"    {a.bodyText}")
         refs = ", ".join(e.get("ref") or e.get("label") or "" for e in (a.impactedEntities or [])[:6])
         if refs:
             lines.append(f"    → {refs}")
+        link = _deep_link(a)
+        if link:
+            lines.append(f"    Open: {link}")
         lines.append("")
     return "\n".join(lines)
 

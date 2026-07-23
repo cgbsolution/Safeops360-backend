@@ -114,6 +114,9 @@ async def compute_combined_risk(
         return [], [], 0
 
     bar: list[Insight] = []
+    not_tracked = _not_active_tracked_insight(rows)
+    if not_tracked:
+        bar.append(not_tracked)
     anomaly = _reduced_no_capa_insight(rows)
     if anomaly:
         bar.append(anomaly)
@@ -123,6 +126,27 @@ async def compute_combined_risk(
 
     signals = _row_signals(rows)
     return bar, signals, record_count
+
+
+def _not_active_tracked_insight(rows: list[_Row]) -> Insight | None:
+    """Bar-level promotion of the row 'Not active-tracked' signal (spec §2 card
+    #3): CRITICAL-initial register entries still in DRAFT/APPROVED, not ACTIVE.
+    A critical risk that no one is tracking is a leading, pre-incident gap."""
+    hits = [r for r in rows if r.initial == "CRITICAL" and r.status != "ACTIVE"]
+    if not hits:
+        return None
+    refs = [r.ref for r in hits]
+    return Insight(
+        id="combined-risk:anomaly:not-active-tracked",
+        kind="anomaly",
+        severity="high" if len(hits) >= 2 else "watch",
+        headline=fill("combined.not_active_tracked", count=len(hits)),
+        evidence=fill("combined.not_active_tracked.evidence", count=len(hits), refs=refs_str(refs)),
+        recordRefs=refs,
+        suggestedAction="Move these critical-initial risks to ACTIVE so they are tracked and reviewed.",
+        confidence=confidence_for(len(hits)),
+        seriousPotential=True,
+    )
 
 
 async def _capa_linked_ids(db: AsyncSession, hira_ids: list[str], eai_ids: list[str]) -> set[str]:

@@ -107,6 +107,9 @@ def _critical_uninvestigated(rows: list[Any]) -> Insight | None:
         recordRefs=refs,
         suggestedAction=fill("nearmiss.critical.uninvestigated.action"),
         confidence=confidence_for(n_crit),
+        # Critical-potential near misses precede LTIs — this is the leading
+        # PSI/SIF indicator the Executive Sentinel ranks highest (spec §2).
+        seriousPotential=True,
     )
 
 

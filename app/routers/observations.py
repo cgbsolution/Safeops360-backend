@@ -242,6 +242,18 @@ async def create_observation(
         print(f"TriageAgent failed: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
+    # Training & Competency Engine — stage a trigger event (dedicated outbox) so
+    # the background resolver can evaluate the severity + threshold rules against
+    # this observation's classification. Best-effort SAVEPOINT — never blocks
+    # creation (spec: rule engine runs as a background job, not in the request).
+    try:
+        async with db.begin_nested():
+            from app.services.training_engine import emit_training_trigger
+
+            await emit_training_trigger(db, "OBSERVATION", obs)
+    except Exception as e:  # noqa: BLE001
+        print(f"Training trigger emit failed: {e}", file=sys.stderr)
+
     # Final refresh before serialising. The savepoint flushes above
     # (workflow init, TriageAgent's UPDATE on closureTriggers) leave
     # `obs` with expired attributes — even with expire_on_commit=False

@@ -30,6 +30,7 @@ from app.routers import (
     capa,
     capture,
     competency,
+    training_engine,
     dashboard,
     devices,
     eai,
@@ -96,6 +97,10 @@ _ROUTERS = {
     "workflow": workflow, "workflow_definitions": workflow_definitions, "anomalies": anomalies,
     "agents": agents, "agents_config": agents_config, "hira": hira, "capa": capa, "eai": eai,
     "erm": erm, "erm_attachments": erm_attachments, "erm_p2": erm_p2, "erm_p3": erm_p3, "erm_t3": erm_t3, "competency": competency,
+    # Training & Competency Engine (Trigger + Assignment + Content Adapter +
+    # Correlation). Mounted ungated (insights/capture precedent) — per-endpoint
+    # SKILL_MATRIX RBAC is the real gate; the signed dev licence predates the code.
+    "training_engine": training_engine,
     "moc": moc, "risk_register": risk_register, "risk_dashboard": risk_dashboard,
     "rca": rca, "rca_field": rca_field, "notifications": notifications,
     "scr": scr, "sci": sci, "kaizen": kaizen, "safety_culture": safety_culture, "ppe": ppe,

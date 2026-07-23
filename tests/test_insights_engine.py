@@ -155,6 +155,7 @@ def test_all_eight_modules_registered():
 _NEW_HEADLINES = {
     "observation.cluster.category": dict(count=6, total=8, plant="Meridian North Integrated Unit", category="Electrical"),
     "observation.duplicate": dict(groups=2, records=5),
+    "observation.bottleneck": dict(step="Section Head Review", avg=4.2, count=18),
     "hira.review.soon": dict(count=3, soonest_ref="HIRA-NW-007", days=12),
     "hira.review.overdue": dict(count=3, soonest_ref="HIRA-NW-007", days=12),
     "hira.cluster.hazard": dict(category="Confined Space Entry", plants=2),
@@ -189,3 +190,105 @@ _NEW_LABELS = [
 def test_new_signal_labels_within_24(key):
     label = fill(key)
     assert label and len(label) <= 24
+
+
+# Row-Level Insight Layer signal labels carry slots — fill them at the widest
+# plausible value and confirm the Signal.label max_length (24) still holds.
+def test_row_layer_signal_labels_within_24():
+    assert len(fill("signal.repeat_location.label", count=99)) <= 24
+    assert len(fill("signal.stale_step.label", days=999)) <= 24
+
+
+# ─── Row-Level Insight Layer: pure observation-rule logic (no DB) ────────────
+
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+
+from app.services.insights.rules_observation import (
+    _bottleneck_insight,
+    _repeat_location_map,
+    _row_signals,
+)
+
+_NOW = datetime(2026, 7, 23, 12, 0, 0)
+
+
+def _obs(**kw):
+    """A minimal observation row stand-in (attribute access, like a SA Row)."""
+    base = dict(
+        id="o1", number="OBS-1", date=_NOW, plantId="P1", areaId="A1",
+        type="UNSAFE_ACT", category="ELECTRICAL", severity="LOW",
+        status="OPEN", description="frayed cable near panel", createdAt=_NOW,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_repeat_location_flags_recurring_spot():
+    # 3 in the same (plant·area·category) within 90d → recurring; a 4th combo
+    # with only 2 members is not flagged; one outside 90d is excluded.
+    rows = [
+        _obs(id="a", number="OBS-A"),
+        _obs(id="b", number="OBS-B"),
+        _obs(id="c", number="OBS-C"),
+        _obs(id="d", number="OBS-D", category="PPE"),   # different combo (only 1)
+        _obs(id="e", number="OBS-E", category="PPE"),   # 2nd PPE → still < 3
+        _obs(id="old", number="OBS-OLD", date=_NOW - timedelta(days=120)),  # out of window
+    ]
+    m = _repeat_location_map(rows, _NOW)
+    assert m["a"][0] == 3 and m["b"][0] == 3 and m["c"][0] == 3
+    assert "d" not in m and "e" not in m       # PPE combo under the ≥3 floor
+    assert "old" not in m                        # outside the 90d window
+
+
+def test_bottleneck_picks_slowest_step_with_enough_stuck():
+    open_rows = [_obs(id=f"r{i}", number=f"OBS-{i}") for i in range(6)]
+    current = {
+        "r0": ("Section Head Review", 6), "r1": ("Section Head Review", 5),
+        "r2": ("Section Head Review", 7),  # 3 stuck, avg 6.0
+        "r3": ("Initiator", 1), "r4": ("Initiator", 1),  # only 2 stuck → ignored
+        "r5": ("Initiator", 1),
+    }
+    ins = _bottleneck_insight(open_rows, current)
+    assert ins is not None
+    assert "Section Head Review" in ins.headline
+    assert set(ins.recordRefs) == {"OBS-0", "OBS-1", "OBS-2"}
+
+
+def test_bottleneck_none_when_nothing_stuck_enough():
+    open_rows = [_obs(id="r0", number="OBS-0")]
+    assert _bottleneck_insight(open_rows, {"r0": ("Initiator", 1)}) is None
+
+
+def test_row_signals_multi_and_priority_and_filterhref():
+    r = _obs(id="x", number="OBS-X", status="IN_PROGRESS", severity="LOW")
+    signals = _row_signals(
+        [r],
+        dup_ids={"x"},
+        repeat_map={"x": (4, "P1", "A1", "ELECTRICAL")},
+        current_step={"x": ("Section Head Review", 6)},
+        avg_dwell={("ELECTRICAL", "Section Head Review"): (2.0, 5)},
+        area_names={"A1": "Panel Room"},
+        now=_NOW,
+    )
+    kinds = [s.kind for s in signals]
+    # Three chips on one row: stale (high) ranks first, then repeat, then duplicate.
+    assert kinds == ["overdue_escalation", "cluster", "duplicate"]
+    assert signals[0].severity == "high"  # 6 > 2×2.0 avg
+    # Click-to-filter wiring: repeat → cat+area; duplicate → the bar insight.
+    repeat = next(s for s in signals if s.kind == "cluster")
+    assert repeat.filterHref == "?cat=ELECTRICAL&area=A1"
+    dup = next(s for s in signals if s.kind == "duplicate")
+    assert dup.filterHref == "?insight=observation:duplicate:near-identical"
+
+
+def test_row_signals_stale_needs_enough_samples():
+    # Same dwell excess but only 2 completed samples → below the trust floor.
+    r = _obs(id="x", number="OBS-X", status="IN_PROGRESS")
+    signals = _row_signals(
+        [r], dup_ids=set(), repeat_map={},
+        current_step={"x": ("Review", 6)},
+        avg_dwell={("ELECTRICAL", "Review"): (2.0, 2)},  # only 2 samples
+        area_names={}, now=_NOW,
+    )
+    assert signals == []

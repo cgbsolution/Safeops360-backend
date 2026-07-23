@@ -50,12 +50,19 @@ TEMPLATES: dict[str, str] = {
     "observation.cluster.category.evidence": "{count} open unsafe {category} observations at {plant}: {refs}",
     "observation.duplicate": "{groups} sets of near-identical observations logged ({records} records)",
     "observation.duplicate.evidence": "{records} observations look like duplicates (same place, <48h, near-identical text): {refs}",
+    "observation.bottleneck": "{step} is the bottleneck — avg {avg}d, {count} stuck here",
+    "observation.bottleneck.evidence": "{count} open observations sit in '{step}', dwelling {avg}d on average — the slowest step: {refs}",
     "signal.duplicate.label": "Likely duplicate",
     "signal.duplicate.evidence": "{ref} closely matches another observation in the same area within 48h.",
     "signal.severity_mismatch.label": "Check severity",
     "signal.severity_mismatch.evidence": "{ref} is marked {severity} but the description is too thin to justify it.",
     "signal.escalate.label": "Escalate",
     "signal.escalate.evidence": "{ref} has sat open {days}d past the review SLA.",
+    # Row-Level Insight Layer row signals — repeat-location + stale-step.
+    "signal.repeat_location.label": "Repeat ×{count} · 90d",
+    "signal.repeat_location.evidence": "{count} {category} observations here in the same area within 90 days — a recurring hazard at this spot.",
+    "signal.stale_step.label": "{days}d in step",
+    "signal.stale_step.evidence": "{ref} has sat in {step} {days}d vs a {avg}d average for this category — well past the usual dwell.",
     # ── HIRA Studies (§2.4) ───────────────────────────────────────────────
     "hira.review.soon": "{count} HIRA studies due for review — soonest {soonest_ref} in {days}d",
     "hira.review.overdue": "{count} HIRA studies overdue for review — {soonest_ref} {days}d overdue",
@@ -80,11 +87,15 @@ TEMPLATES: dict[str, str] = {
     "combined.reduced_no_capa.evidence": "{count} entries were CRITICAL initially, now lower residual, with no CAPA linked: {refs}",
     "combined.area_cluster": "{count} HIRA & EAI risks share area {area}",
     "combined.area_cluster.evidence": "Area '{area}' carries both HIRA and EAI risks: {refs}",
+    "combined.not_active_tracked": "{count} critical-initial risks not yet under active tracking",
+    "combined.not_active_tracked.evidence": "{count} CRITICAL-initial register entries still in DRAFT/APPROVED, not ACTIVE: {refs}",
     "signal.not_active.label": "Not active-tracked",
     "signal.not_active.evidence": "{ref} is a critical-initial risk still in {status} — not yet active-tracked.",
     # ── CAPA Management (§2.7) ────────────────────────────────────────────
     "capa.overdue": "{count} CAPAs overdue — worst {worst_ref} at {worst_days}d ({severity})",
     "capa.overdue.evidence": "{count} open CAPAs past their closure target: {refs}",
+    "capa.near_breach": "{count} serious CAPAs near breach — {worst_ref} due in {days}d, not started",
+    "capa.near_breach.evidence": "{count} CRITICAL/HIGH CAPAs approach their closure target while still in Actions Planned: {refs}",
     "capa.backlog": "{closed} CAPAs closed vs {opened} opened this month — backlog growing",
     "capa.backlog.evidence": "{opened} CAPAs opened and {closed} closed so far this month.",
     "capa.bottleneck": "{owner} holds {count} overdue CAPAs — a bottleneck",
@@ -98,6 +109,11 @@ TEMPLATES: dict[str, str] = {
     "moc.cluster.critical.evidence": "{count} changes overlap a critical HIRA/EAI risk (e.g. {risk}): {refs}",
     "signal.stalled_draft.label": "Stalled in draft",
     "signal.stalled_draft.evidence": "{ref} is a {cls} change stuck in draft for {days}d.",
+    # ── Training & Competency Engine cross-link (spec §B/§D) ──────────────
+    "training.followup.open": "{workers} workers have open training from these events — top gap: {competency}",
+    "training.followup.open.evidence": "{count} open training assignments were auto-created from {module} records here; {competency} is the most-assigned competency.",
+    "training.followup.overdue": "{overdue} auto-assigned trainings from these events are now overdue",
+    "training.followup.overdue.evidence": "{overdue} of {count} event-driven training assignments are past due — competency gaps stay open until completed.",
 }
 
 

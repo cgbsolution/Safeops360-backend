@@ -33,6 +33,8 @@ _STOPWORDS = frozenset(
     all any both each few more most other some such only own same very just too
     incident incidents nearmiss near miss report reported occurred happened
     worker operator employee area plant site unit line shift day night morning
+    days week weeks month months year years hour hours minute minutes second
+    seconds lost time times ago approx approximately around later duration
     """.split()
 )
 

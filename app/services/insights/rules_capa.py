@@ -32,6 +32,7 @@ _OPEN = ("DRAFT", "SUBMITTED", "UNDER_RCA", "ACTIONS_PLANNED", "ACTIONS_IN_PROGR
 _SERIOUS = {"CRITICAL", "HIGH"}
 _PLANNED_STALE_DAYS = 7
 _BOTTLENECK_MIN = 3
+_NEAR_BREACH_DAYS = 7  # a serious CAPA still in planning this close to target is a pre-breach signal
 
 
 async def compute_capa(
@@ -73,6 +74,9 @@ async def compute_capa(
     overdue_rows, overdue_card = _overdue_insight(open_rows, now)
     if overdue_card:
         bar.append(overdue_card)
+    near_breach = _near_breach_insight(open_rows, now)
+    if near_breach:
+        bar.append(near_breach)
     trend = await _backlog_trend_insight(db, plant, month_start)
     if trend:
         bar.append(trend)
@@ -82,6 +86,43 @@ async def compute_capa(
 
     signals = _row_signals(open_rows, now)
     return bar, signals, record_count
+
+
+def _near_breach_insight(open_rows: list[Any], now: Any) -> Insight | None:
+    """Predictive, not reactive (spec §2 card #4): CRITICAL/HIGH-source CAPAs
+    still in ACTIONS_PLANNED (not yet started) whose closure target lands within
+    the next week — flagged BEFORE the date passes, the difference between a
+    sentinel and a late-notice list."""
+    from datetime import timedelta
+
+    horizon = now + timedelta(days=_NEAR_BREACH_DAYS)
+    hits: list[tuple[Any, int]] = []
+    for r in open_rows:
+        if (r.severity or "").upper() not in _SERIOUS:
+            continue
+        if (r.state or "") != "ACTIONS_PLANNED":
+            continue
+        d = as_naive(r.closureTargetDate)
+        if d is not None and now < d <= horizon:
+            hits.append((r, (d - now).days))
+    if not hits:
+        return None
+    hits.sort(key=lambda rd: rd[1])  # soonest-due first
+    soonest_row, soonest_days = hits[0]
+    refs = [r.capaNumber for r, _ in hits]
+    return Insight(
+        id="capa:predictive:near-breach",
+        kind="predictive_risk",
+        severity="high",
+        headline=fill(
+            "capa.near_breach", count=len(hits), worst_ref=soonest_row.capaNumber, days=soonest_days
+        ),
+        evidence=fill("capa.near_breach.evidence", count=len(hits), refs=refs_str(refs)),
+        recordRefs=refs,
+        suggestedAction="Move these serious CAPAs into progress now — they breach their target within the week.",
+        confidence=confidence_for(len(hits)),
+        seriousPotential=True,
+    )
 
 
 def _overdue_insight(open_rows: list[Any], now: Any) -> tuple[list[Any], Insight | None]:
@@ -112,6 +153,8 @@ def _overdue_insight(open_rows: list[Any], now: Any) -> tuple[list[Any], Insight
         recordRefs=refs,
         suggestedAction="Escalate the worst-overdue CAPAs to their owners this week — these are next audit findings.",
         confidence=confidence_for(len(overdue)),
+        seriousPotential=any_serious,
+        overdueDays=worst_days,
     )
     return [r for r, _ in overdue], card
 

@@ -723,6 +723,20 @@ async def classify_incident(
     await db.flush()
     await db.refresh(incident)
 
+    # Training & Competency Engine — stage a trigger event now that type/severity
+    # (and the derived SIF signals) are finalized. Best-effort SAVEPOINT — never
+    # blocks classification; the resolver runs severity + threshold rules in the
+    # background (spec §B).
+    try:
+        async with db.begin_nested():
+            from app.services.training_engine import emit_training_trigger
+
+            await emit_training_trigger(db, "INCIDENT", incident)
+    except Exception as e:  # noqa: BLE001
+        import sys as _sys
+
+        print(f"Training trigger emit failed: {e}", file=_sys.stderr)
+
     # Approve the workflow CHECKER step — this also propagates the new
     # severity / isReportable / investigationTeamLead via record_data so
     # subsequent step lookups (Plant Head review condition, statutory

@@ -43,6 +43,17 @@ class Insight(BaseModel):
     suggestedAction: str | None = None
     confidence: InsightConfidence
 
+    # ── Brief-Sentinel ranking metadata (optional; default-safe) ──────────────
+    # Populated by the predictive rules so the Daily Brief's Brief Priority Score
+    # (app/services/sentinel/score.py) is a deterministic, inspectable function of
+    # fields the rule already computed — never re-queried per the spec §1.2. The
+    # eight list-screen consumers ignore these three; they are a backwards-
+    # compatible superset of the shipped Insight contract (the InsightBar/
+    # SignalChip components read only the fields above).
+    seriousPotential: bool = False   # source carries fatal / serious-injury (PSI/SIF) potential
+    overdueDays: int | None = None   # days past a target, when the finding is overdue-grounded
+    escalated: bool = False          # escalation chain already notified for this finding
+
 
 class Signal(BaseModel):
     """A row-level chip payload attached to one record."""
@@ -54,6 +65,12 @@ class Signal(BaseModel):
     label: str = Field(max_length=24)
     evidence: str
     suggestedAction: str | None = None
+    # Row-Level Insight Layer (Part 3): when set, clicking the chip narrows the
+    # list to this signal's cluster/location. A query string the host list page
+    # understands (e.g. "?cat=ELECTRICAL&area=<id>" or "?insight=<barId>"). Most
+    # signals are per-record and leave this None (the chip just opens its
+    # popover). Optional + default-safe — the other list screens ignore it.
+    filterHref: str | None = None
 
 
 class InsightResponse(BaseModel):

@@ -169,6 +169,15 @@ async def _job_alert_digest(db) -> dict:
     return await run_alert_digest(db)
 
 
+async def _job_sentinel_scan(db) -> dict:
+    """Executive Sentinel — run the deterministic AI Insights engine across every
+    module + plant and materialise the predictive/leading-indicator cards as Alert
+    rows (scored by the Brief Priority Score), firing an in-platform push on each
+    new critical. Recomputes nothing; consumes the insight engine."""
+    from app.services.sentinel import run_sentinel_scan
+    return await run_sentinel_scan(db)
+
+
 async def _job_culture_recalc(db) -> dict:
     """Recompute every site's Safety Culture maturity score (five components) +
     award quality-weighted recognition. The culture KRIs then feed off the
@@ -195,6 +204,43 @@ async def _job_culture_band_breach(db) -> dict:
     return await run_band_breach_scan(db)
 
 
+async def _job_training_engine_resolver(db) -> dict:
+    """Training & Competency Engine — drain the TrainingTriggerEvent outbox
+    (Incident/Near Miss/Observation classification saves) through the severity +
+    threshold rules and materialise TrainingAssignments (spec §B, "run as a
+    background job … not synchronously in the request path")."""
+    from app.services.training_engine.service import drain_trigger_events
+    return await drain_trigger_events(db)
+
+
+async def _job_training_recert_scan(db) -> dict:
+    """Recertification rule — competency expiry approaching → auto-assign a
+    refresher, independent of incident triggers (spec §B rule 4)."""
+    from app.services.training_engine.service import run_recert_scan
+    return await run_recert_scan(db)
+
+
+async def _job_training_overdue_scan(db) -> dict:
+    """Flip past-due training assignments to overdue + notify the worker."""
+    from app.services.training_engine.service import run_overdue_scan
+    return await run_overdue_scan(db)
+
+
+async def _job_training_correlation_scan(db) -> dict:
+    """Fill the post-training re-incident window on correlation points once it
+    elapses + emit the Daily Brief 'correlation' card (spec §D)."""
+    from app.services.training_engine.correlation import run_correlation_scan
+    return await run_correlation_scan(db)
+
+
+async def _job_person_risk_scan(db) -> dict:
+    """Person-risk analytics — aggregate every worker's incidents/near-misses/
+    observations 'against their name', auto-flag repeat-involved people into the
+    training module, and assign the training their events point to."""
+    from app.services.training_engine.person_risk import run_person_risk_scan
+    return await run_person_risk_scan(db)
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
@@ -215,10 +261,16 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("ptw_expiry_scan", "PTW T-24h expiring events + expiry flip", 1 * HOUR, _job_ptw_expiry_scan),
     Job("capa_overdue_scan", "CAPA overdue events (daily scan)", 1 * DAY, _job_capa_overdue_scan),
     Job("alert_digest", "Daily Brief 06:00 site-local email digest", 15 * 60, _job_alert_digest),
+    Job("sentinel_scan", "Executive Sentinel — insight→Alert materialise + critical push", 5 * 60, _job_sentinel_scan),
     Job("culture_recalc", "Safety Culture maturity recompute + recognition", 1 * DAY, _job_culture_recalc),
     Job("culture_walk_reminders", "Culture — T-2d leadership walk reminders", 1 * DAY, _job_culture_walk_reminders),
     Job("culture_survey_launch", "Culture — perception survey window launch", 1 * DAY, _job_culture_survey_launch),
     Job("culture_band_breach", "Culture — stage-band regression escalation", 6 * HOUR, _job_culture_band_breach),
+    Job("training_engine_resolver", "Training Engine — trigger→assignment resolver", 60, _job_training_engine_resolver),
+    Job("training_recert_scan", "Training — recertification refresher scan", 1 * DAY, _job_training_recert_scan),
+    Job("training_overdue_scan", "Training — overdue assignment scan", 6 * HOUR, _job_training_overdue_scan),
+    Job("training_correlation_scan", "Training — re-incident correlation scan + Daily Brief card", 1 * DAY, _job_training_correlation_scan),
+    Job("person_risk_scan", "Training — person-risk repeat-involvement flag + auto-assign", 6 * HOUR, _job_person_risk_scan),
 ]}
 
 

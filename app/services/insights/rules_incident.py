@@ -121,10 +121,16 @@ def _cluster_insights(open_rows: list[Any], plant_names: dict[str, str]) -> list
     for plant_id, group in by_plant.items():
         if len(group) < 3:
             continue
-        # incidents-per-keyword (distinct incidents, not token frequency)
+        # incidents-per-keyword (distinct incidents, not token frequency).
+        # Grounded ONLY in the structured cause arrays — the free-text
+        # `description` is deliberately excluded: it narrates lost-time ("off
+        # work 5 days") so generic duration words (days/weeks/hours) used to win
+        # the frequency count and render "share a cause pattern: days" (the §2
+        # slot-fill bug). A cause cluster must key off a real cause term, not
+        # incidental narrative. `common._STOPWORDS` also now drops those units.
         token_refs: dict[str, list[str]] = {}
         for r in group:
-            for tok in set(keywords(r.immediateCauses, r.rootCauses, r.description)):
+            for tok in set(keywords(r.immediateCauses, r.rootCauses)):
                 token_refs.setdefault(tok, []).append(r.number)
         candidates = sorted(
             ((tok, refs) for tok, refs in token_refs.items() if len(refs) >= 3),
@@ -135,11 +141,19 @@ def _cluster_insights(open_rows: list[Any], plant_names: dict[str, str]) -> list
         keyword, refs = candidates[0]
         plant_label = plant_names.get(plant_id, "this plant")
         count, total = len(refs), len(group)
+        # Fatal/serious-injury potential (PSI/SIF) — an LTI/fatality-class or
+        # CRITICAL-severity member makes this cluster a leader-level signal.
+        ref_set = set(refs)
+        serious = any(
+            ((r.type or "") in {"LTI", "FATALITY"}) or ((r.severity or "").upper() == "CRITICAL")
+            for r in group
+            if r.number in ref_set
+        )
         out.append(
             Insight(
                 id=_slug("incident", "cluster", plant_id, keyword),
                 kind="cluster",
-                severity="high" if count >= 4 else "watch",
+                severity="high" if (count >= 4 or serious) else "watch",
                 headline=fill(
                     "incident.cluster.rootcause",
                     count=count,
@@ -157,6 +171,7 @@ def _cluster_insights(open_rows: list[Any], plant_names: dict[str, str]) -> list
                 recordRefs=refs,
                 suggestedAction="Group these under one investigation theme and check for a common control gap.",
                 confidence=confidence_for(count),
+                seriousPotential=serious,
             )
         )
     return out

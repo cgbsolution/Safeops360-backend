@@ -249,6 +249,17 @@ async def _rule_training_trigger(db: AsyncSession, incident: Incident) -> dict[s
     incident.triggeredTrainingFor = affected_user_ids
     incident.triggeredTrainingKeywords = matched
 
+    # Training & Competency Engine — stage an `incident_closed` trigger so the
+    # background resolver turns this keyword-detected training gap into real,
+    # provenance-carrying TrainingAssignments (not just a dashboard flag). The
+    # engine's keyword-mode HazardToSkillMappings match the root-cause text blob.
+    try:
+        from app.services.training_engine import emit_training_trigger
+
+        await emit_training_trigger(db, "INCIDENT", incident, event_type="incident_closed")
+    except Exception as e:  # noqa: BLE001
+        print(f"[incident_post_closure] training trigger emit failed: {e}", file=sys.stderr)
+
     return {
         "ruleName": "Training-gap detection",
         "fired": True,

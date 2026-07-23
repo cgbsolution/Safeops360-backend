@@ -72,6 +72,18 @@ async def compute(
         db, plant=plant, date_from=date_from, date_to=date_to
     )
 
+    # Training & Competency Engine cross-link — surface training auto-assigned
+    # FROM this module's records on the Incident / Near Miss / Observation bars
+    # (spec: training-driven signals appear on those screens). Additive + guarded:
+    # a failure here can never break the host screen's own insights.
+    if module in ("incident", "nearmiss", "observation"):
+        try:
+            from app.services.insights.rules_training_cross import training_cross_bar
+
+            bar = list(bar) + await training_cross_bar(db, module_key=module, plant=plant)
+        except Exception:  # noqa: BLE001
+            pass
+
     # Thin-data suppression: below the floor, show nothing rather than a
     # low-confidence card on too few records (spec §1.4). Signals are dropped
     # too — there is no meaningful intelligence under the floor.
