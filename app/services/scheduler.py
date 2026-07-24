@@ -241,6 +241,16 @@ async def _job_person_risk_scan(db) -> dict:
     return await run_person_risk_scan(db)
 
 
+async def _job_observation_weekly_insights(db) -> dict:
+    """Weekly Insight Engine — recompute the Safety Observations 'This week's
+    focus' hero + secondary row and persist the InsightSnapshot lifecycle for the
+    current week (idempotent per weekOf). Deterministic; no model calls. Interval
+    is daily so a missed Sunday still lands; the weekOf key makes re-runs update
+    rather than duplicate."""
+    from app.services.insights.weekly import compute_weekly
+    return await compute_weekly(db, module="safety_observation")
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
@@ -271,6 +281,7 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("training_overdue_scan", "Training — overdue assignment scan", 6 * HOUR, _job_training_overdue_scan),
     Job("training_correlation_scan", "Training — re-incident correlation scan + Daily Brief card", 1 * DAY, _job_training_correlation_scan),
     Job("person_risk_scan", "Training — person-risk repeat-involvement flag + auto-assign", 6 * HOUR, _job_person_risk_scan),
+    Job("observation_weekly_insights", "Weekly Insight Engine — observation hero + row recompute", 1 * DAY, _job_observation_weekly_insights),
 ]}
 
 

@@ -15,6 +15,8 @@ QueryScope is a follow-up — documented in the DECISIONS log.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +27,11 @@ from app.schemas.insights import InsightResponse
 from app.services.insights import SUPPORTED_MODULES, compute
 
 router = APIRouter(prefix="/api/insights", tags=["insights"])
+log = logging.getLogger("safeops360.insights")
+
+# Weekly Insight Engine (hero + secondary row). Only observation is wired in the
+# pilot; the internal module name differs from the list-screen key.
+_WEEKLY_MODULE_MAP = {"observation": "safety_observation"}
 
 
 @router.get("/modules")
@@ -32,6 +39,28 @@ async def list_modules(
     user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate only
 ) -> dict[str, list[str]]:
     return {"modules": list(SUPPORTED_MODULES)}
+
+
+@router.get("/{module}/weekly")
+async def module_weekly(
+    module: str,
+    plant: str | None = Query(default=None),
+    user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate only
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Weekly Insight Engine view: the 'This week's focus' hero + secondary row.
+    Degrades to an empty view on any error (e.g. the InsightSnapshot table not yet
+    applied) so the list screen never breaks."""
+    internal = _WEEKLY_MODULE_MAP.get(module)
+    if internal is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No weekly insight engine for module '{module}'")
+    from app.services.insights.weekly import get_current_week_view
+
+    try:
+        return await get_current_week_view(db, module=internal, plant=plant)
+    except Exception as e:  # noqa: BLE001 — never break the screen on an engine/DDL issue
+        log.warning("weekly insight view failed for %s: %s", internal, e)
+        return {"module": internal, "weekOf": None, "hero": None, "row": [], "moreCount": 0, "empty": None}
 
 
 @router.get("/{module}", response_model=InsightResponse)
